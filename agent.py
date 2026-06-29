@@ -30,6 +30,8 @@ TASKS_FILE = WORKSPACE_ROOT / ".agent_tasks.json"
 BLACKBOARD_FILE = WORKSPACE_ROOT / ".agent_blackboard.json"
 CODE_INDEX_FILE = WORKSPACE_ROOT / ".agent_code_index.json"
 IMPROVEMENT_BACKLOG_FILE = WORKSPACE_ROOT / ".agent_improvement_backlog.json"
+IMPROVEMENT_LEARNING_FILE = WORKSPACE_ROOT / ".agent_improvement_learning.json"
+EXPERIMENT_JOURNAL_FILE = WORKSPACE_ROOT / ".agent_experiments.json"
 MODEL = "local-model"
 MAX_STEPS = 12
 MAX_BATCH_ACTIONS = 3
@@ -125,6 +127,12 @@ def default_config() -> dict[str, Any]:
         "max_steps": MAX_STEPS,
         "max_batch_actions": MAX_BATCH_ACTIONS,
         "monitor": DEFAULT_MONITOR_MODE,
+        "autonomy_policy": {
+            "max_changed_files_per_cycle": 4,
+            "max_risk_level": "medium",
+            "rollback_on_policy_violation": True,
+            "allow_state_file_changes": True,
+        },
         "role_models": role_models,
     }
 
@@ -153,6 +161,17 @@ def load_config() -> dict[str, Any]:
     config["temperature"] = float(config.get("temperature", 0.25))
     if config.get("monitor") not in {"quiet", "summary"}:
         config["monitor"] = DEFAULT_MONITOR_MODE
+    policy_defaults = defaults["autonomy_policy"]
+    parsed_policy = parsed.get("autonomy_policy", {})
+    if not isinstance(parsed_policy, dict):
+        parsed_policy = {}
+    policy = policy_defaults | parsed_policy
+    policy["max_changed_files_per_cycle"] = max(1, int(policy.get("max_changed_files_per_cycle", 4)))
+    if policy.get("max_risk_level") not in {"low", "medium", "high"}:
+        policy["max_risk_level"] = "medium"
+    policy["rollback_on_policy_violation"] = bool(policy.get("rollback_on_policy_violation", True))
+    policy["allow_state_file_changes"] = bool(policy.get("allow_state_file_changes", True))
+    config["autonomy_policy"] = policy
     return config
 
 
@@ -163,6 +182,14 @@ def save_config(config: dict[str, Any]) -> None:
 def get_role_model(role: str) -> str:
     config = load_config()
     return str(config.get("role_models", {}).get(role, config.get("default_model", MODEL)))
+
+
+def risk_level_value(level: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(level, 3)
+
+
+def load_autonomy_policy() -> dict[str, Any]:
+    return dict(load_config().get("autonomy_policy", default_config()["autonomy_policy"]))
 
 
 def get_client() -> OpenAI:
@@ -246,12 +273,25 @@ Available tools and JSON arg schemas:
 - meta_review: {{"objective": "goal", "draft": "candidate answer", "context": "optional context"}}
 - create_checkpoint: {{"label": "before-cycle-1"}}
 - summarize_changes_since_checkpoint: {{"checkpoint": ".agent_checkpoints/..." }}
+- analyze_change_impact: {{"checkpoint": ".agent_checkpoints/..." }}
+- restore_checkpoint: {{"checkpoint": ".agent_checkpoints/...", "preserve_agent_state": true}}
 - validate_python_file: {{"path": "agent.py"}}
 - validate_workspace_python: {{"path": ".", "recursive": true}}
 - read_control_state: {{}}
 - set_control_mode: {{"mode": "continue|wrap_up|stop", "note": "optional note", "monitor": "quiet|summary"}}
+- evaluate_autonomy_policy: {{"impact": {{}}, "changed_files": ["agent.py"]}}
 - self_improve_codebase: {{"goal": "improve this codebase", "max_cycles": 5, "roles": ["planner", "coder", "reviewer"]}}
 - scan_improvement_opportunities: {{"goal": "improve this codebase"}}
+- select_next_improvement: {{}}
+- evaluate_improvement_opportunity: {{"opportunity": {{}}}}
+- update_improvement_opportunity: {{"opportunity_id": "opp_...", "status": "in_progress", "note": ""}}
+- record_improvement_outcome: {{"opportunity": {{}}, "status": "done", "validation_ok": true, "files_changed": []}}
+- show_improvement_learning: {{}}
+- start_experiment: {{"title": "...", "hypothesis": "...", "opportunity": {{}}}}
+- update_experiment: {{"experiment_id": "exp_...", "status": "completed", "evidence": {{}}, "conclusion": "..."}}
+- show_experiments: {{"status": ""}}
+- generate_health_report: {{"goal": "improve this codebase"}}
+- generate_planning_brief: {{"goal": "improve this codebase"}}
 - update_plan: {{"items": ["step 1", "step 2"]}}
 - show_plan: {{}}
 - remember: {{"key": "topic", "value": "durable fact"}}
@@ -420,6 +460,14 @@ def should_skip_checkpoint_path(path: Path) -> bool:
     )
 
 
+def should_preserve_on_restore(path: Path) -> bool:
+    rel = path.relative_to(WORKSPACE_ROOT)
+    parts = set(rel.parts)
+    if any(name in parts for name in {".git", ".agent_checkpoints", "__pycache__"}):
+        return True
+    return rel.name.startswith(".agent_")
+
+
 def iter_workspace_files(base: Path) -> list[Path]:
     files: list[Path] = []
     for item in base.rglob("*"):
@@ -567,6 +615,54 @@ def load_improvement_backlog() -> dict[str, Any]:
 
 def save_improvement_backlog(backlog: dict[str, Any]) -> None:
     IMPROVEMENT_BACKLOG_FILE.write_text(json.dumps(backlog, indent=2), encoding="utf-8")
+
+
+def default_improvement_learning() -> dict[str, Any]:
+    return {
+        "updated_at": "",
+        "opportunities": {},
+    }
+
+
+def opportunity_learning_key(opportunity: dict[str, Any]) -> str:
+    title = str(opportunity.get("title", "")).strip().lower()
+    target = str(opportunity.get("target", "")).strip().lower()
+    return f"{title}::{target}"
+
+
+def load_improvement_learning() -> dict[str, Any]:
+    if not IMPROVEMENT_LEARNING_FILE.exists():
+        return default_improvement_learning()
+    try:
+        data = json.loads(IMPROVEMENT_LEARNING_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default_improvement_learning()
+    return data if isinstance(data, dict) else default_improvement_learning()
+
+
+def save_improvement_learning(learning: dict[str, Any]) -> None:
+    learning["updated_at"] = utc_now()
+    IMPROVEMENT_LEARNING_FILE.write_text(json.dumps(learning, indent=2), encoding="utf-8")
+
+
+def default_experiment_journal() -> dict[str, Any]:
+    return {
+        "experiments": [],
+    }
+
+
+def load_experiment_journal() -> dict[str, Any]:
+    if not EXPERIMENT_JOURNAL_FILE.exists():
+        return default_experiment_journal()
+    try:
+        data = json.loads(EXPERIMENT_JOURNAL_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default_experiment_journal()
+    return data if isinstance(data, dict) and isinstance(data.get("experiments"), list) else default_experiment_journal()
+
+
+def save_experiment_journal(journal: dict[str, Any]) -> None:
+    EXPERIMENT_JOURNAL_FILE.write_text(json.dumps(journal, indent=2), encoding="utf-8")
 
 
 def run_subprocess(command: list[str], timeout: int = 15) -> subprocess.CompletedProcess[str]:
@@ -1091,10 +1187,13 @@ class AgentTools:
         add("meta_review", "Synthesize and critique a candidate result.", {"objective": "goal", "draft": "candidate answer", "context": "optional context"}, TOOL_RISK_AGENTIC, self.meta_review)
         add("create_checkpoint", "Snapshot workspace files for later comparison.", {"label": "before-cycle-1"}, TOOL_RISK_WRITE_FILE, self.create_checkpoint)
         add("summarize_changes_since_checkpoint", "Summarize file changes since a checkpoint.", {"checkpoint": ".agent_checkpoints/..."}, TOOL_RISK_READ_ONLY, self.summarize_changes_since_checkpoint)
+        add("analyze_change_impact", "Analyze changed files since a checkpoint and estimate semantic risk.", {"checkpoint": ".agent_checkpoints/..."}, TOOL_RISK_READ_ONLY, self.analyze_change_impact)
+        add("restore_checkpoint", "Restore workspace files from a checkpoint while preserving agent state by default.", {"checkpoint": ".agent_checkpoints/...", "preserve_agent_state": True}, TOOL_RISK_WRITE_FILE, self.restore_checkpoint)
         add("validate_python_file", "Compile-check one Python file.", {"path": "agent.py"}, TOOL_RISK_READ_ONLY, self.validate_python_file)
         add("validate_workspace_python", "Compile-check Python files in a workspace path.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.validate_workspace_python)
         add("read_control_state", "Read autonomous loop control state.", {}, TOOL_RISK_CONTROL, self.read_control_state)
         add("set_control_mode", "Set autonomous loop control mode.", {"mode": "continue|wrap_up|stop", "note": "optional note", "monitor": "quiet|summary"}, TOOL_RISK_CONTROL, self.set_control_mode)
+        add("evaluate_autonomy_policy", "Evaluate changed files and impact against configured autonomy risk budgets.", {"impact": {}, "changed_files": ["agent.py"]}, TOOL_RISK_READ_ONLY, self.evaluate_autonomy_policy)
         add("self_improve_codebase", "Run an interruptible autonomous codebase improvement loop.", {"goal": "improve this codebase", "max_cycles": 5, "roles": ["planner", "coder", "reviewer"]}, TOOL_RISK_AGENTIC, self.self_improve_codebase)
         add("create_task", "Create a persistent task record.", {"title": "...", "objective": "..."}, TOOL_RISK_MEMORY, self.create_task)
         add("update_task", "Update a persistent task record.", {"task_id": "...", "status": "...", "note": "", "plan": []}, TOOL_RISK_MEMORY, self.update_task)
@@ -1108,6 +1207,16 @@ class AgentTools:
         add("find_symbol", "Find indexed functions/classes by name.", {"name": "..."}, TOOL_RISK_READ_ONLY, self.find_symbol)
         add("summarize_python_file", "Summarize imports, classes, and functions in one Python file.", {"path": "agent.py"}, TOOL_RISK_READ_ONLY, self.summarize_python_file)
         add("scan_improvement_opportunities", "Build a scored backlog of safe codebase improvement opportunities.", {"goal": "improve this codebase"}, TOOL_RISK_READ_ONLY, self.scan_improvement_opportunities)
+        add("select_next_improvement", "Select the highest-ranked open improvement opportunity.", {}, TOOL_RISK_READ_ONLY, self.select_next_improvement)
+        add("evaluate_improvement_opportunity", "Apply manager policy gates to an improvement opportunity before execution.", {"opportunity": {}}, TOOL_RISK_READ_ONLY, self.evaluate_improvement_opportunity)
+        add("update_improvement_opportunity", "Update an improvement opportunity status and notes.", {"opportunity_id": "opp_...", "status": "in_progress", "note": ""}, TOOL_RISK_MEMORY, self.update_improvement_opportunity)
+        add("record_improvement_outcome", "Record learned outcome statistics for an improvement opportunity.", {"opportunity": {}, "status": "done", "validation_ok": True, "files_changed": []}, TOOL_RISK_MEMORY, self.record_improvement_outcome)
+        add("show_improvement_learning", "Show learned success and blockage rates for improvement opportunities.", {}, TOOL_RISK_READ_ONLY, self.show_improvement_learning)
+        add("start_experiment", "Start a persistent autonomous-improvement experiment record.", {"title": "...", "hypothesis": "...", "opportunity": {}}, TOOL_RISK_MEMORY, self.start_experiment)
+        add("update_experiment", "Update an experiment with evidence, status, and conclusion.", {"experiment_id": "exp_...", "status": "completed", "evidence": {}, "conclusion": "..."}, TOOL_RISK_MEMORY, self.update_experiment)
+        add("show_experiments", "Show experiment journal entries, optionally filtered by status.", {"status": ""}, TOOL_RISK_READ_ONLY, self.show_experiments)
+        add("generate_health_report", "Summarize platform health, risks, and recommended next improvements.", {"goal": "improve this codebase"}, TOOL_RISK_READ_ONLY, self.generate_health_report)
+        add("generate_planning_brief", "Generate a pre-flight execution brief for the next autonomous improvement.", {"goal": "improve this codebase"}, TOOL_RISK_READ_ONLY, self.generate_planning_brief)
         add("update_plan", "Replace the current in-memory plan.", {"items": ["step 1", "step 2"]}, TOOL_RISK_MEMORY, self.update_plan)
         add("show_plan", "Show the current in-memory plan.", {}, TOOL_RISK_READ_ONLY, self.show_plan)
         add("remember", "Store a durable memory key/value.", {"key": "topic", "value": "durable fact"}, TOOL_RISK_MEMORY, self.remember)
@@ -1828,6 +1937,138 @@ class AgentTools:
         )
         return ToolResult(True, json.dumps(summary, indent=2), meta=summary)
 
+    def analyze_change_impact(self, checkpoint: str) -> ToolResult:
+        summary_result = self.summarize_changes_since_checkpoint(checkpoint)
+        if not summary_result.ok:
+            return summary_result
+
+        summary = summary_result.meta
+        added = summary.get("added", [])
+        removed = summary.get("removed", [])
+        modified = summary.get("modified", [])
+        touched_paths = list(added) + list(removed) + [item.get("path", "") for item in modified]
+        python_paths = [path for path in touched_paths if str(path).endswith(".py")]
+        state_paths = [path for path in touched_paths if Path(str(path)).name.startswith(".agent_")]
+        symbol_impacts: list[dict[str, Any]] = []
+
+        for path in python_paths:
+            try:
+                target = resolve_workspace_path(str(path))
+            except ValueError:
+                continue
+            if not target.exists() or not target.is_file():
+                symbol_impacts.append({"path": path, "status": "removed_or_missing", "symbols": []})
+                continue
+            summary_file = self.summarize_python_file(str(path))
+            if not summary_file.ok:
+                symbol_impacts.append({"path": path, "status": "parse_failed", "error": summary_file.content})
+                continue
+            meta = summary_file.meta
+            symbol_impacts.append(
+                {
+                    "path": path,
+                    "status": "parsed",
+                    "functions": [
+                        {"name": item.get("name"), "line": item.get("line")}
+                        for item in meta.get("functions", [])
+                    ],
+                    "classes": [
+                        {
+                            "name": item.get("name"),
+                            "line": item.get("line"),
+                            "methods": item.get("methods", []),
+                        }
+                        for item in meta.get("classes", [])
+                    ],
+                }
+            )
+
+        risk_score = 0
+        risk_score += len(added) * 1
+        risk_score += len(removed) * 3
+        risk_score += len(modified) * 2
+        risk_score += len(python_paths) * 2
+        risk_score += len(state_paths) * 1
+        if any(path == "agent.py" for path in touched_paths):
+            risk_score += 4
+        if any(path in {"agent.py", ".agent_config.json"} for path in touched_paths) and removed:
+            risk_score += 4
+
+        if risk_score >= 14:
+            risk_level = "high"
+        elif risk_score >= 7:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+
+        payload = {
+            "checkpoint": checkpoint,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "touched_count": len([path for path in touched_paths if path]),
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "modified_count": len(modified),
+            "python_paths": python_paths,
+            "state_paths": state_paths,
+            "symbol_impacts": symbol_impacts,
+            "recommendations": [
+                "Run validation before continuing." if risk_level != "low" else "Validation still recommended.",
+                "Prefer rollback on failed validation." if risk_level in {"medium", "high"} else "Rollback likely unnecessary if validation passes.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def restore_checkpoint(self, checkpoint: str, preserve_agent_state: bool = True) -> ToolResult:
+        checkpoint_path = resolve_workspace_path(checkpoint)
+        if not checkpoint_path.exists() or not checkpoint_path.is_dir():
+            return ToolResult(False, f"Checkpoint not found: {checkpoint}")
+
+        restored: list[str] = []
+        removed: list[str] = []
+        skipped: list[str] = []
+        checkpoint_files = {
+            path.relative_to(checkpoint_path): path
+            for path in checkpoint_path.rglob("*")
+            if path.is_file()
+        }
+        current_files = {
+            path.relative_to(WORKSPACE_ROOT): path
+            for path in iter_workspace_files(WORKSPACE_ROOT)
+        }
+
+        for relative, source in checkpoint_files.items():
+            destination = WORKSPACE_ROOT / relative
+            if preserve_agent_state and should_preserve_on_restore(destination):
+                skipped.append(str(relative))
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            restored.append(str(relative))
+
+        for relative, current in current_files.items():
+            if relative in checkpoint_files:
+                continue
+            if preserve_agent_state and should_preserve_on_restore(current):
+                skipped.append(str(relative))
+                continue
+            if current.is_file():
+                current.unlink()
+                removed.append(str(relative))
+
+        payload = {
+            "checkpoint": checkpoint,
+            "preserve_agent_state": preserve_agent_state,
+            "restored": restored,
+            "removed": removed,
+            "skipped": skipped,
+        }
+        emit_monitor(
+            f"Checkpoint restored: restored={len(restored)} removed={len(removed)} skipped={len(skipped)}",
+            force=True,
+        )
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
     def validate_python_file(self, path: str) -> ToolResult:
         target = resolve_workspace_path(path)
         if not target.is_file():
@@ -1899,6 +2140,33 @@ class AgentTools:
             force=True,
         )
         return ToolResult(True, json.dumps(state, indent=2), meta=state)
+
+    def evaluate_autonomy_policy(self, impact: dict[str, Any], changed_files: list[str] | None = None) -> ToolResult:
+        policy = load_autonomy_policy()
+        changed_files = [str(path) for path in (changed_files or []) if str(path)]
+        risk_level = str(impact.get("risk_level", "high"))
+        state_paths = [path for path in changed_files if Path(path).name.startswith(".agent_")]
+        violations: list[str] = []
+
+        if len(changed_files) > int(policy["max_changed_files_per_cycle"]):
+            violations.append(
+                f"changed file count {len(changed_files)} exceeds max {policy['max_changed_files_per_cycle']}"
+            )
+        if risk_level_value(risk_level) > risk_level_value(str(policy["max_risk_level"])):
+            violations.append(f"risk level {risk_level} exceeds max {policy['max_risk_level']}")
+        if state_paths and not bool(policy["allow_state_file_changes"]):
+            violations.append(f"state file changes are not allowed: {state_paths}")
+
+        decision = "allow" if not violations else "rollback" if policy["rollback_on_policy_violation"] else "warn"
+        payload = {
+            "decision": decision,
+            "policy": policy,
+            "risk_level": risk_level,
+            "changed_files": changed_files,
+            "state_paths": state_paths,
+            "violations": violations,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
     def _append_task_artifacts(
         self,
@@ -1987,14 +2255,71 @@ class AgentTools:
             board = load_blackboard()
             code_index = self.index_codebase(path=".", recursive=True)
             backlog = self.scan_improvement_opportunities(goal=current_goal)
-            opportunities = backlog.meta.get("opportunities", []) if backlog.ok else []
-            top_opportunity = opportunities[0] if opportunities else {}
+            planning_brief = self.generate_planning_brief(goal=current_goal)
+            selected_opportunity = self.select_next_improvement()
+            top_opportunity = selected_opportunity.meta if selected_opportunity.ok else {}
+            opportunity_evaluation = top_opportunity.get("manager_evaluation", {}) if top_opportunity else {}
+            cycle_roles = selected_roles or planning_brief.meta.get("recommended_roles", [])
+            cycle_template = template_name
+            experiment: dict[str, Any] = {}
             if top_opportunity:
+                self.update_improvement_opportunity(
+                    opportunity_id=str(top_opportunity.get("id", "")),
+                    status="in_progress",
+                    note=f"Selected for autonomous cycle {cycle}.",
+                )
                 self.update_blackboard(
                     "todo",
                     f"Cycle {cycle} top opportunity: {top_opportunity.get('title')} "
                     f"(score={top_opportunity.get('score')}, target={top_opportunity.get('target')})",
                 )
+                if opportunity_evaluation.get("decision") != "approve":
+                    deferred_status = "rejected" if opportunity_evaluation.get("decision") == "reject" else "blocked"
+                    self.update_improvement_opportunity(
+                        opportunity_id=str(top_opportunity.get("id", "")),
+                        status=deferred_status,
+                        note=f"Governor decision={opportunity_evaluation.get('decision')}: {opportunity_evaluation.get('reasons', [])}",
+                    )
+                    self.record_improvement_outcome(
+                        opportunity=top_opportunity,
+                        status=deferred_status,
+                        validation_ok=True,
+                        files_changed=[],
+                    )
+                    cycle_reports.append(
+                        {
+                            "cycle": cycle,
+                            "goal": current_goal,
+                            "control": control,
+                            "top_opportunity": top_opportunity,
+                            "opportunity_evaluation": opportunity_evaluation,
+                            "team_ok": False,
+                            "team_summary": "Skipped execution because the improvement governor did not approve the opportunity.",
+                            "change_summary_ok": True,
+                            "change_summary": "{}",
+                            "validation_ok": True,
+                            "validation_summary": "{}",
+                            "review": {
+                                "continue_improving": False,
+                                "wrap_up_now": True,
+                                "next_focus": current_goal,
+                                "summary": "Improvement governor found no approved opportunity worth executing.",
+                                "reason": "governor_deferred_top_opportunity",
+                            },
+                        }
+                    )
+                    stop_reason = "governor_no_approved_opportunity"
+                    emit_monitor("Improvement governor did not approve the selected opportunity; wrapping up.", force=True)
+                    break
+                experiment_result = self.start_experiment(
+                    title=f"Cycle {cycle}: {top_opportunity.get('title', 'autonomous improvement')}",
+                    hypothesis=(
+                        f"If Cerebro addresses `{top_opportunity.get('title', 'this opportunity')}`, "
+                        f"then validation should remain green and the improvement should move the goal forward: {current_goal}"
+                    ),
+                    opportunity=top_opportunity,
+                )
+                experiment = experiment_result.meta if experiment_result.ok else {}
             cycle_label = f"self-improve-cycle-{cycle}-pre"
             checkpoint = self.create_checkpoint(label=cycle_label)
             emit_monitor(
@@ -2015,10 +2340,12 @@ class AgentTools:
                 f"- Leave the codebase in a good stopping state at the end of the cycle.\n"
                 f"- Use the code index, task state, blackboard, and validation tools before editing.\n"
                 f"- Prefer small reversible changes with explicit evidence.\n"
+                f"- Failed validation will trigger rollback to the pre-cycle checkpoint.\n"
             )
             manager_context = (
                 f"{self.state.context_summary()}\n\n"
                 f"Persistent task id: {task_id}\n\n"
+                f"Planning brief:\n{trim_text(planning_brief.content, 5000)}\n\n"
                 f"Shared blackboard:\n{json.dumps(board, indent=2)}\n\n"
                 f"Improvement backlog:\n{trim_text(backlog.content, 5000)}\n\n"
                 f"Latest code index preview:\n{trim_text(code_index.content, 5000)}"
@@ -2026,11 +2353,14 @@ class AgentTools:
             team_result = self.manager_execute(
                 task=cycle_task,
                 context=manager_context,
-                template=template_name,
-                roles=selected_roles,
+                template=cycle_template,
+                roles=cycle_roles,
             )
             change_summary = self.summarize_changes_since_checkpoint(checkpoint=checkpoint.meta.get("checkpoint", ""))
+            impact_analysis = self.analyze_change_impact(checkpoint=checkpoint.meta.get("checkpoint", ""))
             validation = self.run_self_improvement_validation(path=".")
+            rollback_result: ToolResult | None = None
+            post_rollback_validation: ToolResult | None = None
             changed_files: list[str] = []
             if change_summary.ok:
                 change_meta = change_summary.meta
@@ -2038,12 +2368,32 @@ class AgentTools:
                 changed_files.extend(change_meta.get("removed", []))
                 changed_files.extend(item.get("path", "") for item in change_meta.get("modified", []))
                 changed_files = [item for item in changed_files if item]
+            policy_result = self.evaluate_autonomy_policy(
+                impact=impact_analysis.meta if impact_analysis.ok else {},
+                changed_files=changed_files,
+            )
+            policy_violation = policy_result.meta.get("decision") == "rollback"
+            if (not validation.ok or policy_violation) and changed_files:
+                rollback_result = self.restore_checkpoint(
+                    checkpoint=checkpoint.meta.get("checkpoint", ""),
+                    preserve_agent_state=True,
+                )
+                post_rollback_validation = self.run_self_improvement_validation(path=".")
+                self.update_blackboard(
+                    "risks",
+                    f"Cycle {cycle} rollback triggered; validation_ok={validation.ok}; "
+                    f"policy_decision={policy_result.meta.get('decision')}; rollback_ok={rollback_result.ok}; "
+                    f"post_rollback_validation_ok={post_rollback_validation.ok}",
+                )
             self._append_task_artifacts(
                 task_id,
                 evidence={
                     "time": utc_now(),
                     "cycle": cycle,
                     "summary": trim_text(team_result.content, 1200),
+                    "impact": impact_analysis.meta if impact_analysis.ok else impact_analysis.content,
+                    "policy": policy_result.meta,
+                    "rollback": parse_json_value(rollback_result.content) if rollback_result else None,
                 },
                 files_changed=changed_files,
                 validation={
@@ -2051,14 +2401,63 @@ class AgentTools:
                     "cycle": cycle,
                     "ok": validation.ok,
                     "summary": validation.meta,
+                    "post_rollback_ok": post_rollback_validation.ok if post_rollback_validation else None,
                 },
             )
             self.update_blackboard(
                 "agent_notes",
                 f"Cycle {cycle}: team_ok={team_result.ok}, validation_ok={validation.ok}, changed_files={changed_files[:8]}",
             )
+            if top_opportunity:
+                opportunity_status = "done" if validation.ok and changed_files else "blocked"
+                if rollback_result:
+                    opportunity_status = "blocked"
+                opportunity_note = (
+                    f"Cycle {cycle} completed with validation_ok={validation.ok}; "
+                    f"changed_files={changed_files[:8]}; "
+                    f"policy_decision={policy_result.meta.get('decision')}; "
+                    f"rollback_ok={rollback_result.ok if rollback_result else None}"
+                )
+                self.update_improvement_opportunity(
+                    opportunity_id=str(top_opportunity.get("id", "")),
+                    status=opportunity_status,
+                    note=opportunity_note,
+                )
+                self.record_improvement_outcome(
+                    opportunity=top_opportunity,
+                    status=opportunity_status,
+                    validation_ok=validation.ok and rollback_result is None,
+                    files_changed=changed_files,
+                )
+            if experiment:
+                if rollback_result:
+                    experiment_status = "rolled_back"
+                elif validation.ok and changed_files:
+                    experiment_status = "completed"
+                elif validation.ok:
+                    experiment_status = "abandoned"
+                else:
+                    experiment_status = "failed"
+                self.update_experiment(
+                    experiment_id=str(experiment.get("id", "")),
+                    status=experiment_status,
+                    evidence={
+                    "cycle": cycle,
+                    "validation_ok": validation.ok,
+                    "changed_files": changed_files,
+                    "impact": impact_analysis.meta if impact_analysis.ok else impact_analysis.content,
+                    "policy": policy_result.meta,
+                    "rollback": parse_json_value(rollback_result.content) if rollback_result else None,
+                },
+                    conclusion=(
+                        f"Cycle ended with status={experiment_status}, "
+                        f"validation_ok={validation.ok}, files_changed={len(changed_files)}."
+                    ),
+                )
             emit_monitor(
-                f"Cycle {cycle} post-checks: changes_ok={change_summary.ok} validation_ok={validation.ok}",
+                f"Cycle {cycle} post-checks: changes_ok={change_summary.ok} "
+                f"impact={impact_analysis.meta.get('risk_level', 'unknown') if impact_analysis.ok else 'unknown'} "
+                f"validation_ok={validation.ok}",
                 force=True,
             )
 
@@ -2069,6 +2468,7 @@ class AgentTools:
                 f"External control mode: {control['mode']}\n\n"
                 f"Latest team result:\n{team_result.content}\n"
                 f"\nChange summary:\n{change_summary.content}\n"
+                f"\nImpact analysis:\n{impact_analysis.content}\n"
                 f"\nValidation summary:\n{validation.content}\n"
                 f"\nBlackboard:\n{json.dumps(load_blackboard(), indent=2)}\n"
             )
@@ -2095,12 +2495,22 @@ class AgentTools:
                 "control": control,
                 "checkpoint": checkpoint.meta.get("checkpoint", ""),
                 "top_opportunity": top_opportunity,
+                "opportunity_evaluation": opportunity_evaluation,
+                "planning_brief": planning_brief.meta if planning_brief.ok else planning_brief.content,
+                "experiment": experiment,
                 "team_ok": team_result.ok,
                 "team_summary": trim_text(team_result.content, 2000),
                 "change_summary_ok": change_summary.ok,
                 "change_summary": trim_text(change_summary.content, 3000),
+                "impact_analysis_ok": impact_analysis.ok,
+                "impact_analysis": trim_text(impact_analysis.content, 3000),
+                "policy_ok": policy_result.ok,
+                "policy": policy_result.meta,
                 "validation_ok": validation.ok,
                 "validation_summary": trim_text(validation.content, 2000),
+                "rollback": parse_json_value(rollback_result.content) if rollback_result else None,
+                "post_rollback_validation_ok": post_rollback_validation.ok if post_rollback_validation else None,
+                "post_rollback_validation_summary": trim_text(post_rollback_validation.content, 2000) if post_rollback_validation else None,
                 "review": review,
             }
             cycle_reports.append(cycle_report)
@@ -2144,6 +2554,8 @@ class AgentTools:
             "preflight_validation_ok": preflight_validation.ok,
             "preflight_backlog_ok": preflight_backlog.ok,
             "improvement_backlog_file": workspace_relative(IMPROVEMENT_BACKLOG_FILE),
+            "improvement_learning_file": workspace_relative(IMPROVEMENT_LEARNING_FILE),
+            "experiment_journal_file": workspace_relative(EXPERIMENT_JOURNAL_FILE),
             "control_file": workspace_relative(CONTROL_FILE),
             "cycle_reports": cycle_reports,
         }
@@ -2348,6 +2760,13 @@ class AgentTools:
         index = index_result.meta if index_result.ok else parse_json_value(index_result.content)
         files = index.get("files", []) if isinstance(index, dict) else []
         goal_text = goal.lower()
+        previous_backlog = load_improvement_backlog()
+        previous_by_key = {
+            (str(item.get("title", "")), str(item.get("target", ""))): item
+            for item in previous_backlog.get("opportunities", [])
+            if isinstance(item, dict)
+        }
+        learning = load_improvement_learning().get("opportunities", {})
         opportunities: list[dict[str, Any]] = []
 
         def add_opportunity(
@@ -2360,10 +2779,23 @@ class AgentTools:
             effort: int,
             evidence: list[str],
         ) -> None:
-            score = max(0, impact * 3 + confidence * 2 - risk * 2 - effort)
+            previous = previous_by_key.get((title, target), {})
+            learned = learning.get(f"{title.strip().lower()}::{target.strip().lower()}", {})
+            attempts = int(learned.get("attempts", 0)) if isinstance(learned, dict) else 0
+            success_rate = float(learned.get("success_rate", 0.0)) if isinstance(learned, dict) else 0.0
+            blocked_rate = float(learned.get("blocked_rate", 0.0)) if isinstance(learned, dict) else 0.0
+            learning_adjustment = 0
+            if attempts >= 2:
+                learning_adjustment += round(success_rate * 4)
+                learning_adjustment -= round(blocked_rate * 5)
+            score = max(0, impact * 3 + confidence * 2 - risk * 2 - effort + learning_adjustment)
+            history = previous.get("history") if isinstance(previous.get("history"), list) else []
+            status = str(previous.get("status", "open"))
+            if not history:
+                history = [{"time": utc_now(), "status": status, "note": "Opportunity discovered."}]
             opportunities.append(
                 {
-                    "id": f"opp_{uuid.uuid4().hex[:10]}",
+                    "id": previous.get("id") or f"opp_{uuid.uuid4().hex[:10]}",
                     "title": title,
                     "rationale": rationale,
                     "target": target,
@@ -2372,6 +2804,10 @@ class AgentTools:
                     "risk": risk,
                     "effort": effort,
                     "score": score,
+                    "learning_adjustment": learning_adjustment,
+                    "learning": learned,
+                    "status": status,
+                    "history": history,
                     "evidence": evidence,
                 }
             )
@@ -2474,6 +2910,355 @@ class AgentTools:
         }
         save_improvement_backlog(backlog)
         return ToolResult(True, json.dumps(backlog, indent=2), meta=backlog)
+
+    def select_next_improvement(self) -> ToolResult:
+        backlog = load_improvement_backlog()
+        opportunities = [
+            item
+            for item in backlog.get("opportunities", [])
+            if item.get("status", "open") in {"open", "planned"}
+        ]
+        if not opportunities:
+            return ToolResult(False, "No open improvement opportunities. Run scan_improvement_opportunities first.")
+        ranked: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for item in opportunities:
+            evaluation = self.evaluate_improvement_opportunity(item)
+            ranked.append((item, evaluation.meta))
+        ranked.sort(
+            key=lambda pair: (
+                0 if pair[1].get("decision") == "approve" else 1,
+                -int(pair[1].get("priority_score", 0)),
+                int(pair[0].get("risk", 5)),
+                int(pair[0].get("effort", 5)),
+            )
+        )
+        selected, evaluation = ranked[0]
+        selected = {**selected, "manager_evaluation": evaluation}
+        return ToolResult(True, json.dumps(selected, indent=2), meta=selected)
+
+    def evaluate_improvement_opportunity(self, opportunity: dict[str, Any]) -> ToolResult:
+        validation = self.run_self_improvement_validation(path=".")
+        validation_meta = validation.meta if isinstance(validation.meta, dict) else {}
+        hard_failures = validation_meta.get("hard_failures", [])
+        impact = int(opportunity.get("impact", 0))
+        confidence = int(opportunity.get("confidence", 0))
+        risk = int(opportunity.get("risk", 5))
+        effort = int(opportunity.get("effort", 5))
+        history = opportunity.get("history", [])
+        learned = load_improvement_learning().get("opportunities", {}).get(opportunity_learning_key(opportunity), {})
+        learned_attempts = int(learned.get("attempts", 0)) if isinstance(learned, dict) else 0
+        learned_success_rate = float(learned.get("success_rate", 0.0)) if isinstance(learned, dict) else 0.0
+        learned_blocked_rate = float(learned.get("blocked_rate", 0.0)) if isinstance(learned, dict) else 0.0
+        blocked_count = sum(
+            1
+            for item in history
+            if isinstance(item, dict) and item.get("status") in {"blocked", "rejected"}
+        )
+        learned_adjustment = 0
+        if learned_attempts >= 2:
+            learned_adjustment += round(learned_success_rate * 5)
+            learned_adjustment -= round(learned_blocked_rate * 6)
+        priority_score = max(0, impact * 4 + confidence * 3 - risk * 3 - effort * 2 - blocked_count * 4 + learned_adjustment)
+        reasons: list[str] = []
+        decision = "approve"
+
+        if hard_failures and opportunity.get("target") != "validation":
+            decision = "defer"
+            reasons.append("Hard validation failures exist; prioritize validation repairs first.")
+        if risk >= 5 and confidence < 4:
+            decision = "reject"
+            reasons.append("Risk is high and confidence is too low.")
+        elif risk >= 4 and impact < 4:
+            decision = "defer"
+            reasons.append("Risk is not justified by impact.")
+        if blocked_count >= 2:
+            decision = "defer"
+            reasons.append("Opportunity has been blocked or rejected repeatedly.")
+        if learned_attempts >= 3 and learned_blocked_rate >= 0.66:
+            decision = "defer"
+            reasons.append("Learning memory shows this opportunity type is frequently blocked.")
+        if priority_score < 8 and decision == "approve":
+            decision = "defer"
+            reasons.append("Priority score is below the execution threshold.")
+        if not reasons:
+            reasons.append("Expected value is acceptable under current validation state.")
+
+        payload = {
+            "decision": decision,
+            "priority_score": priority_score,
+            "validation_ok": validation.ok,
+            "hard_failures": hard_failures,
+            "blocked_or_rejected_count": blocked_count,
+            "learned_attempts": learned_attempts,
+            "learned_success_rate": learned_success_rate,
+            "learned_blocked_rate": learned_blocked_rate,
+            "learned_adjustment": learned_adjustment,
+            "reasons": reasons,
+            "opportunity_id": opportunity.get("id", ""),
+            "title": opportunity.get("title", ""),
+            "target": opportunity.get("target", ""),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def update_improvement_opportunity(self, opportunity_id: str, status: str, note: str = "") -> ToolResult:
+        allowed = {"open", "planned", "in_progress", "done", "blocked", "rejected"}
+        if status not in allowed:
+            return ToolResult(False, f"status must be one of: {', '.join(sorted(allowed))}")
+        backlog = load_improvement_backlog()
+        for item in backlog.get("opportunities", []):
+            if item.get("id") != opportunity_id:
+                continue
+            item["status"] = status
+            item.setdefault("history", []).append(
+                {
+                    "time": utc_now(),
+                    "status": status,
+                    "note": note,
+                }
+            )
+            save_improvement_backlog(backlog)
+            return ToolResult(True, json.dumps(item, indent=2), meta=item)
+        return ToolResult(False, f"Opportunity not found: {opportunity_id}")
+
+    def record_improvement_outcome(
+        self,
+        opportunity: dict[str, Any],
+        status: str,
+        validation_ok: bool,
+        files_changed: list[str] | None = None,
+    ) -> ToolResult:
+        learning = load_improvement_learning()
+        records = learning.setdefault("opportunities", {})
+        key = opportunity_learning_key(opportunity)
+        record = records.setdefault(
+            key,
+            {
+                "title": opportunity.get("title", ""),
+                "target": opportunity.get("target", ""),
+                "attempts": 0,
+                "successes": 0,
+                "blocked": 0,
+                "validation_failures": 0,
+                "files_changed_total": 0,
+                "last_outcome": {},
+            },
+        )
+        record["attempts"] = int(record.get("attempts", 0)) + 1
+        if status == "done" and validation_ok:
+            record["successes"] = int(record.get("successes", 0)) + 1
+        if status in {"blocked", "rejected"}:
+            record["blocked"] = int(record.get("blocked", 0)) + 1
+        if not validation_ok:
+            record["validation_failures"] = int(record.get("validation_failures", 0)) + 1
+        changed_count = len(files_changed or [])
+        record["files_changed_total"] = int(record.get("files_changed_total", 0)) + changed_count
+        attempts = max(1, int(record["attempts"]))
+        record["success_rate"] = round(int(record.get("successes", 0)) / attempts, 3)
+        record["blocked_rate"] = round(int(record.get("blocked", 0)) / attempts, 3)
+        record["last_outcome"] = {
+            "time": utc_now(),
+            "status": status,
+            "validation_ok": validation_ok,
+            "files_changed": files_changed or [],
+        }
+        save_improvement_learning(learning)
+        return ToolResult(True, json.dumps(record, indent=2), meta=record)
+
+    def show_improvement_learning(self) -> ToolResult:
+        learning = load_improvement_learning()
+        return ToolResult(True, json.dumps(learning, indent=2), meta=learning)
+
+    def start_experiment(self, title: str, hypothesis: str, opportunity: dict[str, Any] | None = None) -> ToolResult:
+        journal = load_experiment_journal()
+        now = utc_now()
+        experiment = {
+            "id": f"exp_{uuid.uuid4().hex[:12]}",
+            "title": title,
+            "hypothesis": hypothesis,
+            "status": "running",
+            "opportunity": opportunity or {},
+            "evidence": [],
+            "conclusion": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        journal["experiments"].append(experiment)
+        save_experiment_journal(journal)
+        return ToolResult(True, json.dumps(experiment, indent=2), meta=experiment)
+
+    def update_experiment(
+        self,
+        experiment_id: str,
+        status: str,
+        evidence: dict[str, Any] | None = None,
+        conclusion: str = "",
+    ) -> ToolResult:
+        allowed = {"planned", "running", "completed", "failed", "rolled_back", "abandoned"}
+        if status not in allowed:
+            return ToolResult(False, f"status must be one of: {', '.join(sorted(allowed))}")
+        journal = load_experiment_journal()
+        for experiment in journal["experiments"]:
+            if experiment.get("id") != experiment_id:
+                continue
+            experiment["status"] = status
+            if evidence:
+                experiment.setdefault("evidence", []).append({"time": utc_now(), **evidence})
+            if conclusion:
+                experiment["conclusion"] = conclusion
+            experiment["updated_at"] = utc_now()
+            save_experiment_journal(journal)
+            return ToolResult(True, json.dumps(experiment, indent=2), meta=experiment)
+        return ToolResult(False, f"Experiment not found: {experiment_id}")
+
+    def show_experiments(self, status: str = "") -> ToolResult:
+        journal = load_experiment_journal()
+        experiments = journal["experiments"]
+        if status:
+            experiments = [item for item in experiments if item.get("status") == status]
+        payload = {"experiments": experiments}
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def generate_health_report(self, goal: str = "improve this codebase") -> ToolResult:
+        validation = self.run_self_improvement_validation(path=".")
+        code_index = self.index_codebase(path=".", recursive=True)
+        backlog = self.scan_improvement_opportunities(goal=goal)
+        selected = self.select_next_improvement()
+        learning = load_improvement_learning()
+        experiments = load_experiment_journal().get("experiments", [])
+        tasks = load_tasks().get("tasks", [])
+
+        risk_counts: dict[str, int] = {}
+        for spec in self.tool_specs.values():
+            risk_counts[spec.risk] = risk_counts.get(spec.risk, 0) + 1
+
+        task_status_counts: dict[str, int] = {}
+        for task in tasks:
+            status = str(task.get("status", "unknown"))
+            task_status_counts[status] = task_status_counts.get(status, 0) + 1
+
+        experiment_status_counts: dict[str, int] = {}
+        for experiment in experiments:
+            status = str(experiment.get("status", "unknown"))
+            experiment_status_counts[status] = experiment_status_counts.get(status, 0) + 1
+
+        opportunities = backlog.meta.get("opportunities", []) if backlog.ok else []
+        opportunity_status_counts: dict[str, int] = {}
+        for opportunity in opportunities:
+            status = str(opportunity.get("status", "unknown"))
+            opportunity_status_counts[status] = opportunity_status_counts.get(status, 0) + 1
+
+        learning_records = learning.get("opportunities", {}) if isinstance(learning, dict) else {}
+        learned_attempts = sum(int(item.get("attempts", 0)) for item in learning_records.values() if isinstance(item, dict))
+        learned_successes = sum(int(item.get("successes", 0)) for item in learning_records.values() if isinstance(item, dict))
+        learned_blocked = sum(int(item.get("blocked", 0)) for item in learning_records.values() if isinstance(item, dict))
+
+        recommendations: list[str] = []
+        validation_meta = validation.meta if isinstance(validation.meta, dict) else {}
+        if validation_meta.get("hard_failures"):
+            recommendations.append("Fix hard validation failures before attempting feature work.")
+        if selected.ok:
+            evaluation = selected.meta.get("manager_evaluation", {})
+            recommendations.append(
+                f"Next approved focus: {selected.meta.get('title')} "
+                f"(decision={evaluation.get('decision')}, priority={evaluation.get('priority_score')})."
+            )
+        if task_status_counts.get("running", 0) + task_status_counts.get("blocked", 0) > 3:
+            recommendations.append("Reconcile stale running or blocked task records before long autonomous runs.")
+        if learned_attempts == 0:
+            recommendations.append("Run at least one controlled improvement experiment to seed learning statistics.")
+        elif learned_blocked > learned_successes:
+            recommendations.append("Prefer lower-risk opportunities until blocked-rate improves.")
+        if not recommendations:
+            recommendations.append("Platform health is acceptable; proceed with the top governed improvement opportunity.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "goal": goal,
+            "autonomy_policy": load_autonomy_policy(),
+            "validation": {
+                "ok": validation.ok,
+                "summary": validation_meta,
+            },
+            "code_index": {
+                "ok": code_index.ok,
+                "files_indexed": len(code_index.meta.get("files", [])) if code_index.ok else 0,
+                "errors": code_index.meta.get("errors", []) if code_index.ok else [],
+            },
+            "tools": {
+                "total": len(self.tool_specs),
+                "risk_counts": risk_counts,
+            },
+            "tasks": {
+                "total": len(tasks),
+                "status_counts": task_status_counts,
+            },
+            "experiments": {
+                "total": len(experiments),
+                "status_counts": experiment_status_counts,
+                "journal_file": workspace_relative(EXPERIMENT_JOURNAL_FILE),
+            },
+            "improvement_backlog": {
+                "ok": backlog.ok,
+                "opportunity_count": len(opportunities),
+                "status_counts": opportunity_status_counts,
+                "selected": selected.meta if selected.ok else None,
+                "backlog_file": workspace_relative(IMPROVEMENT_BACKLOG_FILE),
+            },
+            "learning": {
+                "records": len(learning_records),
+                "attempts": learned_attempts,
+                "successes": learned_successes,
+                "blocked": learned_blocked,
+                "learning_file": workspace_relative(IMPROVEMENT_LEARNING_FILE),
+            },
+            "recommendations": recommendations,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def generate_planning_brief(self, goal: str = "improve this codebase") -> ToolResult:
+        health = self.generate_health_report(goal=goal)
+        selected = health.meta.get("improvement_backlog", {}).get("selected") if health.ok else None
+        selected = selected or {}
+        evaluation = selected.get("manager_evaluation", {}) if isinstance(selected, dict) else {}
+        decision = evaluation.get("decision", "unknown")
+        roles = ["planner", "coder", "reviewer"]
+        if selected.get("target") == "validation":
+            roles = ["coder", "tester", "reviewer"]
+        elif decision != "approve":
+            roles = ["researcher", "planner", "critic"]
+
+        acceptance_criteria = [
+            "Validation suite must pass or the cycle must roll back.",
+            "Autonomy policy must allow the final changed-file count and impact risk.",
+            "Experiment journal must record hypothesis, evidence, and conclusion.",
+            "Improvement learning must record the final opportunity outcome.",
+        ]
+        if selected:
+            acceptance_criteria.append(f"Selected opportunity should be addressed or explicitly blocked: {selected.get('title')}.")
+
+        brief = {
+            "generated_at": utc_now(),
+            "goal": goal,
+            "selected_opportunity": selected,
+            "governor_decision": decision,
+            "recommended_roles": roles,
+            "autonomy_policy": health.meta.get("autonomy_policy", {}),
+            "health_recommendations": health.meta.get("recommendations", []),
+            "execution_constraints": [
+                "Prefer the smallest reversible change that can satisfy the selected opportunity.",
+                "Use checkpoint, impact analysis, validation, policy evaluation, and rollback if needed.",
+                "Do not broaden scope beyond the selected opportunity unless validation is failing.",
+                "Preserve .agent_* state files during rollback.",
+            ],
+            "acceptance_criteria": acceptance_criteria,
+            "health_summary": {
+                "validation_ok": health.meta.get("validation", {}).get("ok"),
+                "tool_total": health.meta.get("tools", {}).get("total"),
+                "learning_attempts": health.meta.get("learning", {}).get("attempts"),
+                "open_backlog_items": health.meta.get("improvement_backlog", {}).get("status_counts", {}).get("open", 0),
+            },
+        }
+        return ToolResult(True, json.dumps(brief, indent=2), meta=brief)
 
     def update_plan(self, items: list[str]) -> ToolResult:
         cleaned = [item.strip() for item in items if item.strip()]
