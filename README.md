@@ -1,6 +1,6 @@
 # Cerebro
 
-A local AI agent designed to manage your Python codebase autonomously.
+A local AI agent designed to manage your codebase and sub-agents autonomously.
 
 ## Overview
 
