@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import difflib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -23,6 +24,11 @@ try:
     from openai import OpenAI
 except ImportError:  # Keep local validation tools importable without optional client deps.
     OpenAI = None
+
+try:
+    import anthropic
+except ImportError:  # Claude support is optional and only required when configured.
+    anthropic = None
 
 
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -193,6 +199,7 @@ def clear_terminal() -> None:
 
 def default_config() -> dict[str, Any]:
     role_models = {role: MODEL for role in ROLE_CATALOG}
+    role_providers = {role: "lmstudio" for role in ROLE_CATALOG}
     return {
         "provider": "lmstudio",
         "base_url": "http://localhost:1234/v1",
@@ -202,14 +209,79 @@ def default_config() -> dict[str, Any]:
         "max_steps": MAX_STEPS,
         "max_batch_actions": MAX_BATCH_ACTIONS,
         "monitor": DEFAULT_MONITOR_MODE,
+        "show_thinking_indicator": True,
+        "fallback_provider": "lmstudio",
         "autonomy_policy": {
             "max_changed_files_per_cycle": 4,
             "max_risk_level": "medium",
             "rollback_on_policy_violation": True,
             "allow_state_file_changes": True,
         },
+        "llm_providers": {
+            "lmstudio": {
+                "type": "openai_compatible",
+                "base_url": "http://localhost:1234/v1",
+                "api_key": "lm-studio",
+                "model": MODEL,
+                "auto_discover_model": True,
+            },
+            "openai": {
+                "type": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "gpt-4.1",
+            },
+            "anthropic": {
+                "type": "anthropic",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 4096,
+            },
+            "xai": {
+                "type": "openai_compatible",
+                "base_url": "https://api.x.ai/v1",
+                "api_key_env": "XAI_API_KEY",
+                "model": "grok-3",
+            },
+        },
+        "role_providers": role_providers,
         "role_models": role_models,
     }
+
+
+def merge_provider_config(defaults: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    providers = {
+        str(name): dict(settings)
+        for name, settings in defaults.get("llm_providers", {}).items()
+        if isinstance(settings, dict)
+    }
+    parsed_providers = parsed.get("llm_providers", {})
+    if isinstance(parsed_providers, dict):
+        for name, settings in parsed_providers.items():
+            if isinstance(settings, dict):
+                providers[str(name)] = providers.get(str(name), {}) | settings
+
+    legacy_provider = str(parsed.get("provider", defaults.get("provider", "lmstudio")))
+    if legacy_provider not in providers:
+        providers[legacy_provider] = {
+            "type": "openai_compatible",
+            "base_url": parsed.get("base_url", defaults.get("base_url")),
+            "api_key": parsed.get("api_key", defaults.get("api_key")),
+            "model": parsed.get("default_model", defaults.get("default_model", MODEL)),
+        }
+
+    # Preserve old single-provider config fields as the selected provider's defaults.
+    if "base_url" in parsed:
+        providers[legacy_provider]["base_url"] = parsed["base_url"]
+    if "api_key" in parsed:
+        providers[legacy_provider]["api_key"] = parsed["api_key"]
+    if "default_model" in parsed:
+        providers[legacy_provider]["model"] = parsed["default_model"]
+
+    for settings in providers.values():
+        settings.setdefault("type", "openai_compatible")
+        settings.setdefault("model", MODEL)
+    return providers
 
 
 def load_config() -> dict[str, Any]:
@@ -226,12 +298,43 @@ def load_config() -> dict[str, Any]:
         return defaults
 
     config = defaults | parsed
-    role_models = defaults["role_models"] | parsed.get("role_models", {})
+    config["llm_providers"] = merge_provider_config(defaults, parsed)
+    if config.get("provider") not in config["llm_providers"]:
+        config["provider"] = defaults["provider"]
+    selected_provider = config["llm_providers"].get(config["provider"], {})
+    config["base_url"] = selected_provider.get("base_url", config.get("base_url", defaults["base_url"]))
+    config["api_key"] = selected_provider.get("api_key", config.get("api_key", defaults["api_key"]))
+    config["default_model"] = selected_provider.get("model", config.get("default_model", MODEL))
+
+    parsed_role_providers = parsed.get("role_providers", {})
+    if not isinstance(parsed_role_providers, dict):
+        parsed_role_providers = {}
+    default_role_providers = defaults["role_providers"]
+    config["role_providers"] = {
+        role: str(parsed_role_providers.get(role, default_role_providers.get(role, config["provider"])))
+        if str(parsed_role_providers.get(role, default_role_providers.get(role, config["provider"]))) in config["llm_providers"]
+        else str(config["provider"])
+        for role in ROLE_CATALOG
+    }
+
+    parsed_role_models = parsed.get("role_models", {})
+    if not isinstance(parsed_role_models, dict):
+        parsed_role_models = {}
+    role_models = defaults["role_models"] | parsed_role_models
     migrated = False
-    if set(role_models) != set(parsed.get("role_models", {})):
+    if set(role_models) != set(parsed_role_models):
         migrated = True
     config["role_models"] = {
-        role: str(role_models.get(role, config["default_model"]))
+        role: str(config["llm_providers"].get(config["role_providers"][role], {}).get("model", config["default_model"]))
+        if role_models.get(role) == MODEL
+        and config["role_providers"][role] != config.get("provider")
+        and config["llm_providers"].get(config["role_providers"][role], {}).get("model") != MODEL
+        else str(
+            role_models.get(
+                role,
+                config["llm_providers"].get(config["role_providers"][role], {}).get("model", config["default_model"]),
+            )
+        )
         for role in ROLE_CATALOG
     }
     config["max_steps"] = max(1, int(config.get("max_steps", MAX_STEPS)))
@@ -239,6 +342,9 @@ def load_config() -> dict[str, Any]:
     config["temperature"] = float(config.get("temperature", 0.25))
     if config.get("monitor") not in {"quiet", "summary"}:
         config["monitor"] = DEFAULT_MONITOR_MODE
+    config["show_thinking_indicator"] = bool(config.get("show_thinking_indicator", False))
+    if config.get("fallback_provider") not in config["llm_providers"]:
+        config["fallback_provider"] = defaults["fallback_provider"]
     policy_defaults = defaults["autonomy_policy"]
     parsed_policy = parsed.get("autonomy_policy", {})
     if not isinstance(parsed_policy, dict):
@@ -250,7 +356,14 @@ def load_config() -> dict[str, Any]:
     policy["rollback_on_policy_violation"] = bool(policy.get("rollback_on_policy_violation", True))
     policy["allow_state_file_changes"] = bool(policy.get("allow_state_file_changes", True))
     config["autonomy_policy"] = policy
-    if migrated or "autonomy_policy" not in parsed:
+    if (
+        migrated
+        or "autonomy_policy" not in parsed
+        or "llm_providers" not in parsed
+        or "role_providers" not in parsed
+        or "fallback_provider" not in parsed
+        or "show_thinking_indicator" not in parsed
+    ):
         save_config(config)
     return config
 
@@ -259,9 +372,32 @@ def save_config(config: dict[str, Any]) -> None:
     CONFIG_FILE.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def redacted_llm_providers(providers: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for name, settings in providers.items():
+        if not isinstance(settings, dict):
+            continue
+        visible = dict(settings)
+        if visible.get("api_key"):
+            visible["api_key"] = "<redacted>"
+        redacted[str(name)] = visible
+    return redacted
+
+
 def get_role_model(role: str) -> str:
     config = load_config()
-    return str(config.get("role_models", {}).get(role, config.get("default_model", MODEL)))
+    provider = get_role_provider(role, config)
+    provider_model = config.get("llm_providers", {}).get(provider, {}).get("model", config.get("default_model", MODEL))
+    return str(config.get("role_models", {}).get(role, provider_model))
+
+
+def get_role_provider(role: str, config: dict[str, Any] | None = None) -> str:
+    config = config or load_config()
+    providers = config.get("llm_providers", {})
+    provider = str(config.get("role_providers", {}).get(role, config.get("provider", "lmstudio")))
+    if provider not in providers:
+        provider = str(config.get("provider", "lmstudio"))
+    return provider
 
 
 def risk_level_value(level: str) -> int:
@@ -358,14 +494,151 @@ def redraw_repl_screen(control: dict[str, Any], transcript: list[dict[str, str]]
             print(terminal_color("Cerebro: ", "94") + render_terminal_markdown(content))
 
 
-def get_client() -> OpenAI:
+def read_provider_api_key(provider_config: dict[str, Any]) -> str:
+    env_name = str(provider_config.get("api_key_env", "")).strip()
+    if env_name:
+        return os.environ.get(env_name, "")
+    return str(provider_config.get("api_key", ""))
+
+
+def get_provider_config(provider: str | None = None) -> tuple[str, dict[str, Any]]:
+    config = load_config()
+    providers = config.get("llm_providers", {})
+    selected = str(provider or config.get("provider", "lmstudio"))
+    if selected not in providers:
+        selected = str(config.get("provider", "lmstudio"))
+    provider_config = dict(providers.get(selected, {}))
+    provider_config.setdefault("type", "openai_compatible")
+    provider_config.setdefault("base_url", config.get("base_url", "http://localhost:1234/v1"))
+    provider_config.setdefault("api_key", config.get("api_key", "lm-studio"))
+    provider_config.setdefault("model", config.get("default_model", MODEL))
+    return selected, provider_config
+
+
+def get_client(provider: str | None = None) -> OpenAI:
     if OpenAI is None:
         raise RuntimeError("The openai package is required for model calls but is not installed.")
-    config = load_config()
+    _, provider_config = get_provider_config(provider)
+    api_key = read_provider_api_key(provider_config)
+    if not api_key:
+        env_hint = provider_config.get("api_key_env")
+        hint = f" Set environment variable {env_hint}." if env_hint else ""
+        raise RuntimeError(f"No API key configured for provider.{hint}")
     return OpenAI(
-        base_url=str(config.get("base_url", "http://localhost:1234/v1")),
-        api_key=str(config.get("api_key", "lm-studio")),
+        base_url=str(provider_config.get("base_url", "http://localhost:1234/v1")),
+        api_key=api_key,
     )
+
+
+def should_auto_discover_model(provider_name: str, provider_config: dict[str, Any], model: str) -> bool:
+    if not bool(provider_config.get("auto_discover_model", provider_name == "lmstudio")):
+        return False
+    provider_type = str(provider_config.get("type", "openai_compatible")).lower()
+    if provider_type not in {"openai", "openai_compatible"}:
+        return False
+    base_url = str(provider_config.get("base_url", ""))
+    return model == MODEL or "localhost" in base_url or "127.0.0.1" in base_url
+
+
+def discover_provider_model(provider_name: str, provider_config: dict[str, Any], preferred_model: str) -> str:
+    if not should_auto_discover_model(provider_name, provider_config, preferred_model):
+        return preferred_model
+    try:
+        models = list(get_client(provider_name).models.list().data)
+    except Exception as exc:
+        log_run_event(
+            "model_discovery_failed",
+            {
+                "provider": provider_name,
+                "preferred_model": preferred_model,
+                "error": trim_text(str(exc), 1000),
+            },
+        )
+        return preferred_model
+    model_ids = [str(getattr(item, "id", "")) for item in models if getattr(item, "id", "")]
+    if not model_ids:
+        return preferred_model
+    if preferred_model in model_ids:
+        return preferred_model
+    selected = model_ids[0]
+    log_run_event(
+        "model_auto_discovered",
+        {
+            "provider": provider_name,
+            "preferred_model": preferred_model,
+            "selected_model": selected,
+            "available_models": model_ids[:20],
+        },
+    )
+    return selected
+
+
+def call_model_once(
+    messages: list[dict[str, str]],
+    *,
+    provider_name: str,
+    provider_config: dict[str, Any],
+    model: str,
+    temperature: float,
+) -> str:
+    provider_type = str(provider_config.get("type", "openai_compatible")).lower()
+    if provider_type == "anthropic":
+        if anthropic is None:
+            raise RuntimeError("The anthropic package is required for Claude calls but is not installed.")
+        api_key = read_provider_api_key(provider_config)
+        if not api_key:
+            env_hint = provider_config.get("api_key_env")
+            hint = f" Set environment variable {env_hint}." if env_hint else ""
+            raise RuntimeError(f"No API key configured for provider `{provider_name}`.{hint}")
+        system_parts = [item.get("content", "") for item in messages if item.get("role") == "system"]
+        anthropic_messages = [
+            {"role": item.get("role", "user"), "content": item.get("content", "")}
+            for item in messages
+            if item.get("role") in {"user", "assistant"}
+        ]
+        response = anthropic.Anthropic(api_key=api_key).messages.create(
+            model=model,
+            max_tokens=int(provider_config.get("max_tokens", 4096)),
+            temperature=temperature,
+            system="\n\n".join(system_parts),
+            messages=anthropic_messages,
+        )
+        return "".join(
+            block.text
+            for block in response.content
+            if getattr(block, "type", "") == "text" and getattr(block, "text", None)
+        )
+
+    resolved_model = discover_provider_model(provider_name, provider_config, model)
+    response = get_client(provider_name).chat.completions.create(
+        model=resolved_model,
+        messages=messages,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content or ""
+
+
+def model_fallback_notice(provider: str, model: str, fallback_provider: str, fallback_model: str, error: Exception) -> str:
+    return (
+        f"Model route `{provider}/{model}` was unavailable, so Cerebro retried with "
+        f"`{fallback_provider}/{fallback_model}`. Original error: {trim_text(str(error), 500)}"
+    )
+
+
+def format_agent_failure(exc: Exception) -> str:
+    message = str(exc)
+    lower = message.lower()
+    if "no models loaded" in lower or "model has crashed" in lower:
+        return (
+            "Model unavailable. Load a model in LM Studio or update `.agent_config.json` "
+            "to route the active role to an available provider. "
+            f"Details: {trim_text(message, 600)}"
+        )
+    if "anthropic package" in lower:
+        return "Claude is configured but the `anthropic` package is not installed. Run `python -m pip install anthropic` or route that role back to `lmstudio`."
+    if "api key" in lower:
+        return f"Model provider is missing an API key. {trim_text(message, 600)}"
+    return f"Agent failure: {trim_text(message, 800)}"
 
 def clear_current_line() -> None:
     if sys.stdout.isatty():
@@ -592,6 +865,7 @@ Available tools and JSON arg schemas:
 - update_user_profile: {{"field": "identity.first_name", "value": "..."}}
 - add_user_profile_note: {{"note": "...", "category": "preference"}}
 - forget_user_profile_field: {{"field": "contact.phone"}}
+- list_llm_routes: {{}}
 - show_history: {{"limit": 8}}
 """
 
@@ -839,7 +1113,7 @@ ACTIVITY_ICONS = {
 def shimmer_text(text: str, offset: int = 0) -> str:
     if not sys.stdout.isatty():
         return text
-    colors = ["90", "36", "96", "97", "96", "36"]
+    colors = ["90", "37", "97", "37"]
     rendered = []
     for index, char in enumerate(text):
         color = colors[(index + offset) % len(colors)]
@@ -847,11 +1121,19 @@ def shimmer_text(text: str, offset: int = 0) -> str:
     return "".join(rendered)
 
 
-def emit_activity(kind: str, message: str, *, force: bool = False, animate: bool = True) -> None:
-    if not (force or monitor_enabled()):
-        return
+def activity_enabled(force: bool = False) -> bool:
+    return force or monitor_enabled()
+
+
+def activity_line(kind: str, message: str) -> str:
     icon = ACTIVITY_ICONS.get(kind, "[*]")
-    line = f"{icon} {message}"
+    return f"{icon} {message}"
+
+
+def emit_activity(kind: str, message: str, *, force: bool = False, animate: bool = True) -> None:
+    if not activity_enabled(force):
+        return
+    line = activity_line(kind, message)
     if not sys.stdout.isatty() or not animate:
         print(render_terminal_markdown(line))
         return
@@ -859,6 +1141,37 @@ def emit_activity(kind: str, message: str, *, force: bool = False, animate: bool
         print("\r\033[K" + shimmer_text(line, offset), end="", flush=True)
         time.sleep(0.035)
     print()
+
+
+def start_activity_indicator(kind: str, message: str, *, force: bool = False) -> tuple[threading.Event, threading.Thread] | None:
+    if not activity_enabled(force):
+        return None
+    line = activity_line(kind, message)
+    if not sys.stdout.isatty():
+        print(render_terminal_markdown(line))
+        return None
+
+    stop_event = threading.Event()
+
+    def animate_line() -> None:
+        offset = 0
+        while not stop_event.is_set():
+            print("\r\033[K" + shimmer_text(line, offset), end="", flush=True)
+            offset += 1
+            time.sleep(0.08)
+        print("\r\033[K", end="", flush=True)
+
+    thread = threading.Thread(target=animate_line, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def stop_activity_indicator(handle: tuple[threading.Event, threading.Thread] | None) -> None:
+    if handle is None:
+        return
+    stop_event, thread = handle
+    stop_event.set()
+    thread.join(timeout=1)
 
 
 def resolve_workspace_path(raw_path: str | None) -> Path:
@@ -1264,31 +1577,67 @@ def ask_model(
     messages: list[dict[str, str]],
     *,
     model: str | None = None,
+    provider: str | None = None,
     temperature: float | None = None,
 ) -> str:
     config = load_config()
+    provider_name, provider_config = get_provider_config(provider)
+    selected_model = model or str(provider_config.get("model", config.get("default_model", MODEL)))
+    selected_temperature = config.get("temperature", 0.25) if temperature is None else temperature
 
     stop_event = threading.Event()
-    indicator = threading.Thread(
-        target=thinking_indicator,
-        args=(stop_event,),
-        daemon=True,
-    )
+    indicator: threading.Thread | None = None
 
-    indicator.start()
+    if config.get("show_thinking_indicator", False):
+        indicator = threading.Thread(
+            target=thinking_indicator,
+            args=(stop_event,),
+            daemon=True,
+        )
+        indicator.start()
 
     try:
-        response = get_client().chat.completions.create(
-            model=model or str(config.get("default_model", MODEL)),
-            messages=messages,
-            temperature=config.get("temperature", 0.25) if temperature is None else temperature,
-        )
+        try:
+            return call_model_once(
+                messages,
+                provider_name=provider_name,
+                provider_config=provider_config,
+                model=selected_model,
+                temperature=selected_temperature,
+            )
+        except Exception as first_error:
+            fallback_provider = str(config.get("fallback_provider", config.get("provider", "lmstudio")))
+            fallback_name, fallback_config = get_provider_config(fallback_provider)
+            fallback_model = str(fallback_config.get("model", config.get("default_model", MODEL)))
+            should_retry = (fallback_name, fallback_model) != (provider_name, selected_model)
+            if not should_retry:
+                raise
+            log_run_event(
+                "model_route_fallback",
+                {
+                    "provider": provider_name,
+                    "model": selected_model,
+                    "fallback_provider": fallback_name,
+                    "fallback_model": fallback_model,
+                    "error": trim_text(str(first_error), 1000),
+                },
+            )
+            emit_monitor(
+                model_fallback_notice(provider_name, selected_model, fallback_name, fallback_model, first_error),
+                force=True,
+            )
+            return call_model_once(
+                messages,
+                provider_name=fallback_name,
+                provider_config=fallback_config,
+                model=fallback_model,
+                temperature=selected_temperature,
+            )
     finally:
         stop_event.set()
-        indicator.join(timeout=1)
-        clear_current_line()
-
-    return response.choices[0].message.content or ""
+        if indicator is not None:
+            indicator.join(timeout=1)
+            clear_current_line()
 
 
 def strip_markdown_fences(text: str) -> str:
@@ -1562,10 +1911,14 @@ class AgentState:
             self.reflections = self.reflections[-12:]
 
     def record_subagent_report(self, role: str, task: str, result: ToolResult) -> None:
+        provider = str(result.meta.get("provider", ""))
+        model = str(result.meta.get("model", ""))
         self.subagent_reports.append(
             {
                 "time": utc_now(),
                 "role": role,
+                "provider": provider,
+                "model": model,
                 "task": trim_text(task, 200),
                 "ok": result.ok,
                 "preview": trim_text(result.content, 500),
@@ -1585,6 +1938,8 @@ class AgentState:
             {
                 "time": utc_now(),
                 "task": trim_text(task, 120),
+                "provider": provider,
+                "model": model,
                 "ok": result.ok,
             }
         )
@@ -1674,6 +2029,7 @@ def run_agent(
     max_steps: int | None = None,
     depth: int = 0,
     model: str | None = None,
+    provider: str | None = None,
     temperature: float | None = None,
 ) -> str:
     state = state or AgentState()
@@ -1692,8 +2048,7 @@ def run_agent(
     log_run_event("turn_started", {"input": user_input, "turn": state.turns_completed, "depth": depth})
 
     for step in range(1, step_limit + 1):
-        emit_activity("thinking", "Thinking...", animate=True)
-        reply = ask_model(messages, model=model, temperature=temperature)
+        reply = ask_model(messages, model=model, provider=provider, temperature=temperature)
         action = parse_model_reply(reply, tool_names=set(tools.tools))
         log_run_event(
             "model_reply",
@@ -1793,6 +2148,7 @@ class AgentTools:
         add("update_blackboard", "Append content to a blackboard section.", {"section": "facts", "content": "..."}, TOOL_RISK_MEMORY, self.update_blackboard)
         add("clear_blackboard", "Clear the shared blackboard.", {}, TOOL_RISK_MEMORY, self.clear_blackboard)
         add("show_config", "Show the active agent configuration.", {}, TOOL_RISK_READ_ONLY, self.show_config)
+        add("list_llm_routes", "Show configured LLM providers and role-to-provider/model routing.", {}, TOOL_RISK_READ_ONLY, self.list_llm_routes)
         add("show_workspace_stats", "Summarize workspace file counts, sizes, and extension mix.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.show_workspace_stats)
         add("show_run_history", "Summarize recent run-log events.", {"limit": 20}, TOOL_RISK_READ_ONLY, self.show_run_history)
         add("index_codebase", "Index Python symbols in workspace files.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.index_codebase)
@@ -2379,6 +2735,7 @@ class AgentTools:
                     {"role": "user", "content": prompt},
                 ],
                 model=get_role_model("planner"),
+                provider=get_role_provider("planner"),
             )
             decision = parse_json_object(reply)
         except Exception as exc:
@@ -2542,6 +2899,7 @@ class AgentTools:
             max_steps=MAX_SUBAGENT_STEPS,
             depth=self.depth + 1,
             model=get_role_model("meta"),
+            provider=get_role_provider("meta"),
         )
         emit_monitor(f"Disagreement resolution completed for task: {trim_text(task, 140)}")
         return ToolResult(True, trim_text(result, 5000), meta={"task": task})
@@ -2567,6 +2925,7 @@ class AgentTools:
             max_steps=MAX_SUBAGENT_STEPS,
             depth=self.depth + 1,
             model=get_role_model("meta"),
+            provider=get_role_provider("meta"),
         )
         emit_monitor(f"Quality gate completed for objective: {trim_text(objective, 140)}")
         return ToolResult(True, trim_text(result, 5000), meta={"objective": objective})
@@ -2577,7 +2936,9 @@ class AgentTools:
         if role not in ROLE_CATALOG:
             return ToolResult(False, f"Unknown role: {role}")
 
-        emit_monitor(f"Delegating to `{role}`: {trim_text(task, 140)}")
+        provider = get_role_provider(role)
+        model = get_role_model(role)
+        emit_monitor(f"Delegating to `{role}` via {provider}/{model}: {trim_text(task, 140)}")
 
         subagent_input = (
             f"Delegated role: {role}\n"
@@ -2591,16 +2952,19 @@ class AgentTools:
             system_prompt=build_role_system_prompt(role),
             max_steps=MAX_SUBAGENT_STEPS,
             depth=self.depth + 1,
-            model=get_role_model(role),
+            model=model,
+            provider=provider,
         )
         tool_result = ToolResult(
             ok=True,
             content=(
                 f"Sub-agent role: {role}\n"
+                f"Provider: {provider}\n"
+                f"Model: {model}\n"
                 f"Task: {task}\n"
                 f"Result:\n{trim_text(result, 4000)}"
             ),
-            meta={"role": role, "task": task},
+            meta={"role": role, "task": task, "provider": provider, "model": model},
         )
         self.state.record_subagent_report(role, task, tool_result)
         emit_monitor(f"`{role}` completed with ok={tool_result.ok}")
@@ -2685,6 +3049,7 @@ class AgentTools:
             max_steps=MAX_SUBAGENT_STEPS,
             depth=self.depth + 1,
             model=get_role_model("meta"),
+            provider=get_role_provider("meta"),
         )
         tool_result = ToolResult(True, trim_text(result, 5000), meta={"objective": objective})
         self.state.record_meta_review(objective, tool_result)
@@ -3313,7 +3678,7 @@ class AgentTools:
                 experiment = experiment_result.meta if experiment_result.ok else {}
             cycle_label = f"self-improve-cycle-{cycle}-pre"
             checkpoint = self.create_checkpoint(label=cycle_label)
-            emit_activity("thinking", f"Cycle {cycle}/{max_cycles}: Thinking...", force=True)
+            emit_monitor(f"Cycle {cycle}/{max_cycles}: starting", force=True)
             emit_monitor(
                 f"Cycle {cycle}/{max_cycles} starting. "
                 f"mode={control['mode']} checkpoint={checkpoint.meta.get('checkpoint', '')}",
@@ -3489,6 +3854,7 @@ class AgentTools:
                     {"role": "user", "content": review_prompt},
                 ],
                 model=get_role_model("meta"),
+                provider=get_role_provider("meta"),
             )
             review = parse_json_object(review_reply)
             if not review:
@@ -3768,8 +4134,42 @@ class AgentTools:
             "max_steps": config.get("max_steps"),
             "max_batch_actions": config.get("max_batch_actions"),
             "monitor": config.get("monitor"),
+            "show_thinking_indicator": config.get("show_thinking_indicator"),
+            "fallback_provider": config.get("fallback_provider"),
             "autonomy_policy": config.get("autonomy_policy", {}),
+            "llm_providers": redacted_llm_providers(config.get("llm_providers", {})),
+            "role_providers": config.get("role_providers", {}),
             "role_models": config.get("role_models", {}),
+            "config_file": workspace_relative(CONFIG_FILE),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def list_llm_routes(self) -> ToolResult:
+        config = load_config()
+        providers = config.get("llm_providers", {})
+        routes = {
+            role: {
+                "provider": get_role_provider(role, config),
+                "provider_type": providers.get(get_role_provider(role, config), {}).get("type", "openai_compatible"),
+                "model": get_role_model(role),
+            }
+            for role in ROLE_CATALOG
+        }
+        provider_summary = {
+            name: {
+                "type": settings.get("type", "openai_compatible"),
+                "base_url": settings.get("base_url", ""),
+                "model": settings.get("model", ""),
+                "api_key_source": settings.get("api_key_env", "inline" if settings.get("api_key") else ""),
+            }
+            for name, settings in providers.items()
+            if isinstance(settings, dict)
+        }
+        payload = {
+            "default_provider": config.get("provider"),
+            "fallback_provider": config.get("fallback_provider"),
+            "providers": provider_summary,
+            "routes": routes,
             "config_file": workspace_relative(CONFIG_FILE),
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
@@ -5071,6 +5471,28 @@ class AgentTools:
 
         config = load_config()
         check("config_has_autonomy_policy", isinstance(config.get("autonomy_policy"), dict))
+        check("thinking_indicator_enabled", config.get("show_thinking_indicator") is True)
+        check("config_has_known_fallback_provider", config.get("fallback_provider") in config.get("llm_providers", {}))
+        check("config_has_llm_providers", isinstance(config.get("llm_providers"), dict) and bool(config.get("llm_providers")))
+        check("lmstudio_auto_discovers_model", config.get("llm_providers", {}).get("lmstudio", {}).get("auto_discover_model") is True)
+        activity_thinking_calls = []
+        try:
+            source_tree = ast.parse(Path(__file__).read_text(encoding="utf-8", errors="replace"))
+            for node in ast.walk(source_tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Name) or node.func.id != "emit_activity":
+                    continue
+                if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "thinking":
+                    activity_thinking_calls.append(getattr(node, "lineno", 0))
+        except SyntaxError as exc:
+            activity_thinking_calls.append(f"parse_error={exc}")
+        check("activity_thinking_not_emitted", not activity_thinking_calls, f"lines={activity_thinking_calls}")
+        check("config_has_role_providers", all(role in config.get("role_providers", {}) for role in ROLE_CATALOG))
+        check(
+            "role_providers_reference_known_providers",
+            all(provider in config.get("llm_providers", {}) for provider in config.get("role_providers", {}).values()),
+        )
         check("config_has_role_models", all(role in config.get("role_models", {}) for role in ROLE_CATALOG))
         template_role_errors = [
             f"{template}:{role}"
@@ -5085,6 +5507,7 @@ class AgentTools:
         )
         centered_banner = render_centered_cerebro_banner()
         check("centered_banner_renders_lines", bool(centered_banner.strip()) and "\n" in centered_banner)
+        check("activity_indicator_helpers_callable", callable(start_activity_indicator) and callable(stop_activity_indicator))
         startup_lines = render_startup_text(load_control_state()).splitlines()
         divider_lines = [line for line in startup_lines if line and set(line) == {"-"}]
         check(
@@ -5135,6 +5558,7 @@ class AgentTools:
             "show_code_hotspots",
             "show_cycle_ledger",
             "show_config",
+            "list_llm_routes",
             "summarize_blackboard",
             "show_workspace_stats",
             "show_run_history",
@@ -5148,6 +5572,10 @@ class AgentTools:
         }
         missing_tools = sorted(required_tools - set(self.tools))
         check("required_tools_registered", not missing_tools, f"missing={missing_tools}")
+
+        routes = self.list_llm_routes()
+        check("list_llm_routes_returns_all_roles", routes.ok and all(role in routes.meta.get("routes", {}) for role in ROLE_CATALOG), trim_text(routes.content, 500))
+        check("friendly_model_failure_mentions_model_unavailable", "Model unavailable" in format_agent_failure(RuntimeError("No models loaded.")))
 
         policy_allow = self.evaluate_autonomy_policy({"risk_level": "low"}, ["agent.py"])
         check("autonomy_policy_allows_low_risk", policy_allow.meta.get("decision") == "allow", policy_allow.content)
@@ -5350,13 +5778,12 @@ class AgentTools:
 
 
 def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str, ToolResult]]:
-    def announce_tool(tool_name: str, args: dict[str, Any]) -> None:
+    def activity_for_tool(tool_name: str, args: dict[str, Any]) -> tuple[str, str]:
         edit_tools = {"write_file", "append_file", "replace_in_file", "apply_unified_diff"}
         if tool_name in edit_tools:
             target = str(args.get("path", "")) if isinstance(args, dict) else ""
-            emit_activity("editing", f"Editing a file: {target or tool_name}", animate=True)
-        else:
-            emit_activity("tool", f"Ran {tool_name}", animate=True)
+            return "editing", f"Editing a file: {target or tool_name}"
+        return "tool", f"Ran {tool_name}"
 
     action_type = action.get("type")
     if action_type == "tool":
@@ -5364,16 +5791,25 @@ def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str,
         args = action.get("args", {})
         if not isinstance(args, dict):
             args = {}
-        announce_tool(tool_name, args)
-        result = tools.call(tool_name, args)
+        kind, message = activity_for_tool(tool_name, args)
+        indicator = start_activity_indicator(kind, message)
+        try:
+            result = tools.call(tool_name, args)
+        finally:
+            stop_activity_indicator(indicator)
         emit_activity("done", f"Ran {tool_name}: ok={result.ok}", animate=False)
         return [(tool_name, result)]
 
     if action_type == "batch":
         executed: list[tuple[str, ToolResult]] = []
         for item in normalize_batch_actions(action.get("actions", [])):
-            announce_tool(item["tool"], item["args"])
-            executed.append((item["tool"], tools.call(item["tool"], item["args"])))
+            kind, message = activity_for_tool(item["tool"], item["args"])
+            indicator = start_activity_indicator(kind, message)
+            try:
+                result = tools.call(item["tool"], item["args"])
+            finally:
+                stop_activity_indicator(indicator)
+            executed.append((item["tool"], result))
         if not executed:
             return [("batch", ToolResult(False, "No valid batch actions were provided."))]
         edit_count = sum(1 for name, _ in executed if name in {"write_file", "append_file", "replace_in_file", "apply_unified_diff"})
@@ -5415,7 +5851,7 @@ def repl() -> None:
         try:
             answer = run_agent(user_input, state=state)
         except Exception as exc:
-            answer = f"Agent failure: {exc}"
+            answer = format_agent_failure(exc)
             log_run_event("agent_exception", {"error": str(exc)})
         transcript.append({"role": "agent", "content": answer})
         print("\n" + terminal_color("Cerebro: ", "94"), end="", flush=True)
