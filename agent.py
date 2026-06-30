@@ -878,6 +878,7 @@ Manager policy:
 
 Rules:
 - Prefer evidence from tools over guessing.
+- For substantial analysis, debugging, implementation, or refactoring, prefer build_context_pack, decompose_goal, and find_relevant_code_context before editing so the work starts from grounded situational context and exact code symbols.
 - Keep file access inside the workspace.
 - Do not run destructive or system-altering commands.
 - Prefer file tools over shell commands for code changes.
@@ -1082,6 +1083,344 @@ def trim_text(text: str, max_chars: int = MAX_FILE_CHARS) -> str:
         return text
     return text[:max_chars] + "\n...[truncated]"
 
+
+SEARCH_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "and",
+    "are",
+    "because",
+    "before",
+    "but",
+    "can",
+    "could",
+    "for",
+    "from",
+    "give",
+    "have",
+    "how",
+    "into",
+    "make",
+    "more",
+    "not",
+    "now",
+    "of",
+    "on",
+    "or",
+    "please",
+    "should",
+    "show",
+    "tell",
+    "than",
+    "that",
+    "the",
+    "this",
+    "through",
+    "to",
+    "use",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "would",
+    "you",
+}
+
+
+def search_terms(text: str, *, min_length: int = 2) -> list[str]:
+    terms: list[str] = []
+    for raw in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", text.lower()):
+        term = raw.strip("._-")
+        if len(term) < min_length or term in SEARCH_STOPWORDS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def score_text_relevance(query: str, text: str) -> tuple[float, list[str]]:
+    query_normalized = re.sub(r"\s+", " ", query.lower()).strip()
+    text_normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    if not query_normalized or not text_normalized:
+        return 0.0, []
+
+    terms = search_terms(query_normalized)
+    score = 0.0
+    reasons: list[str] = []
+
+    if query_normalized and query_normalized in text_normalized:
+        occurrences = text_normalized.count(query_normalized)
+        score += 12.0 + min(occurrences, 5) * 2.0
+        reasons.append("exact phrase")
+
+    text_terms = set(search_terms(text_normalized))
+    matched_terms: list[str] = []
+    for term in terms:
+        occurrences = text_normalized.count(term)
+        if occurrences:
+            matched_terms.append(term)
+            score += 3.0 + min(occurrences, 4)
+            if term in text_terms:
+                score += 1.0
+
+    if matched_terms:
+        coverage = len(matched_terms) / max(1, len(terms))
+        score += coverage * 10.0
+        reasons.append("matched terms: " + ", ".join(matched_terms[:8]))
+
+    for first, second in zip(terms, terms[1:]):
+        phrase = f"{first} {second}"
+        if phrase in text_normalized:
+            score += 4.0
+            reasons.append(f"ordered phrase: {phrase}")
+
+    return score, reasons[:6]
+
+
+def rank_relevant_text_items(
+    query: str,
+    items: list[dict[str, Any]],
+    *,
+    text_fields: tuple[str, ...] = ("content", "text", "value", "note", "title"),
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for item in items:
+        haystack = "\n".join(str(item.get(field, "")) for field in text_fields if item.get(field) is not None)
+        score, reasons = score_text_relevance(query, haystack)
+        if score <= 0:
+            continue
+        enriched = dict(item)
+        enriched["relevance_score"] = round(score, 2)
+        enriched["relevance_reasons"] = reasons
+        ranked.append(enriched)
+    ranked.sort(key=lambda entry: (-float(entry.get("relevance_score", 0)), str(entry.get("key") or entry.get("title") or entry.get("path") or "")))
+    return ranked[: max(1, min(int(limit), 50))]
+
+
+TEXT_FILE_SUFFIXES = {
+    "",
+    ".bat",
+    ".cfg",
+    ".css",
+    ".csv",
+    ".env",
+    ".html",
+    ".ini",
+    ".js",
+    ".json",
+    ".log",
+    ".md",
+    ".py",
+    ".ps1",
+    ".rst",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+
+
+def looks_like_text_path(path: Path) -> bool:
+    return path.suffix.lower() in TEXT_FILE_SUFFIXES
+
+
+def read_text_sample(path: Path, max_chars: int = 12000) -> str:
+    try:
+        data = path.read_bytes()[: max(0, int(max_chars))]
+    except OSError:
+        return ""
+    if b"\x00" in data:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def relevant_line_snippets(query: str, text: str, *, context_lines: int = 1, limit: int = 3) -> list[dict[str, Any]]:
+    terms = search_terms(query)
+    if not terms or not text:
+        return []
+    lines = text.splitlines()
+    scored_lines: list[tuple[float, int, list[str]]] = []
+    for index, line in enumerate(lines):
+        score, reasons = score_text_relevance(query, line)
+        if score > 0:
+            scored_lines.append((score, index, reasons))
+    scored_lines.sort(key=lambda item: (-item[0], item[1]))
+
+    snippets: list[dict[str, Any]] = []
+    used_ranges: list[range] = []
+    for score, index, reasons in scored_lines:
+        start = max(0, index - context_lines)
+        end = min(len(lines), index + context_lines + 1)
+        candidate_range = range(start, end)
+        if any(set(candidate_range).intersection(existing) for existing in used_ranges):
+            continue
+        snippet_lines = [f"{line_number + 1}: {lines[line_number]}" for line_number in candidate_range]
+        snippets.append(
+            {
+                "start_line": start + 1,
+                "end_line": end,
+                "score": round(score, 2),
+                "reasons": reasons,
+                "text": trim_text("\n".join(snippet_lines), 1200),
+            }
+        )
+        used_ranges.append(candidate_range)
+        if len(snippets) >= max(1, min(int(limit), 10)):
+            break
+    return snippets
+
+
+
+def iter_python_source_files(target: Path, *, recursive: bool = True, max_files: int = 250) -> list[Path]:
+    """Return bounded Python source files under a workspace target."""
+    if target.is_file():
+        candidates = [target]
+    else:
+        candidates = list(target.rglob("*.py") if recursive else target.glob("*.py"))
+    files = [
+        candidate
+        for candidate in candidates
+        if candidate.is_file()
+        and candidate.suffix.lower() == ".py"
+        and not should_skip_checkpoint_path(candidate)
+    ]
+    files.sort(key=lambda item: workspace_relative(item))
+    return files[: max(1, min(int(max_files), 1000))]
+
+
+def ast_call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = ast_call_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def ast_decision_points(node: ast.AST) -> int:
+    decision_nodes = (
+        ast.If,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.Try,
+        ast.ExceptHandler,
+        ast.With,
+        ast.AsyncWith,
+        ast.BoolOp,
+        ast.IfExp,
+        ast.Match,
+        ast.comprehension,
+    )
+    return sum(1 for child in ast.walk(node) if isinstance(child, decision_nodes))
+
+
+def ast_node_source(source_lines: list[str], node: ast.AST, *, max_chars: int = 5000) -> str:
+    start = max(0, int(getattr(node, "lineno", 1)) - 1)
+    end = max(start + 1, int(getattr(node, "end_lineno", start + 1)))
+    return trim_text("\n".join(source_lines[start:end]), max_chars)
+
+def infer_task_profile(user_input: str) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", user_input.lower()).strip()
+    terms = search_terms(user_input)[:16]
+    intents: list[str] = []
+
+    def has_any(words: set[str]) -> bool:
+        return any(word in text for word in words)
+
+    if has_any({"fix", "bug", "error", "traceback", "crash", "broken", "wrong"}):
+        intents.append("debug")
+    if has_any({"improve", "advanced", "feature", "functionality", "intelligence", "implement", "build", "add"}):
+        intents.append("implementation")
+    if has_any({"refactor", "cleanup", "simplify", "modular", "architecture"}):
+        intents.append("refactoring")
+    if has_any({"test", "validate", "pytest", "ruff", "compile", "smoke"}):
+        intents.append("validation")
+    if has_any({"analyze", "inspect", "audit", "review", "summarize", "explain"}):
+        intents.append("analysis")
+    if has_any({"self-improve", "self improve", "autonomous", "autonomy", "agentic"}):
+        intents.append("autonomy")
+    if not intents:
+        intents.append("conversation")
+
+    risk_signals: list[str] = []
+    if has_any({"delete", "remove", "wipe", "reset", "overwrite"}):
+        risk_signals.append("destructive file operation")
+    if has_any({"run", "command", "shell", "terminal", "subprocess", "powershell", "cmd"}):
+        risk_signals.append("command execution")
+    if has_any({"self-improve", "autonomous", "autonomy", "loop"}):
+        risk_signals.append("autonomous loop")
+    if has_any({"config", "provider", "api key", "memory", "control"}):
+        risk_signals.append("control-plane or persistent state")
+
+    risk_level = "high" if any("destructive" in item or "autonomous" in item for item in risk_signals) else "medium" if risk_signals else "low"
+
+    suggested_tools: list[str] = []
+    if "implementation" in intents or "refactoring" in intents or "debug" in intents:
+        suggested_tools.extend(["build_context_pack", "decompose_goal", "find_relevant_code_context", "semantic_search_workspace", "read_file", "apply_unified_diff", "validate_python_file"] )
+    elif "analysis" in intents:
+        suggested_tools.extend(["build_context_pack", "find_relevant_code_context", "semantic_search_workspace", "search_files", "summarize_python_file"] )
+    elif "validation" in intents:
+        suggested_tools.extend(["run_internal_self_tests", "validate_workspace_python", "run_self_improvement_validation"] )
+    else:
+        suggested_tools.extend(["search_memory", "build_context_pack"] )
+
+    suggested_roles: list[str] = []
+    if "implementation" in intents:
+        suggested_roles.extend(["architect", "coder", "reviewer"] )
+    if "refactoring" in intents:
+        suggested_roles.extend(["architect", "refactorer", "tester"] )
+    if "debug" in intents or "validation" in intents:
+        suggested_roles.extend(["tester", "reviewer"] )
+    if "analysis" in intents:
+        suggested_roles.extend(["researcher", "planner", "critic"] )
+    if "autonomy" in intents or risk_level != "low":
+        suggested_roles.extend(["safety", "maintainer"] )
+    if not suggested_roles:
+        suggested_roles = ["planner", "writer"]
+
+    deduped_roles: list[str] = []
+    for role in suggested_roles:
+        if role in ROLE_CATALOG and role not in deduped_roles:
+            deduped_roles.append(role)
+
+    deduped_tools: list[str] = []
+    for tool in suggested_tools:
+        if tool not in deduped_tools:
+            deduped_tools.append(tool)
+
+    return {
+        "intents": intents,
+        "query_terms": terms,
+        "write_intent": user_explicitly_requested_file_write(user_input),
+        "tool_intent": user_input_has_tool_intent(user_input),
+        "risk_level": risk_level,
+        "risk_signals": risk_signals,
+        "suggested_roles": deduped_roles[:MAX_TEAM_ROLES],
+        "suggested_tools": deduped_tools[:8],
+    }
+
+
+def build_task_intelligence_summary(user_input: str, state: "AgentState") -> str:
+    profile = infer_task_profile(user_input)
+    recent_failures = [item for item in state.tool_history[-8:] if not item.get("ok")]
+    payload = {
+        "turn_task_profile": profile,
+        "recent_failure_count": len(recent_failures),
+        "last_failed_tools": [item.get("tool") for item in recent_failures[-3:]],
+        "active_plan_items": state.plan[:6],
+        "instruction": (
+            "Use this deterministic task profile as a routing hint only. "
+            "Prefer evidence from tools and user instructions over the heuristic profile."
+        ),
+    }
+    return "Task intelligence snapshot:\n" + json.dumps(payload, indent=2)
 
 
 ANSI_PATTERN = re.compile(r"\033\[[0-9;]*m")
@@ -2742,6 +3081,7 @@ def run_agent(
         {"role": "system", "content": prompt},
         {"role": "system", "content": state.context_summary()},
         {"role": "system", "content": build_turn_guidance(user_input, state)},
+        {"role": "system", "content": build_task_intelligence_summary(user_input, state)},
         *state.recent_conversation_messages(),
         {"role": "user", "content": user_input},
     ]
@@ -2809,6 +3149,8 @@ class AgentTools:
         add("search_todos", "Find TODO, FIXME, HACK, and NOTE markers in workspace text files.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.search_todos)
         add("list_recent_files", "List recently modified workspace files.", {"path": ".", "limit": 20}, TOOL_RISK_READ_ONLY, self.list_recent_files)
         add("find_large_files", "Find largest files in a workspace path.", {"path": ".", "limit": 20}, TOOL_RISK_READ_ONLY, self.find_large_files)
+        add("semantic_search_workspace", "Rank workspace text files and line snippets by semantic-ish term relevance without requiring ripgrep or a model.", {"query": "what to find", "path": ".", "limit": 8, "max_file_chars": 12000}, TOOL_RISK_READ_ONLY, self.semantic_search_workspace)
+        add("find_relevant_code_context", "Rank Python symbols/functions/classes relevant to an objective with snippets and static risk signals.", {"objective": "change objective", "path": ".", "limit": 8}, TOOL_RISK_READ_ONLY, self.find_relevant_code_context)
         add("run_command", "Run a non-destructive shell command in the workspace.", {"command": "dir"}, TOOL_RISK_RUN_COMMAND, self.run_command)
         add("git_status", "Show git status for this workspace.", {}, TOOL_RISK_READ_ONLY, self.git_status)
         add("git_diff", "Show git diff for a path.", {"path": "."}, TOOL_RISK_READ_ONLY, self.git_diff)
@@ -2823,6 +3165,8 @@ class AgentTools:
         add("show_role_telemetry", "Show role call history and success telemetry.", {}, TOOL_RISK_READ_ONLY, self.show_role_telemetry)
         add("recommend_team", "Recommend a small role team deterministically from task, context, templates, and telemetry.", {"task": "objective", "context": "optional context"}, TOOL_RISK_READ_ONLY, self.recommend_team)
         add("list_tool_specs", "List registered tools, schemas, and risk levels.", {}, TOOL_RISK_READ_ONLY, self.list_tool_specs)
+        add("decompose_goal", "Infer task intent, risk, roles, tools, acceptance criteria, and a first execution plan.", {"goal": "user objective", "context": "optional context"}, TOOL_RISK_READ_ONLY, self.decompose_goal)
+        add("build_context_pack", "Build a compact situational context pack from memory, profile, blackboard, tasks, git, recent files, TODOs, and code intelligence.", {"objective": "user objective", "path": ".", "limit": 8}, TOOL_RISK_READ_ONLY, self.build_context_pack)
         add("manager_policy", "Choose a direct, single-agent, or team execution strategy.", {"task": "user objective", "context": "optional context"}, TOOL_RISK_AGENTIC, self.manager_policy)
         add("manager_execute", "Execute a task through manager-selected roles.", {"task": "objective", "context": "optional context", "template": "implementation", "roles": ["planner", "coder", "reviewer"]}, TOOL_RISK_AGENTIC, self.manager_execute)
         add("delegate_subagent", "Delegate bounded work to a role-based subagent.", {"role": "researcher", "task": "analyze X", "context": "optional extra context"}, TOOL_RISK_AGENTIC, self.delegate_subagent)
@@ -2931,7 +3275,7 @@ class AgentTools:
             return ToolResult(False, f"Path does not exist: {path}")
         stat = target.stat()
         payload = {
-            "path": target_relative,
+            "path": workspace_relative(target),
             "is_file": target.is_file(),
             "is_dir": target.is_dir(),
             "size": stat.st_size,
@@ -2939,7 +3283,7 @@ class AgentTools:
         }
         if target.is_dir():
             payload["children"] = len(list(target.iterdir()))
-        return ToolResult(True, json.dumps(payload, indent=2))
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
     def read_file(self, path: str) -> ToolResult:
         target = resolve_workspace_path(path)
@@ -3120,6 +3464,231 @@ class AgentTools:
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
+    def semantic_search_workspace(
+        self,
+        query: str,
+        path: str = ".",
+        limit: int = 8,
+        max_file_chars: int = 12000,
+    ) -> ToolResult:
+        query = str(query).strip()
+        if not query:
+            return ToolResult(False, "Query cannot be empty.")
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+
+        limit = max(1, min(int(limit), 30))
+        max_file_chars = max(1000, min(int(max_file_chars), 100000))
+        candidates = [target] if target.is_file() else list(target.rglob("*"))
+        searched = 0
+        skipped = 0
+        file_items: list[dict[str, Any]] = []
+
+        for candidate in candidates:
+            if not candidate.is_file() or should_skip_checkpoint_path(candidate):
+                continue
+            if not looks_like_text_path(candidate):
+                skipped += 1
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                skipped += 1
+                continue
+            text = read_text_sample(candidate, max_chars=max_file_chars)
+            if not text:
+                skipped += 1
+                continue
+            searched += 1
+            score, reasons = score_text_relevance(query, text)
+            if score <= 0:
+                continue
+            snippets = relevant_line_snippets(query, text, context_lines=1, limit=3)
+            file_items.append(
+                {
+                    "path": workspace_relative(candidate),
+                    "size": stat.st_size,
+                    "score": round(score, 2),
+                    "reasons": reasons,
+                    "snippets": snippets,
+                }
+            )
+
+        file_items.sort(key=lambda item: (-float(item.get("score", 0)), str(item.get("path", ""))))
+        matches = file_items[:limit]
+        payload = {
+            "query": query,
+            "path": workspace_relative(target),
+            "searched_files": searched,
+            "skipped_files": skipped,
+            "match_count": len(file_items),
+            "matches": matches,
+        }
+        if not matches:
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+
+        lines: list[str] = []
+        for item in matches:
+            lines.append(f"{item['path']} (score={item['score']}): {', '.join(item.get('reasons', [])[:3])}")
+            for snippet in item.get("snippets", [])[:2]:
+                lines.append(f"  lines {snippet['start_line']}-{snippet['end_line']}: {trim_text(snippet['text'], 500)}")
+        return ToolResult(True, "\n".join(lines), meta=payload)
+
+
+    def find_relevant_code_context(self, objective: str, path: str = ".", limit: int = 8) -> ToolResult:
+        objective = str(objective).strip()
+        if not objective:
+            return ToolResult(False, "Objective cannot be empty.")
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+
+        limit = max(1, min(int(limit), 30))
+        python_files = iter_python_source_files(target, recursive=target.is_dir(), max_files=250)
+        terms = search_terms(objective)
+        symbols: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+
+        for candidate in python_files:
+            relative = workspace_relative(candidate)
+            try:
+                source = candidate.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source)
+            except (OSError, SyntaxError) as exc:
+                errors.append({"path": relative, "error": str(exc)})
+                continue
+
+            source_lines = source.splitlines()
+            parents: list[str] = []
+
+            class Visitor(ast.NodeVisitor):
+                def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                    self._capture_symbol(node, "class")
+                    parents.append(node.name)
+                    self.generic_visit(node)
+                    parents.pop()
+
+                def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                    self._capture_symbol(node, "function")
+                    parents.append(node.name)
+                    self.generic_visit(node)
+                    parents.pop()
+
+                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                    self._capture_symbol(node, "async_function")
+                    parents.append(node.name)
+                    self.generic_visit(node)
+                    parents.pop()
+
+                def _capture_symbol(self, node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, kind: str) -> None:
+                    qualified = ".".join([*parents, node.name]) if parents else node.name
+                    source_preview = ast_node_source(source_lines, node, max_chars=4500)
+                    docstring = ast.get_docstring(node) or ""
+                    signature = node.name
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        try:
+                            signature = f"{node.name}({', '.join(arg.arg for arg in node.args.args)})"
+                        except Exception:
+                            signature = node.name
+                    relevance_text = "\n".join(
+                        [
+                            kind,
+                            node.name,
+                            qualified,
+                            signature,
+                            docstring,
+                            source_preview,
+                        ]
+                    )
+                    score, reasons = score_text_relevance(objective, relevance_text)
+                    normalized_name = re.sub(r"[_\.]+", " ", qualified).lower()
+                    name_hits = [term for term in terms if term in normalized_name]
+                    if name_hits:
+                        score += len(name_hits) * 4
+                        reasons.append("symbol name hits: " + ", ".join(name_hits[:6]))
+                    if score <= 0:
+                        return
+
+                    end_line = int(getattr(node, "end_lineno", node.lineno))
+                    line_count = max(1, end_line - int(node.lineno) + 1)
+                    calls = [
+                        ast_call_name(child.func)
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Call) and ast_call_name(child.func)
+                    ]
+                    unique_calls = sorted(set(calls))[:40]
+                    decision_count = ast_decision_points(node)
+                    complexity_score = decision_count * 3 + line_count // 8 + len(calls) // 6
+                    risk_level = "high" if complexity_score >= 18 or line_count >= 180 else "medium" if complexity_score >= 8 or line_count >= 70 else "low"
+                    snippet_start = max(1, int(node.lineno) - 2)
+                    snippet_end = min(len(source_lines), int(node.lineno) + 8)
+                    snippet = "\n".join(
+                        f"{line_number}: {source_lines[line_number - 1]}"
+                        for line_number in range(snippet_start, snippet_end + 1)
+                    )
+                    symbols.append(
+                        {
+                            "path": relative,
+                            "kind": kind,
+                            "name": node.name,
+                            "qualified_name": qualified,
+                            "signature": signature,
+                            "line": int(node.lineno),
+                            "end_line": end_line,
+                            "line_count": line_count,
+                            "score": round(score, 2),
+                            "reasons": reasons[:8],
+                            "decision_points": decision_count,
+                            "call_count": len(calls),
+                            "calls": unique_calls,
+                            "risk_level": risk_level,
+                            "docstring": trim_text(docstring, 500),
+                            "snippet": trim_text(snippet, 1600),
+                        }
+                    )
+
+            Visitor().visit(tree)
+
+        symbols.sort(key=lambda item: (-float(item.get("score", 0)), -int(item.get("line_count", 0)), str(item.get("path", "")), int(item.get("line", 0))))
+        top_symbols = symbols[:limit]
+        recommendations: list[str] = []
+        if top_symbols:
+            first = top_symbols[0]
+            recommendations.append(
+                f"Start by inspecting {first.get('path')}:{first.get('line')} ({first.get('qualified_name')}) because it is the top objective match."
+            )
+            if any(item.get("risk_level") != "low" for item in top_symbols[:3]):
+                recommendations.append("Top matches include medium/high-risk symbols; use a narrow patch and run self-tests after edits.")
+            if len(python_files) >= 250:
+                recommendations.append("Search was capped at 250 Python files; narrow the path if relevant code is missing.")
+        else:
+            recommendations.append("No relevant Python symbols matched; fall back to semantic_search_workspace or broaden the query.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective,
+            "path": workspace_relative(target),
+            "searched_files": len(python_files),
+            "match_count": len(symbols),
+            "query_terms": terms,
+            "symbols": top_symbols,
+            "errors": errors[:25],
+            "recommendations": recommendations,
+        }
+        if not top_symbols:
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+
+        lines: list[str] = []
+        for item in top_symbols:
+            lines.append(
+                f"{item['path']}:{item['line']} {item['qualified_name']} [{item['kind']}, risk={item['risk_level']}, score={item['score']}]"
+            )
+            if item.get("reasons"):
+                lines.append("  " + "; ".join(item["reasons"][:3]))
+            lines.append("  " + trim_text(str(item.get("snippet", "")).replace("\n", "\n  "), 900))
+        return ToolResult(True, "\n".join(lines), meta=payload)
+
     def run_command(self, command: str) -> ToolResult:
         lowered = command.lower().strip()
         if not lowered:
@@ -3259,6 +3828,181 @@ class AgentTools:
                 "risk": spec.risk,
             }
             for name, spec in self.tool_specs.items()
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def decompose_goal(self, goal: str, context: str = "") -> ToolResult:
+        objective = str(goal).strip()
+        if not objective:
+            return ToolResult(False, "Goal cannot be empty.")
+
+        profile = infer_task_profile(f"{objective}\n{context}")
+        team = self.recommend_team(task=objective, context=context)
+        roles = team.meta.get("roles", profile.get("suggested_roles", [])) if team.ok else profile.get("suggested_roles", [])
+
+        first_steps: list[str] = []
+        if profile["tool_intent"]:
+            first_steps.append("Build a grounded context pack before changing files.")
+        if profile["write_intent"]:
+            first_steps.append("Create or inspect a rollback point before edits, then keep the patch narrow.")
+        if "debug" in profile["intents"]:
+            first_steps.append("Reproduce or localize the failure before proposing a fix.")
+        if "implementation" in profile["intents"]:
+            first_steps.append("Identify the smallest feature slice that creates visible value.")
+        if "refactoring" in profile["intents"]:
+            first_steps.append("Analyze call impact before moving or rewriting shared helpers.")
+        if "validation" in profile["intents"]:
+            first_steps.append("Run deterministic validation and state what it proves.")
+        if not first_steps:
+            first_steps.append("Answer directly unless a tool provides necessary evidence.")
+
+        acceptance_criteria = [
+            "The answer directly satisfies the user's stated objective.",
+            "Any file changes are explicit, narrow, and validation-backed.",
+            "Residual risks or unknowns are stated plainly.",
+        ]
+        if profile["write_intent"]:
+            acceptance_criteria.append("The changed file compiles or an explicit validation limitation is reported.")
+        if profile["risk_level"] != "low":
+            acceptance_criteria.append("Risk controls, rollback readiness, or policy constraints are checked before finalizing.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "goal": objective,
+            "context_preview": trim_text(context, 600),
+            "task_profile": profile,
+            "recommended_team": {
+                "roles": roles,
+                "template": team.meta.get("template") if team.ok else "custom",
+                "evidence": team.meta.get("reasons") if team.ok else {},
+            },
+            "suggested_first_steps": first_steps,
+            "suggested_tools": profile.get("suggested_tools", []),
+            "acceptance_criteria": acceptance_criteria,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_context_pack(self, objective: str, path: str = ".", limit: int = 8) -> ToolResult:
+        objective = str(objective).strip()
+        if not objective:
+            return ToolResult(False, "Objective cannot be empty.")
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(int(limit), 25))
+        scope = workspace_relative(target)
+
+        profile = infer_task_profile(objective)
+        workspace_stats = self.show_workspace_stats(path=scope, recursive=target.is_dir())
+        recent_files = self.list_recent_files(path=scope, limit=limit)
+        todos = self.search_todos(path=scope, recursive=target.is_dir())
+        git_status = self.git_status()
+        semantic_search = self.semantic_search_workspace(query=objective, path=scope, limit=limit)
+        code_context = self.find_relevant_code_context(objective=objective, path=scope, limit=limit)
+
+        memory_items = [
+            {"key": key, "value": value, "content": f"{key}\n{value}"}
+            for key, value in self.state.memory.items()
+        ]
+        relevant_memory = rank_relevant_text_items(objective, memory_items, text_fields=("content",), limit=limit)
+
+        profile_data = load_user_profile()
+        profile_candidates: list[dict[str, Any]] = []
+        for section, value in profile_data.items():
+            if section in {"updated_at", "schema_version"}:
+                continue
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    if nested:
+                        profile_candidates.append({"section": section, "key": key, "value": nested, "content": f"{section}.{key}: {nested}"})
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    profile_candidates.append({"section": section, "key": str(index), "value": item, "content": json.dumps(item, ensure_ascii=False)})
+        relevant_profile = rank_relevant_text_items(objective, profile_candidates, text_fields=("content",), limit=limit)
+
+        board = load_blackboard()
+        board_candidates: list[dict[str, Any]] = []
+        for section, value in board.items():
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    board_candidates.append({"section": section, "key": str(index), "value": item, "content": json.dumps(item, ensure_ascii=False)})
+            elif value:
+                board_candidates.append({"section": section, "key": section, "value": value, "content": str(value)})
+        relevant_blackboard = rank_relevant_text_items(objective, board_candidates, text_fields=("content",), limit=limit)
+
+        tasks = load_tasks().get("tasks", [])
+        task_candidates = [
+            {**task, "content": json.dumps(task, ensure_ascii=False)}
+            for task in tasks
+            if isinstance(task, dict)
+        ]
+        relevant_tasks = rank_relevant_text_items(objective, task_candidates, text_fields=("content", "title", "objective"), limit=limit)
+
+        hotspot_preview: dict[str, Any] = {"available": False, "hotspots": []}
+        if CODE_HOTSPOTS_FILE.exists():
+            try:
+                hotspots_data = json.loads(CODE_HOTSPOTS_FILE.read_text(encoding="utf-8"))
+                hotspots = hotspots_data.get("hotspots", []) if isinstance(hotspots_data, dict) else []
+                hotspot_preview = {"available": True, "hotspots": hotspots[:limit], "source": workspace_relative(CODE_HOTSPOTS_FILE)}
+            except (OSError, json.JSONDecodeError):
+                hotspot_preview = {"available": False, "error": "Could not read hotspot file."}
+
+        todo_matches = todos.meta.get("matches", []) if todos.ok else []
+        ranked_todos = rank_relevant_text_items(
+            objective,
+            [{**item, "content": f"{item.get('path')}:{item.get('line')} {item.get('tag')} {item.get('text')}"} for item in todo_matches],
+            text_fields=("content",),
+            limit=limit,
+        )
+        if not ranked_todos:
+            ranked_todos = todo_matches[:limit]
+
+        recommendations = [
+            "Use this pack to avoid starting from a blank prompt.",
+            "Prefer the suggested first tools and roles unless direct evidence points elsewhere.",
+        ]
+        if profile.get("write_intent"):
+            recommendations.append("Before editing, inspect the exact target file and validate the changed file afterward.")
+        if profile.get("risk_level") != "low":
+            recommendations.append("Because risk is not low, keep changes reversible and check policy/rollback readiness.")
+        if relevant_memory or relevant_profile or relevant_blackboard:
+            recommendations.append("Relevant persisted context exists; reconcile it with current user instructions before acting.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective,
+            "scope": scope,
+            "task_profile": profile,
+            "workspace": {
+                "stats": workspace_stats.meta if workspace_stats.ok else {"error": workspace_stats.content},
+                "recent_files": recent_files.meta.get("files", []) if recent_files.ok else [],
+                "todo_count": todos.meta.get("count", 0) if todos.ok else None,
+                "relevant_todos": ranked_todos,
+                "git_status": trim_text(git_status.content, 2000),
+                "semantic_matches": semantic_search.meta.get("matches", []) if semantic_search.ok else [],
+                "relevant_code_symbols": code_context.meta.get("symbols", []) if code_context.ok else [],
+                "semantic_search": {
+                    "ok": semantic_search.ok,
+                    "searched_files": semantic_search.meta.get("searched_files", 0),
+                    "skipped_files": semantic_search.meta.get("skipped_files", 0),
+                    "match_count": semantic_search.meta.get("match_count", 0),
+                },
+                "code_context": {
+                    "ok": code_context.ok,
+                    "searched_files": code_context.meta.get("searched_files", 0),
+                    "match_count": code_context.meta.get("match_count", 0),
+                },
+                "code_hotspots": hotspot_preview,
+            },
+            "memory": {
+                "matches": relevant_memory,
+                "total_keys": len(self.state.memory),
+            },
+            "user_profile_matches": relevant_profile,
+            "blackboard_matches": relevant_blackboard,
+            "task_matches": relevant_tasks,
+            "recommended_team": self.recommend_team(task=objective, context=json.dumps({"task_profile": profile})).meta,
+            "recommendations": recommendations,
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
@@ -6377,6 +7121,8 @@ class AgentTools:
             "search_todos",
             "list_recent_files",
             "find_large_files",
+            "semantic_search_workspace",
+            "find_relevant_code_context",
             "analyze_python_complexity",
             "build_import_graph",
             "find_duplicate_blocks",
@@ -6442,6 +7188,10 @@ class AgentTools:
         todos = self.search_todos(active_file, recursive=False)
         recent_files = self.list_recent_files(".", limit=3)
         large_files = self.find_large_files(".", limit=3)
+        inspected_active_file = self.inspect_path(active_file)
+        semantic_search = self.semantic_search_workspace("render markdown tables", active_file, limit=3)
+        relevant_code_context = self.find_relevant_code_context("render markdown tables", active_file, limit=3)
+        context_pack = self.build_context_pack("render markdown tables", active_file, limit=3)
         complexity = self.analyze_python_complexity(active_file, recursive=False)
         import_graph = self.build_import_graph(active_file, recursive=False)
         duplicates = self.find_duplicate_blocks(active_file, min_lines=6)
@@ -6471,6 +7221,19 @@ class AgentTools:
         check("search_todos_returns_matches", todos.ok and isinstance(todos.meta.get("matches"), list), trim_text(todos.content, 500))
         check("list_recent_files_returns_files", recent_files.ok and isinstance(recent_files.meta.get("files"), list), trim_text(recent_files.content, 500))
         check("find_large_files_returns_files", large_files.ok and isinstance(large_files.meta.get("files"), list), trim_text(large_files.content, 500))
+        check("inspect_path_returns_metadata", inspected_active_file.ok and inspected_active_file.meta.get("path") == active_file, trim_text(inspected_active_file.content, 500))
+        check("semantic_search_workspace_returns_ranked_matches", semantic_search.ok and bool(semantic_search.meta.get("matches")), trim_text(semantic_search.content, 500))
+        check("find_relevant_code_context_returns_symbols", relevant_code_context.ok and bool(relevant_code_context.meta.get("symbols")), trim_text(relevant_code_context.content, 500))
+        check(
+            "context_pack_includes_semantic_matches",
+            context_pack.ok and bool(context_pack.meta.get("workspace", {}).get("semantic_matches")),
+            trim_text(context_pack.content, 500),
+        )
+        check(
+            "context_pack_includes_relevant_code_symbols",
+            context_pack.ok and bool(context_pack.meta.get("workspace", {}).get("relevant_code_symbols")),
+            trim_text(context_pack.content, 500),
+        )
         check("analyze_python_complexity_returns_callables", complexity.ok and isinstance(complexity.meta.get("callables"), list), trim_text(complexity.content, 500))
         check("build_import_graph_returns_files", import_graph.ok and isinstance(import_graph.meta.get("files"), dict), trim_text(import_graph.content, 500))
         check("find_duplicate_blocks_returns_list", duplicates.ok and isinstance(duplicates.meta.get("duplicates"), list), trim_text(duplicates.content, 500))
@@ -6575,19 +7338,20 @@ class AgentTools:
         return ToolResult(True, value)
 
     def search_memory(self, query: str, limit: int = 5) -> ToolResult:
-        lowered = query.lower().strip()
-        matches: list[tuple[int, str, str]] = []
-        for key, value in self.state.memory.items():
-            haystack = f"{key}\n{value}".lower()
-            score = haystack.count(lowered) if lowered else 0
-            if score or any(part in haystack for part in lowered.split()):
-                matches.append((score, key, trim_text(value, 300)))
-        matches.sort(key=lambda item: (-item[0], item[1]))
-        selected = matches[: max(1, min(limit, 20))]
+        limit = max(1, min(int(limit), 20))
+        items = [
+            {"key": key, "value": value, "content": f"{key}\n{value}"}
+            for key, value in self.state.memory.items()
+        ]
+        selected = rank_relevant_text_items(query, items, text_fields=("content",), limit=limit)
         if not selected:
-            return ToolResult(False, f"No memory matches for query: {query}")
-        lines = [f"{key}: {value}" for _, key, value in selected]
-        return ToolResult(True, "\n\n".join(lines))
+            return ToolResult(False, f"No memory matches for query: {query}", meta={"query_terms": search_terms(query)})
+        lines = [
+            f"{item['key']} (score={item['relevance_score']}): {trim_text(str(item['value']), 300)}"
+            for item in selected
+        ]
+        payload = {"query": query, "query_terms": search_terms(query), "matches": selected}
+        return ToolResult(True, "\n\n".join(lines), meta=payload)
 
     def show_user_profile(self) -> ToolResult:
         profile = load_user_profile()
@@ -6806,6 +7570,12 @@ def main() -> None:
             "uses_dynamic_tool_registry_prompt": "Registered tool specs are injected at runtime" in SYSTEM_PROMPT and "Available tools and JSON arg schemas:" not in SYSTEM_PROMPT,
             "direct_guidance_for_plain_question": "direct final answer" in build_turn_guidance("What is Cerebro?", AgentState()),
             "cli_roles_validate": parse_cli_roles("planner,coder") == ["planner", "coder"],
+            "task_profile_detects_implementation": "implementation" in infer_task_profile("Improve the agent with more intelligence")["intents"],
+            "context_tools_registered": {"build_context_pack", "decompose_goal", "semantic_search_workspace", "find_relevant_code_context"}.issubset(set(AgentTools(AgentState()).tools)),
+            "inspect_path_smoke": AgentTools(AgentState()).inspect_path(active_agent_file()).ok,
+            "semantic_search_smoke": AgentTools(AgentState()).semantic_search_workspace("render markdown", active_agent_file(), limit=2).ok,
+            "code_context_smoke": AgentTools(AgentState()).find_relevant_code_context("render markdown", active_agent_file(), limit=2).ok,
+            "relevance_scoring_matches_terms": score_text_relevance("advanced agent intelligence", "agent intelligence context pack")[0] > 0,
         }
         ok = all(bool(value) for key, value in checks.items() if key != "active_file")
         print(json.dumps({"ok": ok, "checks": checks}, indent=2))
