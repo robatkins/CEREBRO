@@ -14,7 +14,10 @@ import itertools
 import threading
 import time
 import random
-import msvcrt
+try:
+    import msvcrt  # Windows-only; used by animated_input.
+except ImportError:
+    msvcrt = None
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +68,94 @@ TOOL_RISK_RUN_COMMAND = "run_command"
 TOOL_RISK_AGENTIC = "agentic"
 TOOL_RISK_MEMORY = "memory"
 TOOL_RISK_CONTROL = "control"
+
+WRITE_TOOL_NAMES = {"write_file", "append_file", "replace_in_file", "apply_unified_diff"}
+RUNTIME_OUTPUT_SUPPRESSED = False
+CONVERSATION_HISTORY_LIMIT = 8
+
+WRITE_INTENT_KEYWORDS = {
+    "save",
+    "export",
+    "write",
+    "create file",
+    "make file",
+    "edit",
+    "modify",
+    "change",
+    "update",
+    "replace",
+    "append",
+    "delete",
+    "remove",
+    "implement",
+    "patch",
+    "fix",
+    "refactor",
+    "improve",
+    "self-improve",
+    "self improve",
+    "rename",
+    "copy",
+    "move",
+    "commit",
+}
+
+TOOL_INTENT_KEYWORDS = {
+    "analyze",
+    "audit",
+    "build",
+    "check",
+    "code",
+    "command",
+    "debug",
+    "edit",
+    "file",
+    "find",
+    "fix",
+    "generate",
+    "health",
+    "implement",
+    "inspect",
+    "list",
+    "modify",
+    "open",
+    "patch",
+    "project",
+    "read",
+    "refactor",
+    "run",
+    "save",
+    "scan",
+    "search",
+    "self-improve",
+    "self improve",
+    "show",
+    "summarize",
+    "test",
+    "tool",
+    "update",
+    "workspace",
+    "write",
+}
+
+CONVERSATIONAL_FOLLOWUP_PATTERNS = {
+    "and",
+    "and?",
+    "anything else",
+    "anything else?",
+    "anything more",
+    "anything more?",
+    "continue",
+    "continue please",
+    "elaborate",
+    "go on",
+    "more",
+    "tell me more",
+    "what else",
+    "what else?",
+    "anything to add",
+    "anything to add?",
+}
 
 
 ROLE_CATALOG: dict[str, dict[str, str]] = {
@@ -685,7 +776,8 @@ def animated_input(prompt: str = "User: ", on_resize: Callable[[], None] | None 
     if not sys.platform.startswith("win"):
         return input(prompt).strip()
 
-    import msvcrt
+    if msvcrt is None:
+        return input(prompt).strip()
 
     frames = ["◐", "◓", "◑", "◒"]
     final_frame = "○"
@@ -789,6 +881,9 @@ Rules:
 - Keep file access inside the workspace.
 - Do not run destructive or system-altering commands.
 - Prefer file tools over shell commands for code changes.
+- For ordinary informational answers, answer directly; do not call write_file, append_file, replace_in_file, or other write tools unless the user explicitly asks to save, export, edit, implement, or modify files.
+- For short conversational follow-ups like "anything else?", "continue", "tell me more", or "go on", answer from the recent conversation instead of inspecting the workspace or calling tools unless the user explicitly asks for a workspace/tool action.
+- When a user asks for a table, produce a standard Markdown pipe table in the final answer; the terminal renderer will convert it into a visual table.
 - Store durable findings in memory when they may help later.
 - Store explicit user facts such as name, contact details, birthday, preferences, and personal notes in the structured user profile, not in ad hoc memory.
 - Respect the control file during autonomous loops so a human can ask the agent to wrap up or stop.
@@ -796,77 +891,8 @@ Rules:
 - Do not broaden scope just because more tools exist; choose the smallest reversible step that improves the selected opportunity.
 - Never call self_improve_codebase from inside a self_improve_codebase cycle. During autonomous improvement, use concrete tools like read_file, replace_in_file, validate_python_file, git_diff, and run_internal_self_tests instead of recursively starting another autonomous improvement loop.
 
-Available tools and JSON arg schemas:
-- list_files: {{"path": ".", "recursive": false}}
-- inspect_path: {{"path": "."}}
-- read_file: {{"path": "relative/path.py"}}
-- read_json_file: {{"path": ".agent_config.json"}}
-- validate_json_file: {{"path": ".agent_config.json"}}
-- write_file: {{"path": "notes.txt", "content": "...", "overwrite": false}}
-- append_file: {{"path": "log.txt", "content": "..."}}
-- replace_in_file: {{"path": "app.py", "old": "x", "new": "y", "count": 1}}
-- search_files: {{"pattern": "text or regex", "path": "."}}
-- search_todos: {{"path": ".", "recursive": true}}
-- list_recent_files: {{"path": ".", "limit": 20}}
-- find_large_files: {{"path": ".", "limit": 20}}
-- run_command: {{"command": "dir"}}
-- list_roles: {{}}
-- list_team_templates: {{}}
-- recommend_team: {{"task": "objective", "context": "optional context"}}
-- manager_policy: {{"task": "user objective", "context": "optional context"}}
-- manager_execute: {{"task": "objective", "context": "optional context", "template": "implementation", "roles": ["planner", "coder", "reviewer"]}}
-- delegate_subagent: {{"role": "researcher", "task": "analyze X", "context": "optional extra context"}}
-- resolve_disagreement: {{"task": "objective", "team_report": "...", "context": "optional context"}}
-- quality_gate: {{"objective": "goal", "candidate": "candidate result", "context": "optional context"}}
-- show_role_telemetry: {{}}
-- run_team: {{"task": "objective", "roles": ["planner", "coder", "reviewer"], "context": "optional context"}}
-- meta_review: {{"objective": "goal", "draft": "candidate answer", "context": "optional context"}}
-- create_checkpoint: {{"label": "before-cycle-1"}}
-- summarize_changes_since_checkpoint: {{"checkpoint": ".agent_checkpoints/..." }}
-- show_last_self_improvement_changes: {{"checkpoint": ""}}
-- analyze_change_impact: {{"checkpoint": ".agent_checkpoints/..." }}
-- analyze_python_complexity: {{"path": ".", "recursive": true}}
-- build_import_graph: {{"path": ".", "recursive": true}}
-- find_duplicate_blocks: {{"path": ".", "min_lines": 6}}
-- suggest_refactor_targets: {{"path": ".", "recursive": true}}
-- build_code_graph: {{"path": ".", "recursive": true}}
-- show_code_graph: {{}}
-- find_callers: {{"name": "function_name"}}
-- analyze_symbol_impact: {{"name": "function_name"}}
-- find_orphan_symbols: {{"path": ".", "recursive": true}}
-- rank_code_hotspots: {{"path": ".", "recursive": true}}
-- show_code_hotspots: {{}}
-- restore_checkpoint: {{"checkpoint": ".agent_checkpoints/...", "preserve_agent_state": true}}
-- validate_python_file: {{"path": "agent.py"}}
-- validate_workspace_python: {{"path": ".", "recursive": true}}
-- read_control_state: {{}}
-- set_control_mode: {{"mode": "continue|wrap_up|stop", "note": "optional note", "monitor": "quiet|summary"}}
-- evaluate_autonomy_policy: {{"impact": {{}}, "changed_files": ["agent.py"]}}
-- self_improve_codebase: {{"goal": "improve this codebase", "max_cycles": 250, "roles": ["planner", "coder", "reviewer"]}}
-- scan_improvement_opportunities: {{"goal": "improve this codebase"}}
-- select_next_improvement: {{}}
-- evaluate_improvement_opportunity: {{"opportunity": {{}}}}
-- update_improvement_opportunity: {{"opportunity_id": "opp_...", "status": "in_progress", "note": ""}}
-- record_improvement_outcome: {{"opportunity": {{}}, "status": "done", "validation_ok": true, "files_changed": []}}
-- show_improvement_learning: {{}}
-- start_experiment: {{"title": "...", "hypothesis": "...", "opportunity": {{}}}}
-- update_experiment: {{"experiment_id": "exp_...", "status": "completed", "evidence": {{}}, "conclusion": "..."}}
-- show_experiments: {{"status": ""}}
-- show_cycle_ledger: {{"limit": 10}}
-- generate_health_report: {{"goal": "improve this codebase"}}
-- generate_planning_brief: {{"goal": "improve this codebase"}}
-- run_internal_self_tests: {{}}
-- update_plan: {{"items": ["step 1", "step 2"]}}
-- show_plan: {{}}
-- remember: {{"key": "topic", "value": "durable fact"}}
-- recall: {{"key": "topic"}}
-- search_memory: {{"query": "topic", "limit": 5}}
-- show_user_profile: {{}}
-- update_user_profile: {{"field": "identity.first_name", "value": "..."}}
-- add_user_profile_note: {{"note": "...", "category": "preference"}}
-- forget_user_profile_field: {{"field": "contact.phone"}}
-- list_llm_routes: {{}}
-- show_history: {{"limit": 8}}
+Registered tool specs are injected at runtime from the live tool registry.
+Do not rely on stale hardcoded tool schemas; use the registered tool specs below.
 """
 
 
@@ -1057,16 +1083,515 @@ def trim_text(text: str, max_chars: int = MAX_FILE_CHARS) -> str:
     return text[:max_chars] + "\n...[truncated]"
 
 
-def render_terminal_markdown(text: str) -> str:
-    if not sys.stdout.isatty():
+
+ANSI_PATTERN = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_PATTERN.sub("", text)
+
+
+def strip_inline_markdown_for_width(text: str) -> str:
+    # Width calculations should see the text as the user will see it after light
+    # inline markdown rendering.
+    return re.sub(r"\*\*([^*\n]+?)\*\*", r"\1", text)
+
+
+def terminal_display_width(text: str) -> int:
+    import unicodedata
+
+    plain = strip_inline_markdown_for_width(strip_ansi(text))
+    width = 0
+    for char in plain:
+        if unicodedata.combining(char):
+            continue
+        east_asian = unicodedata.east_asian_width(char)
+        if east_asian in {"F", "W"}:
+            width += 2
+        elif ord(char) > 0xFFFF:
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def truncate_display(text: str, max_width: int) -> str:
+    if terminal_display_width(text) <= max_width:
         return text
+    if max_width <= 1:
+        return "…"[:max_width]
+    output: list[str] = []
+    used = 0
+    for char in text:
+        char_width = terminal_display_width(char)
+        if used + char_width > max_width - 1:
+            break
+        output.append(char)
+        used += char_width
+    return "".join(output) + "…"
+
+
+def pad_display(text: str, width: int, align: str = "left") -> str:
+    visible_width = terminal_display_width(text)
+    if visible_width > width:
+        text = truncate_display(text, width)
+        visible_width = terminal_display_width(text)
+    padding = max(0, width - visible_width)
+    if align == "right":
+        return " " * padding + text
+    if align == "center":
+        left = padding // 2
+        right = padding - left
+        return " " * left + text + " " * right
+    return text + " " * padding
+
+
+def wrap_display_text(text: str, width: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return [""]
+    if terminal_display_width(text) <= width:
+        return [text]
+
+    words = re.split(r"(\s+)", text)
+    lines: list[str] = []
+    current = ""
+
+    for token in words:
+        if not token:
+            continue
+        candidate = current + token if current else token.strip()
+        if terminal_display_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current.rstrip())
+            current = token.strip()
+            if terminal_display_width(current) <= width:
+                continue
+        # Very long token: hard-wrap by display width.
+        while terminal_display_width(current) > width:
+            chunk: list[str] = []
+            used = 0
+            rest: list[str] = []
+            for char in current:
+                char_width = terminal_display_width(char)
+                if used + char_width <= width:
+                    chunk.append(char)
+                    used += char_width
+                else:
+                    rest.append(char)
+            lines.append("".join(chunk))
+            current = "".join(rest)
+    if current:
+        lines.append(current.rstrip())
+    return lines or [""]
+
+
+def split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in stripped:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            current.append(char)
+            continue
+        if char == "|":
+            cells.append("".join(current).strip().replace(r"\|", "|"))
+            current = []
+            continue
+        current.append(char)
+    cells.append("".join(current).strip().replace(r"\|", "|"))
+    return cells
+
+
+def is_markdown_table_separator(line: str) -> bool:
+    cells = split_markdown_table_row(line)
+    if len(cells) < 2:
+        return False
+    for cell in cells:
+        normalized = cell.replace(" ", "")
+        if not re.fullmatch(r":?-{3,}:?", normalized):
+            return False
+    return True
+
+
+def markdown_table_alignments(separator_line: str, column_count: int) -> list[str]:
+    alignments: list[str] = []
+    for cell in split_markdown_table_row(separator_line)[:column_count]:
+        normalized = cell.replace(" ", "")
+        if normalized.startswith(":") and normalized.endswith(":"):
+            alignments.append("center")
+        elif normalized.endswith(":"):
+            alignments.append("right")
+        else:
+            alignments.append("left")
+    while len(alignments) < column_count:
+        alignments.append("left")
+    return alignments
+
+
+def table_like_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and "|" in stripped and stripped.count("|") >= 2
+
+
+def markdown_table_group(lines: list[str]) -> tuple[list[list[str]], list[str]] | None:
+    parsed = [split_markdown_table_row(line) for line in lines]
+    parsed = [row for row in parsed if len(row) >= 2]
+    if len(parsed) < 2:
+        return None
+
+    separator_index = next((index for index, line in enumerate(lines) if is_markdown_table_separator(line)), -1)
+    if separator_index >= 1:
+        header = parsed[separator_index - 1]
+        rows = parsed[separator_index + 1 :]
+        column_count = max(len(header), *(len(row) for row in rows)) if rows else len(header)
+        alignments = markdown_table_alignments(lines[separator_index], column_count)
+        normalized_rows = [header] + rows
+    else:
+        # Loose pipe table fallback. Require at least three rows with stable column
+        # counts so ordinary prose containing pipes is not over-formatted.
+        counts = [len(row) for row in parsed]
+        if len(parsed) < 3 or max(counts) < 2 or len(set(counts)) > 1:
+            return None
+        column_count = counts[0]
+        alignments = ["left"] * column_count
+        normalized_rows = parsed
+
+    normalized: list[list[str]] = []
+    for row in normalized_rows:
+        cells = row[:column_count] + [""] * max(0, column_count - len(row))
+        normalized.append(cells)
+    return normalized, alignments[:column_count]
+
+
+def compute_table_widths(rows: list[list[str]], max_width: int) -> list[int]:
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count == 0:
+        return []
+
+    widths = [
+        max(3, max(terminal_display_width(row[column]) for row in rows))
+        for column in range(column_count)
+    ]
+
+    # Borders use: left/right + 2 spaces per cell + one separator between cells.
+    border_overhead = 3 * column_count + 1
+    available = max(8, max_width - border_overhead)
+    if sum(widths) <= available:
+        return widths
+
+    min_widths = [min(max(3, terminal_display_width(rows[0][column])), 12) for column in range(column_count)]
+    min_total = sum(min_widths)
+    if min_total > available:
+        min_widths = [max(3, available // column_count) for _ in range(column_count)]
+    widths = [max(width, min_widths[index]) for index, width in enumerate(widths)]
+
+    while sum(widths) > available:
+        reducible = [
+            (widths[index] - min_widths[index], index)
+            for index in range(column_count)
+            if widths[index] > min_widths[index]
+        ]
+        if not reducible:
+            break
+        _, index = max(reducible)
+        widths[index] -= 1
+    return widths
+
+
+def render_box_table(rows: list[list[str]], alignments: list[str]) -> str:
+    if not rows:
+        return ""
+
+    max_width = max(40, terminal_width() - 2)
+    widths = compute_table_widths(rows, max_width)
+    column_count = len(widths)
+
+    def border(left: str, middle: str, right: str) -> str:
+        return left + middle.join("─" * (width + 2) for width in widths) + right
+
+    def render_row(row: list[str], *, header: bool = False) -> list[str]:
+        wrapped_cells = [
+            wrap_display_text(row[index] if index < len(row) else "", widths[index])
+            for index in range(column_count)
+        ]
+        height = max(len(cell_lines) for cell_lines in wrapped_cells)
+        lines: list[str] = []
+        for line_index in range(height):
+            rendered_cells = []
+            for column_index, cell_lines in enumerate(wrapped_cells):
+                cell_text = cell_lines[line_index] if line_index < len(cell_lines) else ""
+                align = "left" if header else alignments[column_index]
+                rendered_cells.append(" " + pad_display(cell_text, widths[column_index], align) + " ")
+            lines.append("│" + "│".join(rendered_cells) + "│")
+        return lines
+
+    output: list[str] = [border("┌", "┬", "┐")]
+    output.extend(render_row(rows[0], header=True))
+    if len(rows) > 1:
+        output.append(border("├", "┼", "┤"))
+        for row in rows[1:]:
+            output.extend(render_row(row))
+    output.append(border("└", "┴", "┘"))
+    return "\n".join(output)
+
+
+def normalize_markdown_table(lines: list[str]) -> str | None:
+    group = markdown_table_group(lines)
+    if group is None:
+        return None
+    rows, alignments = group
+    return render_box_table(rows, alignments)
+
+
+def format_markdown_tables_for_terminal(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    pending: list[str] = []
+    in_fence = False
+
+    def flush_pending() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        rendered = normalize_markdown_table(pending)
+        if rendered:
+            output.extend(rendered.splitlines())
+        else:
+            output.extend(pending)
+        pending = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_pending()
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+        if table_like_line(line):
+            pending.append(line)
+            continue
+        flush_pending()
+        output.append(line)
+
+    flush_pending()
+    return "\n".join(output)
+
+
+def markdown_heading_match(line: str) -> re.Match[str] | None:
+    return re.match(r"^(?P<marker>#{1,6})[ \t]+(?P<title>.+?)\s*$", line)
+
+
+def render_markdown_heading_line(line: str) -> str:
+    match = markdown_heading_match(line)
+    if not match:
+        return line
+
+    marker = match.group("marker")
+    level = len(marker)
+    title = match.group("title").strip()
+    if not title:
+        return ""
+
+    # Terminal output should look like a real heading, not raw Markdown.
+    # The Markdown # / ## marker is a source-format hint, so strip it and
+    # replace it with an underline style that still works in plain CMD output.
+    max_width = max(12, min(terminal_width() - 4, 100))
+    display_title = title.upper() if level == 1 else title
+    display_title = truncate_display(display_title, max_width)
+    rule_width = max(8, min(terminal_display_width(display_title), max_width))
+
+    if level == 1:
+        rule_char = "═"
+        color = "96"
+    elif level == 2:
+        rule_char = "─"
+        color = "94"
+    else:
+        rule_char = "┄"
+        color = "90"
+
+    rule = rule_char * rule_width
+    if sys.stdout.isatty():
+        styled_title = f"\033[1m{terminal_color(display_title, color)}\033[0m"
+        styled_rule = terminal_color(rule, color)
+        return f"{styled_title}\n{styled_rule}"
+    return f"{display_title}\n{rule}"
+
+
+def format_markdown_headers_for_terminal(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    in_fence = False
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+        output.append(render_markdown_heading_line(line))
+    return "\n".join(output)
+
+
+def format_markdown_lists_for_terminal(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    in_fence = False
+    unordered_pattern = re.compile(r"^(?P<indent>\s*)[-*+]\s+(?P<body>.+)$")
+    ordered_pattern = re.compile(r"^(?P<indent>\s*)(?P<num>\d+)[.)]\s+(?P<body>.+)$")
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+
+        unordered = unordered_pattern.match(line)
+        if unordered:
+            body = unordered.group("body").strip()
+            indent = unordered.group("indent")
+            if body.startswith("[x] ") or body.startswith("[X] "):
+                output.append(f"{indent}☑ {body[4:].strip()}")
+            elif body.startswith("[ ] "):
+                output.append(f"{indent}☐ {body[4:].strip()}")
+            else:
+                output.append(f"{indent}• {body}")
+            continue
+
+        ordered = ordered_pattern.match(line)
+        if ordered:
+            indent = ordered.group("indent")
+            number = ordered.group("num")
+            body = ordered.group("body").strip()
+            output.append(f"{indent}{number}. {body}")
+            continue
+
+        output.append(line)
+
+    return "\n".join(output)
+
+
+def format_markdown_blockquotes_for_terminal(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    in_fence = False
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+        quote = re.match(r"^\s*>\s?(?P<body>.*)$", line)
+        if quote:
+            output.append("│ " + quote.group("body"))
+        else:
+            output.append(line)
+    return "\n".join(output)
+
+
+def format_inline_markdown_for_terminal(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    in_fence = False
+
+    def inline_code(match: re.Match[str]) -> str:
+        code = match.group(1)
+        return terminal_color(code, "93") if sys.stdout.isatty() else code
 
     def bold(match: re.Match[str]) -> str:
-        return f"\033[1m{match.group(1)}\033[0m"
+        content = match.group(1)
+        return f"\033[1m{content}\033[0m" if sys.stdout.isatty() else content
 
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+        rendered = re.sub(r"`([^`\n]+?)`", inline_code, line)
+        rendered = re.sub(r"\*\*([^\n]+?)\*\*", bold, rendered)
+        output.append(rendered)
+
+    return "\n".join(output)
+
+
+def action_envelope_to_user_text(action: dict[str, Any], *, original_text: str = "") -> str:
+    action_type = action.get("type")
+    if action_type == "final" and isinstance(action.get("content"), str):
+        return action["content"]
+
+    if action_type == "tool":
+        tool_name = str(action.get("tool", "unknown_tool"))
+        return (
+            f"[internal tool request suppressed: {tool_name}]\n"
+            "The model returned a tool-action JSON envelope where user-facing text was expected. "
+            "Cerebro kept the raw JSON out of the terminal."
+        )
+
+    if action_type == "batch":
+        raw_actions = action.get("actions", [])
+        tool_names: list[str] = []
+        if isinstance(raw_actions, list):
+            for item in raw_actions:
+                if isinstance(item, dict) and isinstance(item.get("tool"), str):
+                    tool_names.append(item["tool"])
+        listed_tools = ", ".join(tool_names[:5]) or "no valid tools"
+        extra = f" (+{len(tool_names) - 5} more)" if len(tool_names) > 5 else ""
+        return (
+            f"[internal batch request suppressed: {listed_tools}{extra}]\n"
+            "The model returned a batch-action JSON envelope where user-facing text was expected. "
+            "Cerebro kept the raw JSON out of the terminal."
+        )
+
+    if original_text:
+        return original_text
+    return "The model returned an unsupported action envelope."
+
+
+def unwrap_final_action_text(text: str) -> str:
+    stripped = strip_markdown_fences(text).strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(parsed, dict) and parsed.get("type") in {"final", "tool", "batch"}:
+        return action_envelope_to_user_text(parsed, original_text=text)
+    return text
+
+
+def render_terminal_markdown(text: str) -> str:
     def color_line_count(match: re.Match[str]) -> str:
         label = match.group("label")
         value = match.group("value")
+        if not sys.stdout.isatty():
+            return f"{label}{value}"
         if label.lower().startswith("lines added"):
             color = "32"
         elif label.lower().startswith("lines removed"):
@@ -1076,7 +1601,12 @@ def render_terminal_markdown(text: str) -> str:
             color = "32" if numeric > 0 else "31" if numeric < 0 else "90"
         return f"{label}{terminal_color(value, color)}"
 
-    rendered = re.sub(r"\*\*([^\n]+?)\*\*", bold, text)
+    rendered = unwrap_final_action_text(text)
+    rendered = format_markdown_tables_for_terminal(rendered)
+    rendered = format_markdown_headers_for_terminal(rendered)
+    rendered = format_markdown_lists_for_terminal(rendered)
+    rendered = format_markdown_blockquotes_for_terminal(rendered)
+    rendered = format_inline_markdown_for_terminal(rendered)
     rendered = re.sub(
         r"(?P<label>\bLines added:\s*)(?P<value>[+-]?\d+)",
         color_line_count,
@@ -1122,6 +1652,8 @@ def shimmer_text(text: str, offset: int = 0) -> str:
 
 
 def activity_enabled(force: bool = False) -> bool:
+    if RUNTIME_OUTPUT_SUPPRESSED:
+        return False
     return force or monitor_enabled()
 
 
@@ -1183,6 +1715,14 @@ def resolve_workspace_path(raw_path: str | None) -> Path:
 
 def workspace_relative(path: Path) -> str:
     return str(path.relative_to(WORKSPACE_ROOT))
+
+
+def active_agent_file() -> str:
+    active = Path(__file__).resolve()
+    try:
+        return str(active.relative_to(WORKSPACE_ROOT))
+    except ValueError:
+        return active.name
 
 
 def should_skip_checkpoint_path(path: Path) -> bool:
@@ -1260,6 +1800,8 @@ def monitor_enabled() -> bool:
 
 
 def emit_monitor(message: str, *, force: bool = False) -> None:
+    if RUNTIME_OUTPUT_SUPPRESSED:
+        return
     if force or monitor_enabled():
         print(render_terminal_markdown(f"[monitor] {message}"))
 
@@ -1770,7 +2312,36 @@ def parse_model_reply(reply: str, tool_names: set[str] | None = None) -> dict[st
         ok, reason = validate_action_shape(candidate, tool_names=tool_names)
         if ok:
             return candidate
+        repaired_batch = repair_batch_candidate(candidate, tool_names=tool_names)
+        if repaired_batch is not None:
+            ok, repaired_reason = validate_action_shape(repaired_batch, tool_names=tool_names)
+            if ok:
+                log_run_event(
+                    "repaired_batch_action",
+                    {
+                        "reason": reason,
+                        "original_action_count": len(candidate.get("actions", [])) if isinstance(candidate.get("actions"), list) else 0,
+                        "repaired_action_count": len(repaired_batch.get("actions", [])),
+                    },
+                )
+                return repaired_batch
+            reason = f"{reason}; repaired batch invalid: {repaired_reason}"
         log_run_event("invalid_action_shape", {"reason": reason, "candidate": candidate})
+
+    action_like = next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("type") in {"tool", "batch", "final"}
+        ),
+        None,
+    )
+    if action_like is not None:
+        return {
+            "type": "final",
+            "content": action_envelope_to_user_text(action_like, original_text=reply),
+            "summary": "Model returned an invalid action envelope; raw JSON was suppressed.",
+        }
 
     if reply.startswith("TOOL:"):
         lines = reply.splitlines()
@@ -1814,7 +2385,7 @@ def parse_json_value(reply: str) -> Any:
         return reply
 
 
-def normalize_batch_actions(actions: Any) -> list[dict[str, Any]]:
+def normalize_batch_actions(actions: Any, tool_names: set[str] | None = None) -> list[dict[str, Any]]:
     if not isinstance(actions, list):
         return []
     normalized: list[dict[str, Any]] = []
@@ -1823,9 +2394,26 @@ def normalize_batch_actions(actions: Any) -> list[dict[str, Any]]:
             continue
         tool_name = action.get("tool")
         args = action.get("args", {})
-        if isinstance(tool_name, str) and isinstance(args, dict):
-            normalized.append({"tool": tool_name, "args": args})
+        if not isinstance(tool_name, str) or not isinstance(args, dict):
+            continue
+        if tool_names is not None and tool_name not in tool_names:
+            continue
+        normalized.append({"tool": tool_name, "args": args})
     return normalized
+
+
+def repair_batch_candidate(candidate: dict[str, Any], tool_names: set[str] | None = None) -> dict[str, Any] | None:
+    if candidate.get("type") != "batch":
+        return None
+    normalized = normalize_batch_actions(candidate.get("actions"), tool_names=tool_names)
+    if not normalized:
+        return None
+    repaired = dict(candidate)
+    repaired["type"] = "batch"
+    repaired["actions"] = normalized
+    if len(candidate.get("actions", [])) != len(normalized):
+        repaired["why"] = str(candidate.get("why") or "batch normalized to supported actions")
+    return repaired
 
 
 def log_run_event(event_type: str, payload: dict[str, Any]) -> None:
@@ -1834,8 +2422,13 @@ def log_run_event(event_type: str, payload: dict[str, Any]) -> None:
         "event": event_type,
         "payload": payload,
     }
-    with RUN_LOG_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    try:
+        with RUN_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except OSError:
+        # Logging should never break an agent turn, CLI command, parser repair,
+        # or self-test. The workspace can be read-only in validation sandboxes.
+        return
 
 
 def load_run_events(limit: int = 50) -> list[dict[str, Any]]:
@@ -1888,8 +2481,17 @@ class AgentState:
     manager_decisions: list[dict[str, Any]] = field(default_factory=list)
     meta_reviews: list[dict[str, Any]] = field(default_factory=list)
     autonomous_runs: list[dict[str, Any]] = field(default_factory=list)
+    conversation_history: list[dict[str, str]] = field(default_factory=list)
     consecutive_failures: int = 0
     turns_completed: int = 0
+
+    def record_conversation_turn(self, user_input: str, assistant_output: str) -> None:
+        self.conversation_history.append({"role": "user", "content": trim_text(user_input, 1200)})
+        self.conversation_history.append({"role": "assistant", "content": trim_text(assistant_output, 1800)})
+        self.conversation_history = self.conversation_history[-CONVERSATION_HISTORY_LIMIT:]
+
+    def recent_conversation_messages(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self.conversation_history[-CONVERSATION_HISTORY_LIMIT:]]
 
     def record_tool_event(self, tool_name: str, args: dict[str, Any], result: ToolResult) -> None:
         self.consecutive_failures = 0 if result.ok else self.consecutive_failures + 1
@@ -1998,6 +2600,10 @@ class AgentState:
             f"- goal={item.get('goal')} cycles={item.get('cycles_completed')} stopped={item.get('stop_reason')}"
             for item in self.autonomous_runs[-2:]
         ) or "- none"
+        conversation_text = "\n".join(
+            f"- {item.get('role', 'unknown')}: {trim_text(item.get('content', ''), 180)}"
+            for item in self.conversation_history[-4:]
+        ) or "- none"
         return (
             f"Plan:\n{plan_text}\n\n"
             f"Memory keys: {memory_keys}\n"
@@ -2009,7 +2615,8 @@ class AgentState:
             f"Recent sub-agent reports:\n{subagent_text}\n\n"
             f"Recent meta reviews:\n{meta_text}\n\n"
             f"Role telemetry:\n{role_text}\n\n"
-            f"Recent autonomous runs:\n{auto_text}"
+            f"Recent autonomous runs:\n{auto_text}\n\n"
+            f"Recent conversation:\n{conversation_text}"
         )
 
 
@@ -2019,6 +2626,97 @@ def build_tool_feedback(executed: list[tuple[str, ToolResult]], state: AgentStat
         sections.append(f"Tool result for {tool_name}:\n{result.render()}")
     sections.append(f"Updated state:\n{state.context_summary()}")
     return "\n\n".join(sections)
+
+
+def user_explicitly_requested_file_write(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", user_input.lower()).strip()
+    if not text:
+        return False
+    return any(keyword in text for keyword in WRITE_INTENT_KEYWORDS)
+
+
+def user_input_has_tool_intent(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", user_input.lower()).strip()
+    if not text:
+        return False
+    return any(keyword in text for keyword in TOOL_INTENT_KEYWORDS)
+
+
+def build_turn_guidance(user_input: str, state: "AgentState") -> str:
+    if user_input_looks_like_conversational_followup(user_input) and state.conversation_history:
+        return (
+            "Turn guidance: This user message is a short conversational follow-up. "
+            "Use the recent conversation as context and return a final answer. "
+            "Do not inspect the workspace or call tools unless the user explicitly asks for a tool/workspace/file action."
+        )
+    if not user_input_has_tool_intent(user_input) and not user_explicitly_requested_file_write(user_input):
+        return (
+            "Turn guidance: This looks like ordinary conversation or an informational question. "
+            "Prefer a direct final answer. Do not call file/workspace/write tools unless necessary and clearly requested."
+        )
+    return (
+        "Turn guidance: Tool use may be appropriate if it is the smallest safe way to satisfy the request. "
+        "For write tools, require explicit user intent to save, export, edit, patch, refactor, or improve files."
+    )
+
+
+def should_block_write_action(tool_name: str, user_input: str) -> bool:
+    if tool_name not in WRITE_TOOL_NAMES:
+        return False
+    return not user_explicitly_requested_file_write(user_input)
+
+
+def user_input_looks_like_conversational_followup(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", user_input.lower()).strip()
+    if not text:
+        return False
+    if any(keyword in text for keyword in TOOL_INTENT_KEYWORDS):
+        return False
+    if text in CONVERSATIONAL_FOLLOWUP_PATTERNS:
+        return True
+    return len(text.split()) <= 4 and text.rstrip("?!.") in CONVERSATIONAL_FOLLOWUP_PATTERNS
+
+
+def should_block_tool_for_conversational_followup(tool_name: str, user_input: str, state: AgentState) -> bool:
+    if not state.conversation_history:
+        return False
+    if tool_name in {"remember", "recall", "search_memory"}:
+        return False
+    return user_input_looks_like_conversational_followup(user_input)
+
+
+def blocked_conversational_tool_result(tool_name: str, user_input: str) -> ToolResult:
+    message = (
+        f"Blocked {tool_name}: the user message looks like a conversational follow-up. "
+        "Answer directly from the recent conversation instead of inspecting the workspace or calling tools."
+    )
+    return ToolResult(
+        False,
+        message,
+        meta={
+            "blocked": True,
+            "tool": tool_name,
+            "reason": "conversational_followup_should_answer_directly",
+            "user_input": trim_text(user_input, 500),
+        },
+    )
+
+
+def blocked_write_tool_result(tool_name: str, user_input: str) -> ToolResult:
+    message = (
+        f"Blocked {tool_name}: this looks like an informational request, not an explicit request to save, export, edit, or modify files. "
+        "Answer directly instead of writing to the workspace unless the user explicitly asks for a file change."
+    )
+    return ToolResult(
+        False,
+        message,
+        meta={
+            "blocked": True,
+            "tool": tool_name,
+            "reason": "missing_explicit_write_intent",
+            "user_input": trim_text(user_input, 500),
+        },
+    )
 
 
 def run_agent(
@@ -2043,6 +2741,8 @@ def run_agent(
     messages = [
         {"role": "system", "content": prompt},
         {"role": "system", "content": state.context_summary()},
+        {"role": "system", "content": build_turn_guidance(user_input, state)},
+        *state.recent_conversation_messages(),
         {"role": "user", "content": user_input},
     ]
     log_run_event("turn_started", {"input": user_input, "turn": state.turns_completed, "depth": depth})
@@ -2059,10 +2759,12 @@ def run_agent(
             summary = action.get("summary")
             if isinstance(summary, str):
                 state.add_reflection(summary)
-            log_run_event("turn_finished", {"step": step, "final": action.get("content", ""), "depth": depth})
-            return str(action.get("content", ""))
+            final_content = str(action.get("content", ""))
+            state.record_conversation_turn(user_input, final_content)
+            log_run_event("turn_finished", {"step": step, "final": final_content, "depth": depth})
+            return final_content
 
-        executed = execute_action(action, tools)
+        executed = execute_action(action, tools, user_input=user_input)
         if any(not result.ok for _, result in executed):
             state.add_reflection("A tool failed; inspect the error and choose a narrower recovery step.")
         else:
@@ -2229,7 +2931,7 @@ class AgentTools:
             return ToolResult(False, f"Path does not exist: {path}")
         stat = target.stat()
         payload = {
-            "path": workspace_relative(target),
+            "path": target_relative,
             "is_file": target.is_file(),
             "is_dir": target.is_dir(),
             "size": stat.st_size,
@@ -2419,37 +3121,48 @@ class AgentTools:
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
     def run_command(self, command: str) -> ToolResult:
-        lowered = command.lower()
-        dangerous_tokens = [
-            " del ",
-            " rd ",
-            " rmdir ",
-            " remove-item ",
-            " erase ",
-            " format ",
-            " shutdown ",
-            " restart-computer",
-            " stop-computer",
-            " reg delete",
-            " sc delete",
-            " mkfs",
-            " diskpart",
+        lowered = command.lower().strip()
+        if not lowered:
+            return ToolResult(False, "Command cannot be empty.")
+
+        dangerous_patterns = [
+            r"(^|\s)(del|erase|rd|rmdir|format|diskpart)(\s|$)",
+            r"(^|\s)(shutdown|restart-computer|stop-computer)(\s|$)",
+            r"(^|\s)reg\s+delete(\s|$)",
+            r"(^|\s)sc\s+delete(\s|$)",
+            r"(^|\s)mkfs(\.|\s|$)",
+            r"remove-item",
         ]
-        wrapped = f" {lowered} "
-        if any(token in wrapped for token in dangerous_tokens):
+        if any(re.search(pattern, lowered) for pattern in dangerous_patterns):
             return ToolResult(False, "Blocked: potentially destructive command.")
+
+        shell_control_tokens = ["&&", "||", ";", "|", ">", ">>", "<", "`", "$("]
+        if any(token in command for token in shell_control_tokens):
+            return ToolResult(False, "Blocked: shell control operators are not allowed in run_command.")
+
         try:
-            subprocess.list2cmdline(shlex.split(command, posix=False))
+            args = shlex.split(command, posix=not sys.platform.startswith("win"))
         except ValueError as exc:
             return ToolResult(False, f"Invalid command syntax: {exc}")
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=WORKSPACE_ROOT,
-        )
+        if not args:
+            return ToolResult(False, "Command cannot be empty.")
+
+        windows_shell_builtins = {"dir", "cls", "copy", "move", "type"}
+        use_shell = sys.platform.startswith("win") and args[0].lower() in windows_shell_builtins
+
+        try:
+            result = subprocess.run(
+                command if use_shell else args,
+                shell=use_shell,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=WORKSPACE_ROOT,
+            )
+        except FileNotFoundError:
+            return ToolResult(False, f"Command not found: {args[0]}")
+        except subprocess.TimeoutExpired:
+            return ToolResult(False, "Command timed out after 15 seconds.")
         output = (result.stdout or result.stderr or "(no output)").strip()
         return ToolResult(result.returncode == 0, trim_text(output, 12000))
 
@@ -2617,25 +3330,41 @@ class AgentTools:
             "compile": parse_json_value(compile_result.content),
             "help": None,
         }
-        if "--help" in source or "argparse" in source:
+        if target.name == Path(active_agent_file()).name and "--quick-self-test" in source:
+            try:
+                result = run_subprocess([sys.executable, str(target), "--quick-self-test"], timeout=15)
+                payload["quick_self_test"] = parse_json_value(render_completed_process(result))
+            except subprocess.TimeoutExpired:
+                payload["quick_self_test"] = {"ok": False, "message": "--quick-self-test timed out; compile check still completed."}
+        elif "argparse" in source:
             try:
                 result = run_subprocess([sys.executable, str(target), "--help"], timeout=10)
                 payload["help"] = parse_json_value(render_completed_process(result))
             except subprocess.TimeoutExpired:
                 payload["help"] = {"ok": False, "message": "--help timed out; compile check still completed."}
         else:
-            payload["help"] = {"skipped": True, "reason": "file does not appear to define a --help CLI"}
+            payload["help"] = {"skipped": True, "reason": "file does not appear to define an argparse --help CLI"}
         return ToolResult(compile_result.ok, json.dumps(payload, indent=2), meta=payload)
 
     def run_self_improvement_validation(self, path: str = ".") -> ToolResult:
         target = resolve_workspace_path(path)
-        compile_check = self.validate_workspace_python(path=workspace_relative(target), recursive=True)
-        smoke_check = self.run_python_smoke_test("agent.py")
-        pytest_check = self.run_pytest(path=workspace_relative(target))
-        ruff_check = self.run_ruff(path=workspace_relative(target))
+        target_relative = workspace_relative(target)
+        compile_check = self.validate_workspace_python(path=target_relative, recursive=target.is_dir())
+        smoke_target = target_relative if target.is_file() and target.suffix.lower() == ".py" else active_agent_file()
+        smoke_check = self.run_python_smoke_test(smoke_target)
+
+        def skipped_optional_tool(name: str, reason: str) -> ToolResult:
+            return ToolResult(False, f"{name} skipped: {reason}", meta={"skipped": True, "reason": reason})
+
+        has_pytest_target = any((WORKSPACE_ROOT / item).exists() for item in ("pytest.ini", "tox.ini", "tests"))
+        has_ruff_config = any((WORKSPACE_ROOT / item).exists() for item in ("ruff.toml", ".ruff.toml", "pyproject.toml"))
+        pytest_check = self.run_pytest(path=target_relative) if target.is_dir() and has_pytest_target else skipped_optional_tool("pytest", "no pytest config or tests directory found")
+        ruff_check = self.run_ruff(path=target_relative) if has_ruff_config else skipped_optional_tool("ruff", "no ruff config found")
         git_check = self.git_status()
 
         def optional_status(result: ToolResult, missing_phrase: str) -> str:
+            if result.meta.get("skipped") is True:
+                return "skipped"
             if result.ok:
                 return "pass"
             if missing_phrase in result.content:
@@ -3565,7 +4294,7 @@ class AgentTools:
         )
         self.update_blackboard("decisions", f"Started autonomous self-improvement task {task_id}: {goal}")
         preflight_index = self.index_codebase(path=".", recursive=True)
-        preflight_validation = self.run_self_improvement_validation(path=".")
+        preflight_validation = self.run_self_improvement_validation(path=active_file)
         preflight_backlog = self.scan_improvement_opportunities(goal=goal)
         save_control_state(mode="continue", note="Autonomous improvement loop started.")
         emit_monitor(
@@ -5275,14 +6004,22 @@ class AgentTools:
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
-    def generate_health_report(self, goal: str = "improve this codebase") -> ToolResult:
-        validation = self.run_self_improvement_validation(path=".")
-        code_index = self.index_codebase(path=".", recursive=True)
-        code_graph = self.build_code_graph(path=".", recursive=True)
-        hotspot_result = self.rank_code_hotspots(path=".", recursive=True)
-        orphan_symbols = self.find_orphan_symbols(path=".", recursive=True)
-        backlog = self.scan_improvement_opportunities(goal=goal)
-        selected = self.select_next_improvement()
+    def generate_health_report(self, goal: str = "improve this codebase", scope: str = ".") -> ToolResult:
+        target = resolve_workspace_path(scope)
+        scope_relative = workspace_relative(target)
+        recursive = target.is_dir()
+        validation = self.run_self_improvement_validation(path=scope_relative)
+        code_index = self.index_codebase(path=scope_relative, recursive=recursive)
+        code_graph = self.build_code_graph(path=scope_relative, recursive=recursive)
+        hotspot_result = self.rank_code_hotspots(path=scope_relative, recursive=recursive)
+        orphan_symbols = self.find_orphan_symbols(path=scope_relative, recursive=recursive)
+        if scope_relative == ".":
+            backlog = self.scan_improvement_opportunities(goal=goal)
+            selected = self.select_next_improvement()
+        else:
+            backlog_payload = {"scope": scope_relative, "opportunities": [], "note": "Scope-limited health report skipped workspace-wide backlog scan."}
+            backlog = ToolResult(True, json.dumps(backlog_payload, indent=2), meta=backlog_payload)
+            selected = ToolResult(False, "Scope-limited health report skipped backlog selection.")
         learning = load_improvement_learning()
         experiments = load_experiment_journal().get("experiments", [])
         tasks = load_tasks().get("tasks", [])
@@ -5339,6 +6076,7 @@ class AgentTools:
         payload = {
             "generated_at": utc_now(),
             "goal": goal,
+            "scope": scope_relative,
             "autonomy_policy": load_autonomy_policy(),
             "validation": {
                 "ok": validation.ok,
@@ -5401,8 +6139,8 @@ class AgentTools:
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
-    def generate_planning_brief(self, goal: str = "improve this codebase") -> ToolResult:
-        health = self.generate_health_report(goal=goal)
+    def generate_planning_brief(self, goal: str = "improve this codebase", scope: str = ".") -> ToolResult:
+        health = self.generate_health_report(goal=goal, scope=scope)
         selected = health.meta.get("improvement_backlog", {}).get("selected") if health.ok else None
         selected = selected or {}
         evaluation = selected.get("manager_evaluation", {}) if isinstance(selected, dict) else {}
@@ -5429,6 +6167,7 @@ class AgentTools:
         brief = {
             "generated_at": utc_now(),
             "goal": goal,
+            "scope": scope,
             "selected_opportunity": selected,
             "governor_decision": decision,
             "recommended_roles": roles,
@@ -5470,6 +6209,8 @@ class AgentTools:
             )
 
         config = load_config()
+        active_file = active_agent_file()
+        check("active_agent_file_resolves", bool(active_file) and active_file.endswith(".py"), active_file)
         check("config_has_autonomy_policy", isinstance(config.get("autonomy_policy"), dict))
         check("thinking_indicator_enabled", config.get("show_thinking_indicator") is True)
         check("config_has_known_fallback_provider", config.get("fallback_provider") in config.get("llm_providers", {}))
@@ -5523,6 +6264,8 @@ class AgentTools:
         fenced = parse_json_object("```json\n{\"ok\": true}\n```")
         check("parse_fenced_json_object", fenced.get("ok") is True)
 
+        check("run_logging_is_nonfatal", log_run_event("self_test_probe", {"ok": True}) is None)
+
         valid_tool, valid_tool_reason = validate_action_shape(
             {"type": "tool", "tool": "list_files", "args": {}},
             tool_names=set(self.tools),
@@ -5534,6 +6277,94 @@ class AgentTools:
             tool_names=set(self.tools),
         )
         check("reject_unknown_tool_action", not invalid_tool, invalid_tool_reason)
+
+        oversized_batch = parse_model_reply(
+            json.dumps(
+                {
+                    "type": "batch",
+                    "why": "test oversized batch repair",
+                    "actions": [
+                        {"tool": "list_files", "args": {}},
+                        {"tool": "read_control_state", "args": {}},
+                        {"tool": "show_workspace_stats", "args": {}},
+                        {"tool": "inspect_path", "args": {"path": "."}},
+                    ],
+                }
+            ),
+            tool_names=set(self.tools),
+        )
+        check(
+            "parse_oversized_batch_repairs_instead_of_printing_json",
+            oversized_batch.get("type") == "batch" and len(oversized_batch.get("actions", [])) == configured_max_batch_actions(),
+            json.dumps(oversized_batch),
+        )
+
+        invalid_tool_json = json.dumps({"type": "tool", "tool": "missing_tool", "args": {}})
+        invalid_tool_action = parse_model_reply(invalid_tool_json, tool_names=set(self.tools))
+        check(
+            "invalid_action_json_suppressed_instead_of_printed",
+            invalid_tool_action.get("type") == "final"
+            and "missing_tool" in invalid_tool_action.get("content", "")
+            and "{\"" not in invalid_tool_action.get("content", ""),
+            invalid_tool_action.get("content", ""),
+        )
+
+        rendered_batch_json = render_terminal_markdown(
+            json.dumps(
+                {
+                    "type": "batch",
+                    "actions": [
+                        {"tool": "inspect_path", "args": {"path": "."}},
+                        {"tool": "show_workspace_stats", "args": {"path": "."}},
+                    ],
+                }
+            )
+        )
+        check(
+            "renderer_suppresses_raw_batch_action_json",
+            "internal batch request suppressed" in rendered_batch_json
+            and "\"type\"" not in rendered_batch_json
+            and "\"actions\"" not in rendered_batch_json,
+            rendered_batch_json,
+        )
+
+        check(
+            "system_prompt_uses_live_tool_registry_note",
+            "Registered tool specs are injected at runtime" in SYSTEM_PROMPT
+            and "Available tools and JSON arg schemas:" not in SYSTEM_PROMPT,
+        )
+
+        conversation_state = AgentState()
+        conversation_state.record_conversation_turn("What is Cerebro in X-Men?", "Cerebro is a telepathic amplifier used by Professor Xavier.")
+        check(
+            "conversation_history_records_recent_turn",
+            len(conversation_state.recent_conversation_messages()) == 2,
+            json.dumps(conversation_state.recent_conversation_messages()),
+        )
+        check(
+            "short_followup_detected",
+            user_input_looks_like_conversational_followup("Anything else?"),
+        )
+        check(
+            "conversational_followup_blocks_workspace_tool",
+            should_block_tool_for_conversational_followup("inspect_path", "Anything else?", conversation_state),
+        )
+        check(
+            "turn_guidance_for_followup_forces_direct_answer",
+            "return a final answer" in build_turn_guidance("Anything else?", conversation_state),
+            build_turn_guidance("Anything else?", conversation_state),
+        )
+        check(
+            "turn_guidance_for_plain_question_prefers_direct_answer",
+            "ordinary conversation or an informational question" in build_turn_guidance("What is Cerebro?", AgentState()),
+            build_turn_guidance("What is Cerebro?", AgentState()),
+        )
+        try:
+            parse_cli_roles("planner,definitely_missing")
+            unknown_role_rejected = False
+        except ValueError:
+            unknown_role_rejected = True
+        check("cli_role_parser_rejects_unknown_roles", unknown_role_rejected)
 
         required_tools = {
             "self_improve_codebase",
@@ -5594,27 +6425,27 @@ class AgentTools:
         check("recommend_team_returns_valid_roles", all(role in ROLE_CATALOG for role in recommended_roles), recommendation.content)
         check("recommend_team_respects_role_limit", len(recommended_roles) <= MAX_TEAM_ROLES, recommendation.content)
 
-        graph = self.build_code_graph("agent.py", recursive=False)
+        graph = self.build_code_graph(active_file, recursive=False)
         callers = self.find_callers("load_config")
         symbol_impact = self.analyze_symbol_impact("load_config")
-        orphans = self.find_orphan_symbols("agent.py", recursive=False)
-        hotspots = self.rank_code_hotspots("agent.py", recursive=False)
+        orphans = self.find_orphan_symbols(active_file, recursive=False)
+        hotspots = self.rank_code_hotspots(active_file, recursive=False)
         cycle_ledger = self.show_cycle_ledger(limit=3)
         config_view = self.show_config()
         user_profile = self.show_user_profile()
         blackboard_summary = self.summarize_blackboard(limit=2)
-        workspace_stats = self.show_workspace_stats(path="agent.py", recursive=False)
+        workspace_stats = self.show_workspace_stats(path=active_file, recursive=False)
         run_history = self.show_run_history(limit=5)
         json_read = self.read_json_file(".agent_config.json")
         json_validation = self.validate_json_file(".agent_config.json")
         last_self_improvement_changes = self.show_last_self_improvement_changes()
-        todos = self.search_todos("agent.py", recursive=False)
+        todos = self.search_todos(active_file, recursive=False)
         recent_files = self.list_recent_files(".", limit=3)
         large_files = self.find_large_files(".", limit=3)
-        complexity = self.analyze_python_complexity("agent.py", recursive=False)
-        import_graph = self.build_import_graph("agent.py", recursive=False)
-        duplicates = self.find_duplicate_blocks("agent.py", min_lines=6)
-        refactor_targets = self.suggest_refactor_targets("agent.py", recursive=False)
+        complexity = self.analyze_python_complexity(active_file, recursive=False)
+        import_graph = self.build_import_graph(active_file, recursive=False)
+        duplicates = self.find_duplicate_blocks(active_file, min_lines=6)
+        refactor_targets = self.suggest_refactor_targets(active_file, recursive=False)
         check("code_graph_builds", graph.ok and bool(graph.meta.get("nodes")), trim_text(graph.content, 500))
         check("find_callers_returns_payload", callers.ok and isinstance(callers.meta.get("callers"), list), trim_text(callers.content, 500))
         check("analyze_symbol_impact_scores_symbol", symbol_impact.ok and symbol_impact.meta.get("risk_level") in {"low", "medium", "high"}, trim_text(symbol_impact.content, 500))
@@ -5662,14 +6493,56 @@ class AgentTools:
             check("terminal_line_count_removed_red", "Lines removed: \033[31m5\033[0m" in line_counts)
             check("terminal_net_positive_green", "Net change: \033[32m+25\033[0m" in line_counts)
             check("terminal_net_negative_red", "Net change: \033[31m-4\033[0m" in line_counts)
+            markdown_table = render_terminal_markdown("| Company | Location |\n| --- | --- |\n| Apple | Cupertino |")
+            loose_table = render_terminal_markdown("| Company | Location |\n| Apple | Cupertino |\n| Microsoft | Redmond |")
+            heading = render_terminal_markdown("# Main Title\n## Sub Title")
+            fenced_table = render_terminal_markdown("```\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```")
+            check(
+                "terminal_markdown_table_box_rendering",
+                "┌" in markdown_table and "│ Company" in markdown_table and "Apple" in markdown_table,
+                markdown_table,
+            )
+            check(
+                "terminal_loose_pipe_table_box_rendering",
+                "┌" in loose_table and "Microsoft" in loose_table and "Redmond" in loose_table,
+                loose_table,
+            )
+            plain_heading = strip_ansi(heading)
+            check(
+                "terminal_heading_strips_marker_and_adds_visual_rules",
+                "#" not in plain_heading
+                and "MAIN TITLE" in plain_heading
+                and "Sub Title" in plain_heading
+                and "═" in plain_heading
+                and "─" in plain_heading,
+                heading,
+            )
+            check("terminal_code_fence_table_not_rendered", "┌" not in fenced_table and "| A | B |" in fenced_table, fenced_table)
+            rendered_list = render_terminal_markdown("- item\n- [x] done\n- [ ] todo")
+            rendered_quote = render_terminal_markdown("> quoted text")
+            rendered_inline = render_terminal_markdown("Use `agent.py` and **bold** text")
+            fenced_inline = render_terminal_markdown("```\nUse `raw` and **raw**\n```")
+            check("terminal_unordered_lists_use_bullets", "• item" in rendered_list and "☑ done" in rendered_list and "☐ todo" in rendered_list, rendered_list)
+            check("terminal_blockquote_uses_visual_bar", "│ quoted text" in rendered_quote, rendered_quote)
+            check("terminal_inline_markdown_removes_source_markers", "`" not in strip_ansi(rendered_inline) and "**" not in strip_ansi(rendered_inline), rendered_inline)
+            check("terminal_code_fence_inline_markdown_not_rendered", "`raw`" in fenced_inline and "**raw**" in fenced_inline, fenced_inline)
         finally:
             sys.stdout.isatty = terminal_was_tty
 
-        brief = self.generate_planning_brief("internal self-test planning brief")
+        check("ordinary_informational_request_blocks_write_tools", should_block_write_action("write_file", "Give me a table of tech companies"))
+        check("explicit_file_change_request_allows_write_tools", not should_block_write_action("write_file", "Save this table to a csv file"))
+        blocked_result = execute_action(
+            {"type": "tool", "tool": "write_file", "args": {"path": "blocked_selftest.txt", "content": "x"}},
+            self,
+            user_input="Give me a table of tech companies",
+        )
+        check("execute_action_blocks_unrequested_write", blocked_result[0][1].ok is False and blocked_result[0][1].meta.get("blocked") is True)
+
+        brief = self.generate_planning_brief("internal self-test planning brief", scope=active_file)
         check("planning_brief_generates", brief.ok and bool(brief.meta.get("acceptance_criteria")), trim_text(brief.content, 500))
 
-        validation = self.run_self_improvement_validation(path=".")
-        check("self_improvement_validation_runs", validation.ok, trim_text(validation.content, 500))
+        validation = self.run_self_improvement_validation(path=active_file)
+        check("self_improvement_validation_runs_on_active_file", validation.ok, trim_text(validation.content, 500))
 
         failed = [item for item in checks if not item["ok"]]
         payload = {
@@ -5777,10 +6650,9 @@ class AgentTools:
         return ToolResult(True, json.dumps(selected, indent=2))
 
 
-def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str, ToolResult]]:
+def execute_action(action: dict[str, Any], tools: AgentTools, *, user_input: str = "") -> list[tuple[str, ToolResult]]:
     def activity_for_tool(tool_name: str, args: dict[str, Any]) -> tuple[str, str]:
-        edit_tools = {"write_file", "append_file", "replace_in_file", "apply_unified_diff"}
-        if tool_name in edit_tools:
+        if tool_name in WRITE_TOOL_NAMES:
             target = str(args.get("path", "")) if isinstance(args, dict) else ""
             return "editing", f"Editing a file: {target or tool_name}"
         return "tool", f"Ran {tool_name}"
@@ -5791,6 +6663,14 @@ def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str,
         args = action.get("args", {})
         if not isinstance(args, dict):
             args = {}
+        if should_block_tool_for_conversational_followup(tool_name, user_input, tools.state):
+            result = blocked_conversational_tool_result(tool_name, user_input)
+            emit_activity("warning", result.content, animate=False)
+            return [(tool_name, result)]
+        if should_block_write_action(tool_name, user_input):
+            result = blocked_write_tool_result(tool_name, user_input)
+            emit_activity("warning", result.content, animate=False)
+            return [(tool_name, result)]
         kind, message = activity_for_tool(tool_name, args)
         indicator = start_activity_indicator(kind, message)
         try:
@@ -5802,7 +6682,17 @@ def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str,
 
     if action_type == "batch":
         executed: list[tuple[str, ToolResult]] = []
-        for item in normalize_batch_actions(action.get("actions", [])):
+        for item in normalize_batch_actions(action.get("actions", []), tool_names=set(tools.tools)):
+            if should_block_tool_for_conversational_followup(item["tool"], user_input, tools.state):
+                result = blocked_conversational_tool_result(item["tool"], user_input)
+                emit_activity("warning", result.content, animate=False)
+                executed.append((item["tool"], result))
+                continue
+            if should_block_write_action(item["tool"], user_input):
+                result = blocked_write_tool_result(item["tool"], user_input)
+                emit_activity("warning", result.content, animate=False)
+                executed.append((item["tool"], result))
+                continue
             kind, message = activity_for_tool(item["tool"], item["args"])
             indicator = start_activity_indicator(kind, message)
             try:
@@ -5812,7 +6702,7 @@ def execute_action(action: dict[str, Any], tools: AgentTools) -> list[tuple[str,
             executed.append((item["tool"], result))
         if not executed:
             return [("batch", ToolResult(False, "No valid batch actions were provided."))]
-        edit_count = sum(1 for name, _ in executed if name in {"write_file", "append_file", "replace_in_file", "apply_unified_diff"})
+        edit_count = sum(1 for name, _ in executed if name in WRITE_TOOL_NAMES)
         command_count = sum(1 for name, _ in executed if name.startswith("run_") or name == "run_command")
         emit_activity(
             "done",
@@ -5852,11 +6742,148 @@ def repl() -> None:
             answer = run_agent(user_input, state=state)
         except Exception as exc:
             answer = format_agent_failure(exc)
+            state.record_conversation_turn(user_input, answer)
             log_run_event("agent_exception", {"error": str(exc)})
         transcript.append({"role": "agent", "content": answer})
         print("\n" + terminal_color("Cerebro: ", "94"), end="", flush=True)
         typewriter_print(render_terminal_markdown(answer))
 
 
-if __name__ == "__main__":
+def cli_flag_value(flag: str, default: str = "") -> str:
+    if flag not in sys.argv:
+        return default
+    index = sys.argv.index(flag)
+    if len(sys.argv) <= index + 1:
+        return default
+    value = sys.argv[index + 1]
+    if value.startswith("--"):
+        return default
+    return value
+
+
+def cli_int_value(flag: str, default: int) -> int:
+    value = cli_flag_value(flag, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def parse_cli_roles(value: str) -> list[str]:
+    if not value.strip():
+        return ["planner", "coder", "reviewer"]
+    requested = [item.strip() for item in value.split(",") if item.strip()]
+    unknown = [role for role in requested if role not in ROLE_CATALOG]
+    if unknown:
+        raise ValueError(f"Unknown role(s): {', '.join(unknown)}")
+    return requested or ["planner", "coder", "reviewer"]
+
+
+
+def main() -> None:
+    if "--self-test" in sys.argv:
+        global RUNTIME_OUTPUT_SUPPRESSED
+        RUNTIME_OUTPUT_SUPPRESSED = True
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.run_internal_self_tests()
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--quick-self-test" in sys.argv:
+        RUNTIME_OUTPUT_SUPPRESSED = True
+        checks = {
+            "active_file": active_agent_file(),
+            "renders_headers_without_hashes": "#" not in strip_ansi(render_terminal_markdown("# Title")),
+            "renders_tables_as_boxes": "┌" in render_terminal_markdown("| A | B |\n|---|---|\n| 1 | 2 |"),
+            "blocks_unrequested_writes": should_block_write_action("write_file", "Give me a table of tech companies"),
+            "allows_requested_writes": not should_block_write_action("write_file", "Save this as a csv file"),
+            "detects_conversation_followup": user_input_looks_like_conversational_followup("Anything else?"),
+            "repairs_oversized_batch": len(parse_model_reply(json.dumps({"type": "batch", "actions": [{"tool": "list_files", "args": {}}, {"tool": "read_control_state", "args": {}}, {"tool": "show_workspace_stats", "args": {}}, {"tool": "inspect_path", "args": {"path": "."}}]}), tool_names=set(AgentTools(AgentState()).tools)).get("actions", [])) == configured_max_batch_actions(),
+            "suppresses_raw_action_json": "internal tool request suppressed" in render_terminal_markdown(json.dumps({"type": "tool", "tool": "missing_tool", "args": {}})),
+            "uses_dynamic_tool_registry_prompt": "Registered tool specs are injected at runtime" in SYSTEM_PROMPT and "Available tools and JSON arg schemas:" not in SYSTEM_PROMPT,
+            "direct_guidance_for_plain_question": "direct final answer" in build_turn_guidance("What is Cerebro?", AgentState()),
+            "cli_roles_validate": parse_cli_roles("planner,coder") == ["planner", "coder"],
+        }
+        ok = all(bool(value) for key, value in checks.items() if key != "active_file")
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+        raise SystemExit(0 if ok else 1)
+
+    if "--tools" in sys.argv:
+        state = AgentState()
+        tools = AgentTools(state)
+        print(tools.render_tool_prompt())
+        raise SystemExit(0)
+
+    if "--validate" in sys.argv:
+        target = cli_flag_value("--validate", active_agent_file())
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.validate_python_file(target)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--health-report" in sys.argv:
+        goal = cli_flag_value("--health-report", "improve this codebase")
+        scope = cli_flag_value("--scope", active_agent_file())
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.generate_health_report(goal=goal, scope=scope)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--planning-brief" in sys.argv:
+        goal = cli_flag_value("--planning-brief", "improve this codebase")
+        scope = cli_flag_value("--scope", active_agent_file())
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.generate_planning_brief(goal=goal, scope=scope)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--self-improve" in sys.argv:
+        goal = cli_flag_value("--self-improve", "improve this codebase")
+        cycles = max(1, cli_int_value("--cycles", DEFAULT_SELF_IMPROVE_CYCLES))
+        try:
+            roles = parse_cli_roles(cli_flag_value("--roles", "planner,coder,reviewer"))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2)
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.self_improve_codebase(goal=goal, max_cycles=cycles, roles=roles)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--run-prompt" in sys.argv:
+        index = sys.argv.index("--run-prompt")
+        if len(sys.argv) <= index + 1:
+            print("Missing prompt after --run-prompt", file=sys.stderr)
+            raise SystemExit(2)
+        prompt = " ".join(sys.argv[index + 1 :])
+        answer = run_agent(prompt, state=AgentState())
+        print(render_terminal_markdown(answer))
+        raise SystemExit(0)
+
+    if "--render-sample" in sys.argv:
+        sample = "# Cerebro Renderer Sample\n\n## Tables\n\n| Feature | Status |\n| --- | --- |\n| Headers | Improved |\n| Tables | Boxed |\n\n## Lists\n\n- item\n- [x] done\n- [ ] todo\n\n> blockquote example\n\nUse `inline code` and **bold** text."
+        print(render_terminal_markdown(sample))
+        raise SystemExit(0)
+
+    if "--render-markdown" in sys.argv:
+        index = sys.argv.index("--render-markdown")
+        if len(sys.argv) > index + 1:
+            payload = sys.argv[index + 1]
+            payload = payload.encode("utf-8").decode("unicode_escape")
+        else:
+            payload = sys.stdin.read()
+        print(render_terminal_markdown(payload))
+        raise SystemExit(0)
+
     repl()
+
+
+if __name__ == "__main__":
+    main()
