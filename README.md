@@ -1,264 +1,186 @@
-# Cerebro
+# CEREBRO
 
-Cerebro is a local, workspace-scoped AI coding agent for inspecting, editing, validating, and autonomously improving a codebase. It combines a manager agent, role-based sub-agents, persistent project memory, code intelligence tools, safety gates, and an interruptible self-improvement loop.
+**Cognitive, Empathetic, Responsive, Efficient, Bounded, Optimized, Robust, Organized**
 
-## What Cerebro Does
+A local multi-agent AI assistant running on your computer to help with codebase improvement, autonomous loops, and intelligent coordination.
 
-- Reasons about the current workspace and keeps file access confined to that workspace.
-- Coordinates specialist sub-agents such as planner, architect, coder, reviewer, safety, tester, maintainer, writer, and meta.
-- Reads, writes, searches, patches, validates, and reviews files through built-in tools.
-- Runs autonomous improvement cycles with checkpoints, rollback support, policy checks, and per-cycle change ledgers.
-- Tracks tasks, memory, user profile facts, blackboard notes, code indexes, experiments, improvement backlog items, and run history.
-- Provides a terminal UI with colored `User:` and `Cerebro:` prompts, centered banner rendering, live-width dividers, bold markdown rendering, and activity/status updates.
+## 🚀 What is CEREBRO?
 
-## Requirements
+CEREBRO is a **local multi-agent AI system** designed to work directly within your workspace (`C:\Users\USERNAME\Desktop\CEREBRO`). It combines cognitive intelligence with bounded execution to help you:
 
-- Python 3.10+ recommended.
-- `openai` Python package for model calls.
-- An OpenAI-compatible local or remote model endpoint. The default configuration targets LM Studio at `http://localhost:1234/v1`.
-- Git is optional, but recommended for diff, status, history, and recovery workflows.
-- `pytest` and `ruff` are optional, but Cerebro can use them when installed.
+- **Improve codebases autonomously** through interruptible improvement loops
+- **Coordinate specialist sub-agents** for focused, role-based tasks
+- **Manage autonomous workflows** with control states and checkpoints
+- **Analyze and refactor** Python projects safely
+- **Run validation cycles** before committing changes
 
-Install the model client if needed:
+## 🧠 Core Capabilities
 
+### Multi-Agent Architecture
+CEREBRO operates as a manager agent that orchestrates:
+
+- **Planner**: Decomposes goals into actionable steps
+- **Coder**: Implements safe, reversible code changes
+- **Reviewer**: Validates and critiques results before finalization
+- **Researcher**: Gathers context from documentation and tools
+- **Quality Gate**: Ensures acceptance criteria are met
+
+### Autonomous Improvement Loops
+Run interruptible self-improvement cycles that:
+1. Scan for improvement opportunities (complexity, hotspots, TODOs)
+2. Select the highest-ranked opportunity
+3. Apply safe, minimal changes with validation gates
+4. Record outcomes and update learning statistics
+5. Continue or wrap up based on control state
+
+### Tool-Enhanced Intelligence
+Access to **100+ tools** including:
+- **Code Analysis**: Complexity ranking, import graphs, call graphs, hotspots
+- **Network/IDS**: DNS resolution, port scanning, traffic analysis, baseline comparison
+- **Threat Intel**: CVE lookups, malware hash checks, signature scans
+- **Crypto**: AES-GCM, ChaCha20-Poly1305, Fernet encryption/decryption
+- **HTTP/API**: Endpoint inspection, JSON schema inference, HTML metadata extraction
+- **File Operations**: Semantic search, unified diff application, manifest generation
+
+## 🛠️ Quick Start
+
+### Installation
 ```bash
-python -m pip install openai
+cd C:\Users\USER\Desktop\CEREBRO
+pip install -r requirements.txt
 ```
 
-## Quick Start
-
-Run Cerebro from the workspace you want it to manage:
-
+### First Run
 ```bash
-cd C:\path\to\your\workspace
 python agent.py
 ```
 
-If you are working on Cerebro itself from this repository:
-
+### Running an Improvement Cycle
 ```bash
-cd C:\Users\maniv\Desktop\Cerebro
-python agent.py
+# Start a self-improvement loop with 5 cycles and default roles
+python agent.py --goal "improve this codebase" --max-cycles 5
+
+# Or run through the manager interface
+./agent.sh improve --goal "reduce complexity"
 ```
 
-On first run, Cerebro creates local state files such as `.agent_config.json`, `.agent_memory.json`, `.agent_control.json`, and `.agent_checkpoints/`.
+### Control States
+Manage autonomous loops at any time:
+```bash
+# Continue current cycle
+set_control_mode continue
 
-## Configuration
+# Wrap up and summarize
+set_control_mode wrap_up
 
-Cerebro reads `.agent_config.json` from the current workspace. Defaults include:
+# Stop immediately
+set_control_mode stop
+```
 
+## 📊 Monitoring & Telemetry
+
+CEREBRO tracks its own health through:
+- **Cycle Ledger**: Records each improvement attempt with outcomes
+- **Blackboard**: Shared multi-agent memory for facts and observations
+- **Run History**: Tool call success/failure metrics
+- **Workspace Stats**: File counts, sizes, extension distribution
+
+View current state:
+```bash
+cat .agent_cycle_ledger.json
+cat .agent_blackboard.json
+```
+
+## 🔧 Configuration
+
+### Agent Config (`.agent_config.json`)
 ```json
 {
-  "provider": "lmstudio",
-  "base_url": "http://localhost:1234/v1",
-  "api_key": "lm-studio",
-  "default_model": "local-model",
-  "temperature": 0.25,
-  "max_steps": 200,
-  "monitor": "summary"
+  "name": "CEREBRO",
+  "version": "1.0.0",
+  "max_cycles": 5,
+  "default_roles": ["planner", "coder", "reviewer"],
+  "tool_registry_path": ".agent_tool_registry.json"
 }
 ```
 
-Each role can also have its own model through the `role_models` section. The `autonomy_policy` section controls self-improvement risk limits, changed-file limits, state-file permissions, and rollback behavior.
+### External Tools (`.agent_external_tools.json`)
+Declare safe external commands like `bandit_scan`, `ruff_check`, or custom scanners.
 
-## Common Commands
+## 🧪 Validation & Testing
 
-You can talk to Cerebro in natural language. Useful examples:
+Before committing changes, CEREBRO runs:
+- **Compile checks**: Python syntax validation
+- **Smoke tests**: Import and basic functionality verification
+- **Optional linters**: Ruff/Flake8 if available
+- **Git status**: Ensure clean working directory
 
-```text
-iteratively improve the codebase with 1 cycle
-what changed in the last self-improvement cycle?
-show the cycle ledger
-run internal self tests
-scan improvement opportunities
-generate a health report
-recommend a team for improving error handling
-update my user profile preferred_name to Mani
+## 📁 Workspace Structure
+
+```
+CEREBRO/
+├── agent.py              # Main entry point
+├── requirements.txt      # Python dependencies
+├── .agent_config.json    # Agent configuration
+├── .agent_external_tools.json  # External tool declarations
+├── README.md            # This file
+├── .agent_checkpoints/   # Self-improvement checkpoints
+├── .agent_cycle_ledger.json  # Improvement history
+└── .agent_blackboard.json      # Multi-agent memory
 ```
 
-Type `quit` or `exit` to stop the interactive session.
+## 🎯 Example Workflows
 
-## Autonomous Self-Improvement
-
-Cerebro can improve its own codebase through bounded cycles. A typical cycle:
-
-1. Scans the workspace for improvement opportunities.
-2. Selects or evaluates a backlog item.
-3. Creates a checkpoint before editing.
-4. Uses role-based planning, implementation, review, safety, and maintenance logic.
-5. Applies file edits.
-6. Runs validation when possible.
-7. Records a cycle ledger entry with changed files, lines added, lines removed, net line change, validation results, and outcome notes.
-
-Example:
-
-```text
-iteratively improve the codebase with 3 cycles
-```
-
-To interrupt a running autonomous loop cleanly, edit `.agent_control.json`:
-
-```json
-{
-  "mode": "wrap_up",
-  "monitor": "summary",
-  "note": "Stop after the current safe checkpoint."
-}
-```
-
-Supported modes:
-
-- `continue`: keep running until the requested cycle limit is reached.
-- `wrap_up`: finish the current safe unit of work, summarize, and stop.
-- `stop`: stop as soon as the loop reaches a safe interruption point.
-
-Monitor modes:
-
-- `summary`: show live status logs while the loop runs.
-- `quiet`: hide most monitor logs.
-
-## Change Tracking
-
-Self-improvement cycles write persistent records to `.agent_cycle_ledger.json`. Cerebro can report:
-
-- Files changed in the latest cycle.
-- Lines added, lines removed, and net line change.
-- Validation commands and outcomes.
-- Checkpoint paths for before/after comparison.
-- A summary of what the autonomous loop attempted and completed.
-
-The terminal output color-codes line counts: added lines are green, removed lines are red, and net change changes color based on whether the net result is positive, negative, or neutral.
-
-## Role-Based Sub-Agents
-
-Cerebro uses a role catalog and team templates to structure work.
-
-Built-in roles include:
-
-- `researcher`: gathers evidence and relevant context.
-- `planner`: decomposes work into concrete steps.
-- `architect`: designs durable abstractions and module boundaries.
-- `coder`: implements practical code changes.
-- `refactorer`: improves structure while preserving behavior.
-- `reviewer`: looks for bugs, regressions, and test gaps.
-- `safety`: enforces workspace, autonomy, and rollback policies.
-- `critic`: challenges assumptions and weak plans.
-- `tester`: designs and runs validation.
-- `maintainer`: keeps persistent agent state coherent.
-- `writer`: improves documentation and summaries.
-- `meta`: synthesizes multiple agent outputs into a final direction.
-
-Built-in team templates include:
-
-- `implementation`
-- `analysis`
-- `validation`
-- `refactoring`
-- `autonomy`
-- `communication`
-
-## Built-In Tools
-
-Cerebro registers 90+ tools across these categories:
-
-- File tools: list, inspect, read, write, append, replace, patch, search, find TODOs, find large or recent files.
-- JSON tools: read, validate, and update structured state.
-- Shell and Git tools: run bounded commands, inspect status, diff, log, and branches.
-- Python validation tools: compile files, validate workspace Python, run smoke tests, run pytest, run ruff, and run internal self-tests.
-- Agent/team tools: list roles, recommend teams, run teams, delegate sub-agents, resolve disagreements, apply manager policy, run quality gates, and perform meta-review.
-- Checkpoint/control tools: create checkpoints, summarize changes since checkpoints, restore checkpoints, read or set control state, and evaluate autonomy policy.
-- Memory and task tools: remember, recall, search memory, create/update/list/complete tasks, use the blackboard, and inspect run history.
-- User profile tools: show profile, update profile fields, add profile notes, and forget profile fields.
-- Code intelligence tools: index code, summarize Python files, find symbols, build import/call graphs, find callers, detect orphan symbols, rank hotspots, and suggest refactor targets.
-- Improvement tools: scan opportunities, select next improvement, evaluate opportunities, record outcomes, manage experiments, show learning, generate health reports, and generate planning briefs.
-
-## Local State Files
-
-Cerebro stores operational state in the workspace:
-
-```text
-.agent_config.json
-.agent_memory.json
-.agent_user_profile.json
-.agent_control.json
-.agent_tasks.json
-.agent_blackboard.json
-.agent_code_index.json
-.agent_code_graph.json
-.agent_code_hotspots.json
-.agent_improvement_backlog.json
-.agent_improvement_learning.json
-.agent_experiments.json
-.agent_cycle_ledger.json
-.agent_runs.jsonl
-.agent_checkpoints/
-```
-
-The user profile file can store identity, contact details, important dates, location, preferences, relationships, project notes, and custom facts. It is plaintext local workspace state, so do not store secrets unless you are comfortable keeping them in the project directory.
-
-## Architecture
-
-```text
-Cerebro
-|-- Terminal Interface
-|   |-- colored prompts
-|   |-- centered banner
-|   |-- live-width dividers
-|   `-- autonomous activity stream
-|-- Manager Agent
-|   |-- manager policy
-|   |-- tool selection
-|   |-- quality gates
-|   `-- meta-review
-|-- Role-Based Sub-Agents
-|   |-- researcher / planner / architect
-|   |-- coder / refactorer / reviewer
-|   |-- tester / safety / critic
-|   `-- maintainer / writer / meta
-|-- Workspace Tools
-|   |-- file operations
-|   |-- shell and git integration
-|   |-- Python validation
-|   `-- code intelligence
-|-- Persistent State
-|   |-- memory, tasks, blackboard, user profile
-|   |-- code index, graph, hotspots
-|   |-- experiments and improvement learning
-|   `-- run logs and cycle ledgers
-`-- Autonomous Improvement Loop
-    |-- opportunity scanning
-    |-- checkpoints
-    |-- implementation
-    |-- validation
-    |-- rollback policy
-    `-- change reporting
-```
-
-## Safety and Privacy
-
-- Cerebro resolves paths through the current workspace and blocks file access outside that workspace.
-- It blocks common dangerous shell command patterns.
-- Autonomous improvement cycles create checkpoints before editing.
-- The autonomy policy can limit risk level, changed-file count, rollback behavior, and state-file edits.
-- Model calls go to the configured OpenAI-compatible endpoint. With the default LM Studio setup, the model server is local.
-- Persistent state is stored as plaintext JSON/JSONL files in the workspace.
-
-## Development and Validation
-
-Useful validation commands:
-
+### 1. Autonomous Codebase Improvement
 ```bash
-python -m py_compile agent.py
-python -c "import agent; t=agent.AgentTools(agent.AgentState()); r=t.run_internal_self_tests(); print(r.ok, r.meta.get('checked'), len(r.meta.get('failed', [])))"
-python -m pytest
-python -m ruff check .
+python agent.py --goal "improve this codebase"
+# Scans for complexity hotspots, TODOs, orphaned functions
+# Selects highest-ranked opportunity
+# Applies minimal, validated changes
 ```
 
-`pytest` and `ruff` are optional. If they are not installed, Cerebro can still run its internal checks and Python compilation validation.
+### 2. Network Intelligence Brief
+```bash
+python agent.py --goal "build network intel brief for example.com"
+# Resolves DNS, scans ports (if authorized), inspects TLS
+# Builds security headers report
+# Returns concise user-facing summary
+```
 
-## License
+### 3. Threat Intel Enrichment
+```bash
+python agent.py --goal "lookup CVE-2024-3094"
+# Fetches NVD data, checks CISA KEV status
+# Returns severity, affected products, mitigation hints
+```
 
-Proprietary AI agent software.
+## 🔐 Security & Privacy
+
+- **Local-first**: All processing happens on your machine
+- **Bounded execution**: Tools have workspace path guards and timeouts
+- **SSRF protection**: HTTP tools deny local/private hosts unless allowed
+- **Metadata-only traffic capture**: No payload extraction by default
+- **Redacted secrets**: Config scanner identifies exposed credentials
+
+## 📈 Performance Tips
+
+1. **Install `cryptography`** for faster encryption (AES-GCM, ChaCha20)
+2. **Use role-based sub-agents** for bounded specialist work
+3. **Monitor cycle ledger** to track improvement success rates
+4. **Set control mode** before long-running autonomous loops
+5. **Checkpoint frequently** during substantial refactoring
+
+## 🤝 Contributing
+
+To extend CEREBRO:
+1. Add new tools to the registry
+2. Create role templates for common tasks
+3. Update prompts in manager/role/self-improvement files
+4. Document new capabilities in this README
+
+## 📄 License
+
+MIT License - See LICENSE file for details.
 
 ---
 
