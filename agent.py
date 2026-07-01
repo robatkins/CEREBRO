@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import difflib
 import json
 import os
@@ -11,6 +12,25 @@ import subprocess
 import sys
 import uuid
 import itertools
+import collections
+import math
+import csv
+import base64
+import hashlib
+import hmac
+import secrets
+import html.parser
+import mimetypes
+import sqlite3
+import tarfile
+import zipfile
+import struct
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+import ipaddress
+import socket
 import threading
 import time
 import random
@@ -50,6 +70,16 @@ IMPROVEMENT_BACKLOG_FILE = WORKSPACE_ROOT / ".agent_improvement_backlog.json"
 IMPROVEMENT_LEARNING_FILE = WORKSPACE_ROOT / ".agent_improvement_learning.json"
 EXPERIMENT_JOURNAL_FILE = WORKSPACE_ROOT / ".agent_experiments.json"
 CYCLE_LEDGER_FILE = WORKSPACE_ROOT / ".agent_cycle_ledger.json"
+MODEL_CATALOG_FILE = WORKSPACE_ROOT / ".agent_model_catalog.json"
+EXTERNAL_TOOLS_FILE = WORKSPACE_ROOT / ".agent_external_tools.json"
+IDS_ALERTS_FILE = WORKSPACE_ROOT / ".agent_ids_alerts.jsonl"
+IDS_BASELINE_FILE = WORKSPACE_ROOT / ".agent_ids_baseline.json"
+IDS_CAPTURE_DIR = WORKSPACE_ROOT / ".agent_ids_captures"
+CONTROL_SERVER_TOKEN_FILE = WORKSPACE_ROOT / ".agent_control_server_token"
+CONTROL_SERVER_LOG_FILE = WORKSPACE_ROOT / ".agent_control_server.jsonl"
+THREAT_INTEL_CACHE_FILE = WORKSPACE_ROOT / ".agent_threat_intel_cache.json"
+MALWARE_SIGNATURES_FILE = WORKSPACE_ROOT / ".agent_malware_signatures.json"
+YARA_RULES_DIR = WORKSPACE_ROOT / ".agent_yara_rules"
 MODEL = "local-model"
 MAX_STEPS = 200
 MAX_BATCH_ACTIONS = 3
@@ -61,6 +91,37 @@ DEFAULT_SELF_IMPROVE_CYCLES = 5
 DEFAULT_MONITOR_MODE = "summary"
 MAX_DIFF_CHARS = 12000
 MAX_ROLE_HISTORY = 24
+APPROX_CHARS_PER_TOKEN = 4.0
+DEFAULT_CONTEXT_ROUTE_LIMITS = (2048, 8192, None)
+CONTROL_SERVER_DEFAULT_HOST = "127.0.0.1"
+CONTROL_SERVER_DEFAULT_PORT = 8765
+CONTROL_SERVER_MAX_PAYLOAD_BYTES = 65536
+CONTROL_SERVER_ALLOWED_COMMAND_TYPES = {
+    "ping",
+    "status",
+    "message",
+    "sync_context",
+    "refresh_config",
+}
+CONTROL_SERVER_DENIED_COMMAND_TYPES = {
+    "cmd",
+    "exec",
+    "execute",
+    "shell",
+    "powershell",
+    "python",
+    "download",
+    "download_execute",
+    "upload",
+    "exfiltrate",
+    "persist",
+    "persistence",
+    "keylog",
+    "screenshot",
+    "reverse_shell",
+    "meterpreter",
+    "payload",
+}
 
 TOOL_RISK_READ_ONLY = "read_only"
 TOOL_RISK_WRITE_FILE = "write_file"
@@ -126,6 +187,119 @@ TOOL_INTENT_KEYWORDS = {
     "run",
     "save",
     "scan",
+    "network",
+    "netstat",
+    "dns",
+    "domain",
+    "hostname",
+    "ip",
+    "ip address",
+    "asn",
+    "isp",
+    "geolocation",
+    "geoip",
+    "ports",
+    "port",
+    "tls",
+    "ssl",
+    "traffic",
+    "packet",
+    "packets",
+    "pcap",
+    "pcapng",
+    "ids",
+    "intrusion",
+    "suricata",
+    "zeek",
+    "flows",
+    "flow",
+    "anomaly",
+    "beacon",
+    "cve",
+    "cves",
+    "critical vulnerability",
+    "critical vulnerabilities",
+    "vulnerability",
+    "vulnerabilities",
+    "cvss",
+    "kev",
+    "known exploited",
+    "cisa kev",
+    "malware",
+    "malware signature",
+    "malware signatures",
+    "yara",
+    "ioc",
+    "indicator",
+    "hash",
+    "encrypt",
+    "encryption",
+    "decrypt",
+    "decryption",
+    "crypto",
+    "cryptography",
+    "cipher",
+    "aes",
+    "aes-gcm",
+    "chacha20",
+    "fernet",
+    "pbkdf2",
+    "hmac",
+    "hash lookup",
+    "threat intel",
+    "threat intelligence",
+    "malwarebazaar",
+    "csv",
+    "jsonl",
+    "sqlite",
+    "database",
+    "archive",
+    "zip",
+    "tar",
+    "pdf",
+    "image metadata",
+    "json api",
+    "html",
+    "link extraction",
+    "crawl",
+    "crawler",
+    "security headers",
+    "headers",
+    "json schema",
+    "schema inference",
+    "entities",
+    "entity extraction",
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "diagnostic",
+    "diagnostics",
+    "snapshot",
+    "diff impact",
+    "impact report",
+    "patch impact",
+    "manifest",
+    "file manifest",
+    "compare files",
+    "file diff",
+    "python environment",
+    "environment",
+    "packages",
+    "processes",
+    "process table",
+    "external tool",
+    "plugin",
+    "server",
+    "client",
+    "clients",
+    "connection",
+    "connections",
+    "listen",
+    "control server",
+    "route command",
+    "rdap",
+    "whois",
     "search",
     "self-improve",
     "self improve",
@@ -287,6 +461,612 @@ def clear_terminal() -> None:
     command = "cls" if sys.platform.startswith("win") else "clear"
     subprocess.run(command, shell=True)
 
+def default_model_router_config() -> dict[str, Any]:
+    """Default token-aware model router settings.
+
+    Empty provider/model values mean "keep the route the caller already selected".
+    Users can edit .agent_config.json to map thresholds to specific LM Studio
+    models or external providers without changing code.
+    """
+    return {
+        "enabled": True,
+        "estimate_chars_per_token": APPROX_CHARS_PER_TOKEN,
+        "respect_explicit_model": False,
+        "log_decisions": True,
+        "enable_prompt_compaction": True,
+        "reserve_output_tokens": 1024,
+        "min_compaction_tokens": 256,
+        "compaction_margin_tokens": 128,
+        "routes": [
+            {
+                "name": "short_context",
+                "max_input_tokens": 2048,
+                "input_token_budget": 1800,
+                "provider": "",
+                "model": "",
+                "temperature": None,
+                "reason": "Fast route for small prompts.",
+            },
+            {
+                "name": "medium_context",
+                "max_input_tokens": 8192,
+                "input_token_budget": 7600,
+                "provider": "",
+                "model": "",
+                "temperature": None,
+                "reason": "Balanced route for normal code and analysis tasks.",
+            },
+            {
+                "name": "long_context",
+                "max_input_tokens": None,
+                "input_token_budget": 30000,
+                "provider": "",
+                "model": "",
+                "temperature": None,
+                "reason": "Long-context fallback route for large files, transcripts, or codebase packs.",
+            },
+        ],
+    }
+
+
+def default_llm_provider_configs() -> dict[str, dict[str, Any]]:
+    """Return provider presets for hosted, local, and OpenAI-compatible model backends.
+
+    The presets intentionally prefer provider-level model discovery over hard-coded
+    model names. `known_models` are only seed hints so Cerebro can reason before
+    credentials are configured or a live model-list call has succeeded.
+    """
+    return {
+        "lmstudio": {
+            "type": "openai_compatible",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "lm-studio",
+            "model": MODEL,
+            "auto_discover_model": True,
+            "family": "local",
+            "notes": "Local LM Studio OpenAI-compatible server. Load any model in LM Studio and Cerebro can discover it.",
+            "known_models": [
+                {"id": MODEL, "capabilities": ["local", "configurable"], "status": "placeholder"},
+            ],
+        },
+        "ollama": {
+            "type": "openai_compatible",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "ollama",
+            "model": "llama3.1",
+            "auto_discover_model": True,
+            "family": "local",
+            "notes": "Local Ollama OpenAI-compatible server; model ids depend on installed pulls.",
+            "known_models": [
+                {"id": "llama3.1", "capabilities": ["local", "open_weights", "general"]},
+                {"id": "qwen2.5-coder", "capabilities": ["local", "coding", "open_weights"]},
+            ],
+        },
+        "openai": {
+            "type": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "model": "gpt-4.1",
+            "auto_discover_model": True,
+            "family": "openai",
+            "notes": "Uses OpenAI's /v1/models endpoint when OPENAI_API_KEY is present.",
+            "known_models": [
+                {"id": "gpt-4.1", "capabilities": ["general", "coding", "long_context"]},
+                {"id": "gpt-4.1-mini", "capabilities": ["fast", "cheap", "general", "coding"]},
+                {"id": "gpt-4.1-nano", "capabilities": ["very_fast", "cheap"]},
+                {"id": "o3", "capabilities": ["reasoning", "hard_problems"]},
+                {"id": "o4-mini", "capabilities": ["reasoning", "fast"]},
+                {"id": "gpt-4o", "capabilities": ["general", "vision", "multimodal"]},
+                {"id": "gpt-4o-mini", "capabilities": ["fast", "cheap", "vision"]},
+            ],
+        },
+        "anthropic": {
+            "type": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "auto_discover_model": True,
+            "model_list_endpoint": "https://api.anthropic.com/v1/models",
+            "family": "anthropic",
+            "notes": "Uses Anthropic's Models API when ANTHROPIC_API_KEY is present.",
+            "known_models": [
+                {"id": "claude-opus-4-20250514", "capabilities": ["reasoning", "writing", "hard_problems"]},
+                {"id": "claude-sonnet-4-20250514", "capabilities": ["coding", "reasoning", "general"]},
+                {"id": "claude-3-7-sonnet-latest", "capabilities": ["coding", "reasoning"]},
+                {"id": "claude-3-5-haiku-latest", "capabilities": ["fast", "cheap"]},
+            ],
+        },
+        "xai": {
+            "type": "openai_compatible",
+            "base_url": "https://api.x.ai/v1",
+            "api_key_env": "XAI_API_KEY",
+            "model": "grok-4.3",
+            "auto_discover_model": True,
+            "model_list_endpoint": "https://api.x.ai/v1/language-models",
+            "family": "xai",
+            "notes": "Discovers xAI language models using the xAI model-list endpoint when XAI_API_KEY is present.",
+            "known_models": [
+                {"id": "grok-4.3", "capabilities": ["reasoning", "general", "tools"]},
+                {"id": "grok-4", "capabilities": ["reasoning", "general"]},
+                {"id": "grok-3-mini", "capabilities": ["fast", "cheap"]},
+            ],
+        },
+        "meta": {
+            "type": "openai_compatible",
+            "base_url": "https://llama-api.meta.com/compat/v1",
+            "api_key_env": "LLAMA_API_KEY",
+            "model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+            "auto_discover_model": True,
+            "family": "meta",
+            "notes": "Meta Llama API OpenAI-compatible endpoint. Model ids may vary by account/preview access.",
+            "known_models": [
+                {"id": "Llama-4-Maverick-17B-128E-Instruct-FP8", "capabilities": ["open_weights", "vision", "general"]},
+                {"id": "Llama-4-Scout-17B-16E-Instruct-FP8", "capabilities": ["open_weights", "fast", "vision"]},
+                {"id": "Llama-3.3-70B-Instruct", "capabilities": ["open_weights", "general", "writing"]},
+                {"id": "Llama-3.3-8B-Instruct", "capabilities": ["open_weights", "fast", "cheap"]},
+            ],
+        },
+        "openrouter": {
+            "type": "openai_compatible",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "model": "openrouter/auto",
+            "auto_discover_model": True,
+            "family": "router",
+            "notes": "Unified OpenAI-compatible router for OpenAI, Anthropic, Meta, Google, Mistral, xAI, and many more.",
+            "known_models": [
+                {"id": "openrouter/auto", "capabilities": ["router", "auto_select"]},
+                {"id": "meta-llama/llama-4-maverick", "capabilities": ["open_weights", "vision", "general"]},
+                {"id": "anthropic/claude-sonnet-4", "capabilities": ["coding", "reasoning"]},
+                {"id": "openai/gpt-4.1", "capabilities": ["coding", "general"]},
+            ],
+        },
+        "groq": {
+            "type": "openai_compatible",
+            "base_url": "https://api.groq.com/openai/v1",
+            "api_key_env": "GROQ_API_KEY",
+            "model": "llama-3.3-70b-versatile",
+            "auto_discover_model": True,
+            "family": "groq",
+            "notes": "Very fast OpenAI-compatible inference, including Llama-family models when available.",
+            "known_models": [
+                {"id": "llama-3.3-70b-versatile", "capabilities": ["fast", "open_weights", "general"]},
+                {"id": "llama-3.1-8b-instant", "capabilities": ["very_fast", "cheap", "open_weights"]},
+            ],
+        },
+        "mistral": {
+            "type": "openai_compatible",
+            "base_url": "https://api.mistral.ai/v1",
+            "api_key_env": "MISTRAL_API_KEY",
+            "model": "mistral-large-latest",
+            "auto_discover_model": True,
+            "family": "mistral",
+            "notes": "Mistral's OpenAI-compatible API surface.",
+            "known_models": [
+                {"id": "mistral-large-latest", "capabilities": ["general", "coding"]},
+                {"id": "codestral-latest", "capabilities": ["coding"]},
+                {"id": "mistral-small-latest", "capabilities": ["fast", "cheap"]},
+            ],
+        },
+        "google": {
+            "type": "openai_compatible",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "api_key_env": "GEMINI_API_KEY",
+            "model": "gemini-3.5-flash",
+            "auto_discover_model": True,
+            "family": "google",
+            "notes": "Gemini OpenAI-compatible endpoint. Model ids depend on active Google AI Studio access.",
+            "known_models": [
+                {"id": "gemini-3.5-flash", "capabilities": ["fast", "vision", "reasoning"]},
+                {"id": "gemini-2.5-pro", "capabilities": ["reasoning", "long_context", "vision"]},
+                {"id": "gemini-2.5-flash", "capabilities": ["fast", "cheap", "vision"]},
+            ],
+        },
+        "together": {
+            "type": "openai_compatible",
+            "base_url": "https://api.together.ai/v1",
+            "api_key_env": "TOGETHER_API_KEY",
+            "model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+            "auto_discover_model": True,
+            "family": "together",
+            "notes": "OpenAI-compatible hosted open-weight model provider.",
+            "known_models": [
+                {"id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", "capabilities": ["open_weights", "vision", "general"]},
+                {"id": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "capabilities": ["open_weights", "general"]},
+            ],
+        },
+    }
+
+
+def default_model_catalog_cache() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": "",
+        "providers": {},
+        "models": [],
+        "notes": "Cached live model discovery. Static provider hints live in .agent_config.json.",
+    }
+
+
+def load_model_catalog_cache() -> dict[str, Any]:
+    if not MODEL_CATALOG_FILE.exists():
+        return default_model_catalog_cache()
+    try:
+        parsed = json.loads(MODEL_CATALOG_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default_model_catalog_cache()
+    if not isinstance(parsed, dict):
+        return default_model_catalog_cache()
+    merged = default_model_catalog_cache() | parsed
+    if not isinstance(merged.get("providers"), dict):
+        merged["providers"] = {}
+    if not isinstance(merged.get("models"), list):
+        merged["models"] = []
+    return merged
+
+
+def save_model_catalog_cache(catalog: dict[str, Any]) -> None:
+    catalog = default_model_catalog_cache() | dict(catalog)
+    catalog["updated_at"] = utc_now()
+    MODEL_CATALOG_FILE.write_text(json.dumps(catalog, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def normalize_model_capabilities(provider_name: str, model_id: str, record: dict[str, Any] | None = None) -> list[str]:
+    record = record or {}
+    capabilities = [str(item) for item in record.get("capabilities", []) if str(item).strip()]
+    lowered = model_id.lower()
+    provider_lowered = provider_name.lower()
+
+    def add(name: str) -> None:
+        if name not in capabilities:
+            capabilities.append(name)
+
+    if provider_lowered in {"lmstudio", "ollama"} or "local" in lowered:
+        add("local")
+    if provider_lowered in {"meta", "ollama", "groq", "together"} or "llama" in lowered or "qwen" in lowered or "mistral" in lowered:
+        add("open_weights")
+    if any(token in lowered for token in ["code", "coder", "codestral", "gpt-4.1", "sonnet"]):
+        add("coding")
+    if any(token in lowered for token in ["o3", "o4", "reason", "thinking", "opus", "sonnet", "grok", "gemini"]):
+        add("reasoning")
+    if any(token in lowered for token in ["mini", "nano", "haiku", "flash", "small", "instant", "8b", "scout"]):
+        add("fast")
+        add("cheap")
+    if any(token in lowered for token in ["vision", "image", "multimodal", "4o", "maverick", "scout", "gemini"]):
+        add("vision")
+    if any(token in lowered for token in ["1m", "long", "128k", "200k", "1m", "million"]):
+        add("long_context")
+    if provider_lowered == "openrouter":
+        add("router")
+    if not capabilities:
+        add("general")
+    return capabilities
+
+
+def normalize_model_record(
+    provider_name: str,
+    raw: Any,
+    *,
+    source: str,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    provider_config = provider_config or {}
+    if isinstance(raw, str):
+        raw_data: dict[str, Any] = {"id": raw}
+    elif isinstance(raw, dict):
+        raw_data = dict(raw)
+    else:
+        model_id = str(getattr(raw, "id", "") or "").strip()
+        raw_data = {"id": model_id}
+        for attr in ("created", "owned_by", "display_name", "type"):
+            value = getattr(raw, attr, None)
+            if value is not None:
+                raw_data[attr] = value
+
+    model_id = str(
+        raw_data.get("id")
+        or raw_data.get("name")
+        or raw_data.get("model")
+        or raw_data.get("slug")
+        or ""
+    ).strip()
+    if not model_id:
+        return None
+
+    aliases = raw_data.get("aliases", [])
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    elif not isinstance(aliases, list):
+        aliases = []
+
+    context_window = (
+        raw_data.get("context_window")
+        or raw_data.get("context_length")
+        or raw_data.get("max_context_tokens")
+        or raw_data.get("input_token_limit")
+        or raw_data.get("max_input_tokens")
+    )
+    context_window_int = safe_int(context_window, 0) if context_window is not None else 0
+
+    record = {
+        "provider": provider_name,
+        "id": model_id,
+        "display_name": str(raw_data.get("display_name") or raw_data.get("name") or model_id),
+        "source": source,
+        "family": provider_config.get("family", provider_name),
+        "provider_type": provider_config.get("type", "openai_compatible"),
+        "aliases": [str(alias) for alias in aliases if str(alias).strip()],
+        "context_window": context_window_int or None,
+        "capabilities": normalize_model_capabilities(provider_name, model_id, raw_data),
+        "status": str(raw_data.get("status") or raw_data.get("lifecycle") or "available"),
+        "raw": {k: v for k, v in raw_data.items() if k not in {"capabilities"}},
+    }
+    return record
+
+
+def parse_model_list_payload(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "models", "language_models", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    # Some endpoints return a provider-keyed object. Preserve shallow dicts.
+    if payload and all(isinstance(value, dict) for value in payload.values()):
+        return [dict(value) | {"id": key} for key, value in payload.items()]
+    return []
+
+
+def model_catalog_static_records(config: dict[str, Any], provider_filter: str = "") -> list[dict[str, Any]]:
+    providers = config.get("llm_providers", {})
+    records: list[dict[str, Any]] = []
+    for provider_name, settings in providers.items():
+        if provider_filter and provider_name != provider_filter:
+            continue
+        if not isinstance(settings, dict):
+            continue
+        for raw in settings.get("known_models", []) if isinstance(settings.get("known_models"), list) else []:
+            record = normalize_model_record(str(provider_name), raw, source="static_hint", provider_config=settings)
+            if record:
+                records.append(record)
+        configured_model = str(settings.get("model", "")).strip()
+        if configured_model and configured_model != MODEL:
+            record = normalize_model_record(str(provider_name), {"id": configured_model, "capabilities": ["configured"]}, source="configured_default", provider_config=settings)
+            if record:
+                records.append(record)
+    return records
+
+
+def model_catalog_cached_records(config: dict[str, Any], provider_filter: str = "") -> list[dict[str, Any]]:
+    providers = config.get("llm_providers", {})
+    cache = load_model_catalog_cache()
+    records: list[dict[str, Any]] = []
+    for raw in cache.get("models", []):
+        if not isinstance(raw, dict):
+            continue
+        provider_name = str(raw.get("provider", "")).strip()
+        if not provider_name:
+            continue
+        if provider_filter and provider_name != provider_filter:
+            continue
+        settings = providers.get(provider_name, {}) if isinstance(providers, dict) else {}
+        record = normalize_model_record(provider_name, raw, source=str(raw.get("source") or "cache"), provider_config=settings if isinstance(settings, dict) else {})
+        if record:
+            record["discovered_at"] = raw.get("discovered_at", cache.get("updated_at", ""))
+            records.append(record)
+    return records
+
+
+def dedupe_model_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    source_rank = {"live": 4, "cache": 3, "configured_default": 2, "static_hint": 1}
+    for record in records:
+        key = (str(record.get("provider", "")), str(record.get("id", "")))
+        if not key[0] or not key[1]:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = dict(record)
+            continue
+        current_rank = source_rank.get(str(record.get("source", "")), 0)
+        existing_rank = source_rank.get(str(existing.get("source", "")), 0)
+        if current_rank >= existing_rank:
+            merged = dict(existing) | dict(record)
+            merged["capabilities"] = sorted(set(existing.get("capabilities", [])) | set(record.get("capabilities", [])))
+            by_key[key] = merged
+    return sorted(by_key.values(), key=lambda item: (str(item.get("provider", "")), str(item.get("id", "")).lower()))
+
+
+def combined_model_catalog(
+    config: dict[str, Any],
+    *,
+    provider_filter: str = "",
+    include_cache: bool = True,
+    include_static: bool = True,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if include_static:
+        records.extend(model_catalog_static_records(config, provider_filter=provider_filter))
+    if include_cache:
+        records.extend(model_catalog_cached_records(config, provider_filter=provider_filter))
+    return dedupe_model_records(records)
+
+
+def http_get_json(url: str, headers: dict[str, str], *, timeout: int = 12) -> Any:
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+        data = response.read()
+    return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def http_post_form_json(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, *, timeout: int = 15) -> Any:
+    encoded = urllib.parse.urlencode({str(k): str(v) for k, v in data.items() if v is not None}).encode("utf-8")
+    request_headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Cerebro-Agent/1.0"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=encoded, headers=request_headers, method="POST")
+    with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+        payload = response.read()
+    return json.loads(payload.decode("utf-8", errors="replace"))
+
+
+def discover_provider_models_live(provider_name: str, provider_config: dict[str, Any], *, timeout: int = 12) -> tuple[list[dict[str, Any]], list[str]]:
+    """Discover live models for one provider without failing the caller on network/auth errors."""
+    warnings: list[str] = []
+    provider_type = str(provider_config.get("type", "openai_compatible")).lower()
+    api_key = read_provider_api_key(provider_config)
+    base_url = str(provider_config.get("base_url", "")).rstrip("/")
+    model_list_endpoint = str(provider_config.get("model_list_endpoint", "")).strip()
+
+    local_provider = "localhost" in base_url or "127.0.0.1" in base_url
+    if not api_key and not local_provider:
+        return [], [f"{provider_name}: missing API key; set {provider_config.get('api_key_env') or 'api_key'} to enable live discovery."]
+
+    raw_items: list[Any] = []
+    try:
+        if provider_type == "anthropic":
+            endpoint = model_list_endpoint or f"{base_url}/v1/models"
+            payload = http_get_json(
+                endpoint,
+                {
+                    "x-api-key": api_key,
+                    "anthropic-version": str(provider_config.get("anthropic_version", "2023-06-01")),
+                    "accept": "application/json",
+                },
+                timeout=timeout,
+            )
+            raw_items = parse_model_list_payload(payload)
+        elif model_list_endpoint:
+            payload = http_get_json(
+                model_list_endpoint,
+                {
+                    "Authorization": f"Bearer {api_key}",
+                    "accept": "application/json",
+                },
+                timeout=timeout,
+            )
+            raw_items = parse_model_list_payload(payload)
+            if not raw_items and provider_type in {"openai", "openai_compatible"} and OpenAI is not None:
+                raw_items = list(get_client(provider_name).models.list().data)
+        elif provider_type in {"openai", "openai_compatible"}:
+            if OpenAI is None:
+                return [], [f"{provider_name}: openai package is not installed; cannot call model-list endpoint."]
+            raw_items = list(get_client(provider_name).models.list().data)
+        else:
+            return [], [f"{provider_name}: provider type {provider_type!r} does not have a model discovery adapter."]
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+        return [], [f"{provider_name}: HTTP {exc.code} while listing models: {trim_text(detail, 600)}"]
+    except Exception as exc:
+        return [], [f"{provider_name}: model discovery failed: {trim_text(str(exc), 600)}"]
+
+    records: list[dict[str, Any]] = []
+    for raw in raw_items:
+        record = normalize_model_record(provider_name, raw, source="live", provider_config=provider_config)
+        if record:
+            record["discovered_at"] = utc_now()
+            records.append(record)
+    return dedupe_model_records(records), warnings
+
+
+def score_model_record(
+    record: dict[str, Any],
+    *,
+    objective: str = "",
+    role: str = "",
+    required_context_tokens: int = 0,
+    prefer: str = "",
+) -> tuple[float, list[str]]:
+    text = f"{objective} {role} {prefer}".lower()
+    model_id = str(record.get("id", "")).lower()
+    provider = str(record.get("provider", "")).lower()
+    capabilities = {str(item).lower() for item in record.get("capabilities", [])}
+    score = 10.0
+    reasons: list[str] = []
+
+    def reward(points: float, reason: str) -> None:
+        nonlocal score
+        score += points
+        reasons.append(reason)
+
+    context_window = safe_int(record.get("context_window"), 0)
+    if required_context_tokens > 0:
+        if context_window and context_window >= required_context_tokens:
+            reward(18, f"context_window {context_window} covers required {required_context_tokens}")
+        elif not context_window:
+            reward(2, "context window unknown; not penalized")
+        else:
+            score -= 25
+            reasons.append(f"context_window {context_window} below required {required_context_tokens}")
+
+    if role in {"coder", "architect", "refactorer", "reviewer", "tester"} or any(term in text for term in ["code", "coding", "debug", "refactor", "python", "software"]):
+        if "coding" in capabilities:
+            reward(18, "coding capability match")
+        if any(token in model_id for token in ["sonnet", "gpt-4.1", "codestral", "code", "qwen"]):
+            reward(8, "model id suggests strong coding fit")
+
+    if role in {"planner", "critic", "meta", "safety"} or any(term in text for term in ["reason", "hard", "plan", "architecture", "strategy", "math"]):
+        if "reasoning" in capabilities:
+            reward(16, "reasoning capability match")
+        if any(token in model_id for token in ["o3", "o4", "opus", "sonnet", "grok", "gemini"]):
+            reward(7, "model id suggests reasoning fit")
+
+    if any(term in text for term in ["fast", "cheap", "quick", "low cost", "small"]) or role in {"researcher", "writer"}:
+        if "fast" in capabilities:
+            reward(12, "fast model match")
+        if "cheap" in capabilities:
+            reward(8, "cost-sensitive match")
+
+    if any(term in text for term in ["vision", "image", "screenshot", "multimodal"]):
+        if "vision" in capabilities:
+            reward(15, "vision capability match")
+
+    if any(term in text for term in ["local", "private", "offline", "lm studio", "ollama"]):
+        if "local" in capabilities or provider in {"lmstudio", "ollama"}:
+            reward(20, "local/private preference match")
+
+    if any(term in text for term in ["open", "open source", "open-weight", "open weights", "meta", "llama"]):
+        if "open_weights" in capabilities:
+            reward(14, "open-weight preference match")
+
+    if provider == "openrouter" and any(term in text for term in ["any provider", "all models", "router", "auto"]):
+        reward(10, "router can access many providers")
+
+    if str(record.get("source")) == "live":
+        reward(6, "live-discovered model")
+    elif str(record.get("source")) == "configured_default":
+        reward(3, "configured default model")
+
+    if not reasons:
+        reasons.append("general fallback candidate")
+    return round(score, 2), reasons[:8]
+
+
+def default_control_server_config() -> dict[str, Any]:
+    """Default safe control-server settings.
+
+    The control server is a local, authenticated coordination channel for
+    trusted agent peers/workers. It intentionally does not expose shell
+    execution, payload deployment, persistence, exfiltration, or arbitrary
+    command execution primitives.
+    """
+    return {
+        "enabled": False,
+        "bind_host": CONTROL_SERVER_DEFAULT_HOST,
+        "port": CONTROL_SERVER_DEFAULT_PORT,
+        "require_token": True,
+        "token_env": "CEREBRO_CONTROL_TOKEN",
+        "token_file": ".agent_control_server_token",
+        "max_clients": 16,
+        "max_message_bytes": CONTROL_SERVER_MAX_PAYLOAD_BYTES,
+        "allowed_command_types": sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES),
+        "denied_command_types": sorted(CONTROL_SERVER_DENIED_COMMAND_TYPES),
+        "notes": "Local authenticated coordination channel only; intentionally not a payload/C2 executor.",
+    }
+
 
 def default_config() -> dict[str, Any]:
     role_models = {role: MODEL for role in ROLE_CATALOG}
@@ -301,40 +1081,16 @@ def default_config() -> dict[str, Any]:
         "max_batch_actions": MAX_BATCH_ACTIONS,
         "monitor": DEFAULT_MONITOR_MODE,
         "show_thinking_indicator": True,
+        "control_server": default_control_server_config(),
         "fallback_provider": "lmstudio",
+        "model_router": default_model_router_config(),
         "autonomy_policy": {
             "max_changed_files_per_cycle": 4,
             "max_risk_level": "medium",
             "rollback_on_policy_violation": True,
             "allow_state_file_changes": True,
         },
-        "llm_providers": {
-            "lmstudio": {
-                "type": "openai_compatible",
-                "base_url": "http://localhost:1234/v1",
-                "api_key": "lm-studio",
-                "model": MODEL,
-                "auto_discover_model": True,
-            },
-            "openai": {
-                "type": "openai",
-                "base_url": "https://api.openai.com/v1",
-                "api_key_env": "OPENAI_API_KEY",
-                "model": "gpt-4.1",
-            },
-            "anthropic": {
-                "type": "anthropic",
-                "api_key_env": "ANTHROPIC_API_KEY",
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 4096,
-            },
-            "xai": {
-                "type": "openai_compatible",
-                "base_url": "https://api.x.ai/v1",
-                "api_key_env": "XAI_API_KEY",
-                "model": "grok-3",
-            },
-        },
+        "llm_providers": default_llm_provider_configs(),
         "role_providers": role_providers,
         "role_models": role_models,
     }
@@ -434,8 +1190,116 @@ def load_config() -> dict[str, Any]:
     if config.get("monitor") not in {"quiet", "summary"}:
         config["monitor"] = DEFAULT_MONITOR_MODE
     config["show_thinking_indicator"] = bool(config.get("show_thinking_indicator", False))
+
+    server_defaults = default_control_server_config()
+    parsed_server = parsed.get("control_server", {})
+    if not isinstance(parsed_server, dict):
+        parsed_server = {}
+    server_config = server_defaults | parsed_server
+    server_config["enabled"] = bool(server_config.get("enabled", False))
+    server_config["bind_host"] = str(server_config.get("bind_host") or CONTROL_SERVER_DEFAULT_HOST)
+    try:
+        server_config["port"] = max(1, min(int(server_config.get("port", CONTROL_SERVER_DEFAULT_PORT)), 65535))
+    except (TypeError, ValueError):
+        server_config["port"] = CONTROL_SERVER_DEFAULT_PORT
+    server_config["require_token"] = bool(server_config.get("require_token", True))
+    try:
+        server_config["max_clients"] = max(1, min(int(server_config.get("max_clients", 16)), 128))
+    except (TypeError, ValueError):
+        server_config["max_clients"] = 16
+    try:
+        server_config["max_message_bytes"] = max(1024, min(int(server_config.get("max_message_bytes", CONTROL_SERVER_MAX_PAYLOAD_BYTES)), 1048576))
+    except (TypeError, ValueError):
+        server_config["max_message_bytes"] = CONTROL_SERVER_MAX_PAYLOAD_BYTES
+    allowed = server_config.get("allowed_command_types", sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES))
+    if not isinstance(allowed, list):
+        allowed = sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES)
+    server_config["allowed_command_types"] = sorted(
+        {
+            str(item).strip()
+            for item in allowed
+            if str(item).strip() and str(item).strip() not in CONTROL_SERVER_DENIED_COMMAND_TYPES
+        }
+        or CONTROL_SERVER_ALLOWED_COMMAND_TYPES
+    )
+    denied = server_config.get("denied_command_types", sorted(CONTROL_SERVER_DENIED_COMMAND_TYPES))
+    if not isinstance(denied, list):
+        denied = sorted(CONTROL_SERVER_DENIED_COMMAND_TYPES)
+    server_config["denied_command_types"] = sorted(set(CONTROL_SERVER_DENIED_COMMAND_TYPES) | {str(item).strip() for item in denied if str(item).strip()})
+    config["control_server"] = server_config
+
     if config.get("fallback_provider") not in config["llm_providers"]:
         config["fallback_provider"] = defaults["fallback_provider"]
+
+    router_defaults = default_model_router_config()
+    parsed_router = parsed.get("model_router", {})
+    if not isinstance(parsed_router, dict):
+        parsed_router = {}
+    router = router_defaults | parsed_router
+    router["enabled"] = bool(router.get("enabled", True))
+    router["respect_explicit_model"] = bool(router.get("respect_explicit_model", False))
+    router["log_decisions"] = bool(router.get("log_decisions", True))
+    router["enable_prompt_compaction"] = bool(router.get("enable_prompt_compaction", True))
+    for int_key, default_value in {
+        "reserve_output_tokens": 1024,
+        "min_compaction_tokens": 256,
+        "compaction_margin_tokens": 128,
+    }.items():
+        try:
+            router[int_key] = max(0, int(router.get(int_key, default_value)))
+        except (TypeError, ValueError):
+            router[int_key] = default_value
+    try:
+        chars_per_token = float(router.get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN))
+    except (TypeError, ValueError):
+        chars_per_token = APPROX_CHARS_PER_TOKEN
+    router["estimate_chars_per_token"] = max(1.0, chars_per_token)
+    routes = router.get("routes", router_defaults["routes"])
+    if not isinstance(routes, list) or not routes:
+        routes = router_defaults["routes"]
+    normalized_routes: list[dict[str, Any]] = []
+    default_routes_by_name = {
+        str(route.get("name")): route
+        for route in router_defaults.get("routes", [])
+        if isinstance(route, dict) and route.get("name")
+    }
+    for index, route in enumerate(routes):
+        if not isinstance(route, dict):
+            continue
+        route_name = str(route.get("name") or f"route_{index + 1}")
+        route_defaults = default_routes_by_name.get(route_name, {})
+        normalized = {
+            "name": route_name,
+            "max_input_tokens": route.get("max_input_tokens", route_defaults.get("max_input_tokens")),
+            "input_token_budget": route.get("input_token_budget", route_defaults.get("input_token_budget")),
+            "provider": str(route.get("provider", route_defaults.get("provider", "")) or ""),
+            "model": str(route.get("model", route_defaults.get("model", "")) or ""),
+            "temperature": route.get("temperature", route_defaults.get("temperature")),
+            "reason": str(route.get("reason", route_defaults.get("reason", "")) or ""),
+        }
+        for token_key in ("max_input_tokens", "input_token_budget"):
+            if normalized[token_key] is not None:
+                try:
+                    normalized[token_key] = max(1, int(normalized[token_key]))
+                except (TypeError, ValueError):
+                    normalized[token_key] = None
+        if normalized["temperature"] is not None:
+            try:
+                normalized["temperature"] = float(normalized["temperature"])
+            except (TypeError, ValueError):
+                normalized["temperature"] = None
+        normalized_routes.append(normalized)
+    if not normalized_routes:
+        normalized_routes = router_defaults["routes"]
+    normalized_routes.sort(
+        key=lambda item: (
+            item.get("max_input_tokens") is None,
+            int(item.get("max_input_tokens") or 10**12),
+        )
+    )
+    router["routes"] = normalized_routes
+    config["model_router"] = router
+
     policy_defaults = defaults["autonomy_policy"]
     parsed_policy = parsed.get("autonomy_policy", {})
     if not isinstance(parsed_policy, dict):
@@ -454,6 +1318,8 @@ def load_config() -> dict[str, Any]:
         or "role_providers" not in parsed
         or "fallback_provider" not in parsed
         or "show_thinking_indicator" not in parsed
+        or "model_router" not in parsed
+        or "control_server" not in parsed
     ):
         save_config(config)
     return config
@@ -473,6 +1339,53 @@ def redacted_llm_providers(providers: dict[str, Any]) -> dict[str, Any]:
             visible["api_key"] = "<redacted>"
         redacted[str(name)] = visible
     return redacted
+
+
+SENSITIVE_ARGUMENT_KEYWORDS = {
+    "api_key",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "key_b64",
+    "passphrase",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+}
+
+SENSITIVE_OUTPUT_TOOL_NAMES = {"decrypt_text"}
+
+
+def redact_sensitive_payload(value: Any) -> Any:
+    """Return a log-safe copy of a value by redacting secret-bearing keys."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if "public" not in lowered and any(marker in lowered for marker in SENSITIVE_ARGUMENT_KEYWORDS):
+                redacted[key_text] = "<redacted>"
+            else:
+                redacted[key_text] = redact_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_sensitive_payload(item) for item in value]
+    return value
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Best-effort redaction for secret-looking labels in logs and previews."""
+    safe = str(text or "")
+    safe = re.sub(
+        r"(?i)(\b(?:api[_-]?key|authorization|bearer|client[_-]?secret|credential|key[_-]?b64|passphrase|password|private[_-]?key|secret|token)\b\s*[:=]\s*)([^\s,}]+)",
+        r"\1<redacted>",
+        safe,
+    )
+    return safe
 
 
 def get_role_model(role: str) -> str:
@@ -662,6 +1575,303 @@ def discover_provider_model(provider_name: str, provider_config: dict[str, Any],
         },
     )
     return selected
+
+
+
+def estimate_token_count(text: str, *, chars_per_token: float = APPROX_CHARS_PER_TOKEN) -> int:
+    """Approximate token count without requiring tokenizer-specific packages."""
+    if not text:
+        return 0
+    chars = max(1, len(text))
+    rough = int(chars / max(1.0, float(chars_per_token)))
+    # Add a small lexical floor so symbol-heavy code and short JSON do not get
+    # badly under-estimated by character count alone.
+    lexical = len(re.findall(r"\w+|[^\w\s]", text)) // 2
+    return max(1, rough, lexical)
+
+
+def estimate_message_tokens(messages: list[dict[str, str]], *, chars_per_token: float = APPROX_CHARS_PER_TOKEN) -> int:
+    total = 0
+    for message in messages:
+        role = str(message.get("role", ""))
+        content = str(message.get("content", ""))
+        total += 4  # lightweight per-message framing overhead
+        total += estimate_token_count(role, chars_per_token=chars_per_token)
+        total += estimate_token_count(content, chars_per_token=chars_per_token)
+    return total + 2
+
+
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compact_text_middle(content: str, target_chars: int, *, reason: str = "prompt budget") -> tuple[str, dict[str, Any]]:
+    """Preserve the beginning/end of content while removing the middle.
+
+    This is intentionally deterministic and tokenizer-free so it works in a
+    local-agent environment without extra dependencies.
+    """
+    target_chars = max(0, int(target_chars))
+    if len(content) <= target_chars or target_chars <= 0:
+        return content, {"compacted": False, "original_chars": len(content), "new_chars": len(content), "omitted_chars": 0}
+
+    marker_template = "\n\n[...Cerebro compacted {omitted} characters from the middle for {reason}...]\n\n"
+    marker = marker_template.format(omitted=0, reason=reason)
+    if target_chars <= len(marker) + 40:
+        compacted = content[: max(1, target_chars - 1)] + "…"
+        return compacted, {
+            "compacted": True,
+            "original_chars": len(content),
+            "new_chars": len(compacted),
+            "omitted_chars": max(0, len(content) - len(compacted)),
+            "strategy": "hard_tail_truncate",
+        }
+
+    available = max(1, target_chars - len(marker))
+    head_chars = max(1, int(available * 0.6))
+    tail_chars = max(1, available - head_chars)
+    omitted_chars = max(0, len(content) - head_chars - tail_chars)
+    marker = marker_template.format(omitted=omitted_chars, reason=reason)
+    available = max(1, target_chars - len(marker))
+    head_chars = max(1, int(available * 0.6))
+    tail_chars = max(1, available - head_chars)
+    omitted_chars = max(0, len(content) - head_chars - tail_chars)
+    marker = marker_template.format(omitted=omitted_chars, reason=reason)
+    compacted = content[:head_chars].rstrip() + marker + content[-tail_chars:].lstrip()
+    if len(compacted) > target_chars:
+        compacted = compacted[:target_chars - 1] + "…"
+    return compacted, {
+        "compacted": True,
+        "original_chars": len(content),
+        "new_chars": len(compacted),
+        "omitted_chars": max(0, len(content) - len(compacted)),
+        "strategy": "middle_out",
+    }
+
+
+def model_input_token_budget(
+    decision: dict[str, Any],
+    provider_config: dict[str, Any],
+    config: dict[str, Any],
+) -> int | None:
+    """Resolve the safest known input-token budget for the chosen route."""
+    router = config.get("model_router", default_model_router_config())
+    if not bool(router.get("enable_prompt_compaction", True)):
+        return None
+
+    candidates: list[int] = []
+    route_budget = safe_int(decision.get("input_token_budget"), 0)
+    if route_budget > 0:
+        candidates.append(route_budget)
+
+    provider_window = max(
+        safe_int(provider_config.get("context_window"), 0),
+        safe_int(provider_config.get("max_context_tokens"), 0),
+    )
+    reserve = safe_int(router.get("reserve_output_tokens"), 1024)
+    if provider_window > reserve:
+        candidates.append(max(1, provider_window - reserve))
+
+    explicit_default = safe_int(router.get("default_input_token_budget"), 0)
+    if explicit_default > 0:
+        candidates.append(explicit_default)
+
+    if not candidates:
+        return None
+    min_budget = max(1, min(candidates))
+    margin = safe_int(router.get("compaction_margin_tokens"), 128)
+    return max(1, min_budget - margin)
+
+
+def compact_messages_for_input_budget(
+    messages: list[dict[str, str]],
+    *,
+    max_input_tokens: int,
+    chars_per_token: float = APPROX_CHARS_PER_TOKEN,
+    min_message_tokens: int = 256,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Return a compacted copy of messages if they exceed a model input budget."""
+    original_tokens = estimate_message_tokens(messages, chars_per_token=chars_per_token)
+    if max_input_tokens <= 0 or original_tokens <= max_input_tokens:
+        return [dict(message) for message in messages], {
+            "compacted": False,
+            "original_estimated_tokens": original_tokens,
+            "new_estimated_tokens": original_tokens,
+            "max_input_tokens": max_input_tokens,
+            "changed_messages": [],
+        }
+
+    compacted = [dict(message) for message in messages]
+    changed: list[dict[str, Any]] = []
+    iterations = 0
+    min_chars = max(80, int(max(1, min_message_tokens) * max(1.0, chars_per_token)))
+
+    def message_priority(index: int, message: dict[str, str]) -> tuple[int, int]:
+        role = str(message.get("role", ""))
+        content_len = len(str(message.get("content", "")))
+        is_last = index == len(compacted) - 1
+        # Prefer shrinking older assistant/user context first. Preserve system
+        # prompts and the latest user request unless no other choice remains.
+        if role == "system":
+            priority = 2
+        elif is_last and role == "user":
+            priority = 1
+        else:
+            priority = 0
+        return priority, -content_len
+
+    while estimate_message_tokens(compacted, chars_per_token=chars_per_token) > max_input_tokens and iterations < 24:
+        iterations += 1
+        current_tokens = estimate_message_tokens(compacted, chars_per_token=chars_per_token)
+        over_tokens = max(1, current_tokens - max_input_tokens)
+        candidates = sorted(
+            [
+                (message_priority(index, message), index, str(message.get("content", "")))
+                for index, message in enumerate(compacted)
+                if len(str(message.get("content", ""))) > min_chars
+            ],
+            key=lambda item: item[0],
+        )
+        if not candidates:
+            break
+        _, index, content = candidates[0]
+        remove_chars = max(int(over_tokens * chars_per_token * 1.35), int(512 * chars_per_token))
+        target_chars = max(min_chars, len(content) - remove_chars)
+        new_content, meta = compact_text_middle(content, target_chars, reason="model input budget")
+        if new_content == content:
+            break
+        compacted[index]["content"] = new_content
+        changed.append({"message_index": index, "role": compacted[index].get("role", ""), **meta})
+
+    new_tokens = estimate_message_tokens(compacted, chars_per_token=chars_per_token)
+    return compacted, {
+        "compacted": bool(changed),
+        "original_estimated_tokens": original_tokens,
+        "new_estimated_tokens": new_tokens,
+        "max_input_tokens": max_input_tokens,
+        "changed_messages": changed,
+        "iterations": iterations,
+        "within_budget": new_tokens <= max_input_tokens,
+    }
+
+def model_route_decision_payload(
+    *,
+    messages: list[dict[str, str]],
+    provider_name: str,
+    selected_model: str,
+    selected_temperature: float,
+    config: dict[str, Any],
+    explicit_model: bool = False,
+) -> dict[str, Any]:
+    router = config.get("model_router", default_model_router_config())
+    chars_per_token = float(router.get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN))
+    estimated_tokens = estimate_message_tokens(messages, chars_per_token=chars_per_token)
+    payload: dict[str, Any] = {
+        "enabled": bool(router.get("enabled", True)),
+        "estimated_input_tokens": estimated_tokens,
+        "chars_per_token": chars_per_token,
+        "original_provider": provider_name,
+        "original_model": selected_model,
+        "original_temperature": selected_temperature,
+        "provider": provider_name,
+        "model": selected_model,
+        "temperature": selected_temperature,
+        "route_name": "disabled",
+        "route_reason": "Model router disabled.",
+        "explicit_model": explicit_model,
+        "changed": False,
+    }
+    if not payload["enabled"]:
+        return payload
+    if explicit_model and bool(router.get("respect_explicit_model", True)):
+        payload["route_name"] = "explicit_model"
+        payload["route_reason"] = "Explicit model argument supplied; router preserved it."
+        return payload
+
+    routes = router.get("routes", [])
+    selected_route: dict[str, Any] | None = None
+    for route in routes if isinstance(routes, list) else []:
+        if not isinstance(route, dict):
+            continue
+        max_tokens = route.get("max_input_tokens")
+        if max_tokens is None or estimated_tokens <= int(max_tokens):
+            selected_route = route
+            break
+    if selected_route is None and routes:
+        selected_route = routes[-1]
+    if selected_route is None:
+        payload["route_name"] = "no_routes"
+        payload["route_reason"] = "No usable model-router routes configured."
+        return payload
+
+    providers = config.get("llm_providers", {})
+    route_provider = str(selected_route.get("provider", "") or provider_name)
+    if route_provider not in providers:
+        payload["route_name"] = str(selected_route.get("name", "invalid_provider"))
+        payload["route_reason"] = f"Configured route provider `{route_provider}` is unknown; preserved original route."
+        payload["invalid_provider"] = route_provider
+        return payload
+
+    route_model = str(selected_route.get("model", "") or selected_model or providers.get(route_provider, {}).get("model", MODEL))
+    route_temperature = selected_route.get("temperature")
+    if route_temperature is None:
+        route_temperature = selected_temperature
+    else:
+        route_temperature = float(route_temperature)
+
+    payload.update(
+        {
+            "provider": route_provider,
+            "model": route_model,
+            "temperature": route_temperature,
+            "route_name": str(selected_route.get("name", "unnamed_route")),
+            "route_reason": str(selected_route.get("reason", "") or "Matched by estimated input token count."),
+            "max_input_tokens": selected_route.get("max_input_tokens"),
+            "input_token_budget": selected_route.get("input_token_budget"),
+        }
+    )
+    payload["changed"] = (payload["provider"], payload["model"], payload["temperature"]) != (
+        provider_name,
+        selected_model,
+        selected_temperature,
+    )
+    return payload
+
+
+def resolve_model_route(
+    messages: list[dict[str, str]],
+    *,
+    provider_name: str,
+    provider_config: dict[str, Any],
+    selected_model: str,
+    selected_temperature: float,
+    config: dict[str, Any],
+    explicit_model: bool = False,
+    log_decision: bool = True,
+) -> tuple[str, dict[str, Any], str, float, dict[str, Any]]:
+    decision = model_route_decision_payload(
+        messages=messages,
+        provider_name=provider_name,
+        selected_model=selected_model,
+        selected_temperature=selected_temperature,
+        config=config,
+        explicit_model=explicit_model,
+    )
+    routed_provider = str(decision.get("provider", provider_name))
+    if routed_provider != provider_name:
+        routed_provider, routed_config = get_provider_config(routed_provider)
+    else:
+        routed_config = dict(provider_config)
+    routed_model = str(decision.get("model", selected_model))
+    routed_temperature = float(decision.get("temperature", selected_temperature))
+    if log_decision and config.get("model_router", {}).get("log_decisions", True):
+        log_run_event("model_route_decision", {k: v for k, v in decision.items() if k != "provider_config"})
+    return routed_provider, routed_config, routed_model, routed_temperature, decision
 
 
 def call_model_once(
@@ -874,7 +2084,9 @@ Manager policy:
 - Use generate_health_report and generate_planning_brief before substantial autonomous or architectural changes.
 - Use analyze_change_impact, evaluate_autonomy_policy, and run_internal_self_tests after changing the control plane.
 - Use show_last_self_improvement_changes before answering follow-up questions like "what changed?" after autonomous improvement.
-- Use show_config, show_workspace_stats, show_run_history, summarize_blackboard, and show_cycle_ledger when you need to understand the agent's own operating state.
+- Use show_config, list_llm_routes, list_available_models, discover_available_models, recommend_model_selection, build_model_portfolio, route_multi_model_task, show_model_router, recommend_model_route, audit_tool_coverage, recommend_tool_chain, build_execution_dossier, inspect_runtime_environment, audit_dependency_health, inspect_prompt_surface, build_context_budget_plan, simulate_tool_execution_plan, build_risk_register, map_repository_structure, inspect_project_entrypoints, extract_api_surface, trace_data_flow, inspect_error_log, inspect_config_surface, fetch_url_text, inspect_http_endpoint, fetch_json_api, extract_html_metadata, check_http_security_headers, crawl_url_map, infer_json_schema, extract_text_entities, generate_file_manifest, compare_workspace_files, inspect_python_environment, inspect_process_table, normalize_network_target, resolve_dns_records, reverse_dns_lookup, lookup_ip_rdap, lookup_ip_geolocation, get_public_ip_info, scan_tcp_ports, inspect_local_listening_ports, inspect_tls_certificate, inspect_local_network, build_network_intel_brief, ingest_network_traffic_file, analyze_network_traffic_file, build_ids_baseline, compare_network_baseline, capture_network_metadata_sample, build_ids_mode_plan, show_ids_alerts, lookup_cve, search_cves, check_cisa_kev, lookup_malware_hash, hash_workspace_file, add_malware_signature, scan_workspace_file_signatures, build_threat_intel_brief, build_toolbox_brief, show_workspace_stats, show_run_history, summarize_blackboard, and show_cycle_ledger when you need to understand the agent's own operating state, model catalog, provider/model choices, repository shape, tool affordances, execution plan, external documentation, or model-routing decisions.
+- For direct network-information questions such as public IP, DNS, RDAP, GeoIP, ASN/ISP, TLS, local network, bounded port checks, traffic ingestion, or IDS-mode planning, call the smallest matching network/IDS tool once and then return a concise user-facing summary. Do not repeat the same network lookup and do not expose raw tool JSON unless the user asks for raw JSON. Live traffic capture must be bounded, metadata-only, and explicitly authorized.
+- For direct defensive threat-intelligence questions such as CVE lookups, CISA KEV checks, malware hash enrichment, local file hash checks, or local malware-signature scans, call the smallest matching threat-intel tool once and then return a concise user-facing summary. Never download malware samples or execute suspect files.
 
 Rules:
 - Prefer evidence from tools over guessing.
@@ -1346,6 +2558,14 @@ def infer_task_profile(user_input: str) -> dict[str, Any]:
         intents.append("analysis")
     if has_any({"self-improve", "self improve", "autonomous", "autonomy", "agentic"}):
         intents.append("autonomy")
+    if has_any({"model", "models", "provider", "openai", "anthropic", "xai", "grok", "claude", "llama", "meta", "gemini", "openrouter", "lm studio", "lmstudio", "ollama"}):
+        intents.append("model_selection")
+    if has_any({"network", "netstat", "dns", "domain", "hostname", "ip", "ip address", "asn", "isp", "geolocation", "geoip", "ports", "open port", "port scan", "rdap", "whois", "tls", "ssl", "certificate", "public ip", "traffic", "packet", "pcap", "ids", "intrusion", "suricata", "zeek", "flow", "flows", "beacon", "anomaly"}):
+        intents.append("network_intelligence")
+    if has_any({"cve", "cves", "cvss", "critical vulnerability", "critical vulnerabilities", "vulnerability", "vulnerabilities", "kev", "known exploited", "cisa kev", "malware", "malware signature", "malware signatures", "yara", "ioc", "indicator", "hash lookup", "threat intel", "threat intelligence", "malwarebazaar"}):
+        intents.append("threat_intelligence")
+    if has_any({"encrypt", "encryption", "decrypt", "decryption", "crypto", "cryptography", "cipher", "aes", "aes-gcm", "chacha20", "fernet", "pbkdf2", "hmac"}):
+        intents.append("cryptography")
     if not intents:
         intents.append("conversation")
 
@@ -1356,20 +2576,30 @@ def infer_task_profile(user_input: str) -> dict[str, Any]:
         risk_signals.append("command execution")
     if has_any({"self-improve", "autonomous", "autonomy", "loop"}):
         risk_signals.append("autonomous loop")
-    if has_any({"config", "provider", "api key", "memory", "control"}):
+    if has_any({"config", "provider", "api key", "memory", "control", "model", "models", "route"}):
         risk_signals.append("control-plane or persistent state")
+    if has_any({"port scan", "scan ports", "open ports", "nmap", "external host", "public target"}):
+        risk_signals.append("network scanning")
 
     risk_level = "high" if any("destructive" in item or "autonomous" in item for item in risk_signals) else "medium" if risk_signals else "low"
 
     suggested_tools: list[str] = []
+    if "model_selection" in intents:
+        suggested_tools.extend(["list_available_models", "discover_available_models", "recommend_model_selection", "build_model_portfolio", "set_model_selection", "list_llm_routes", "show_model_router"] )
+    if "network_intelligence" in intents:
+        suggested_tools.extend(["build_network_intel_brief", "build_ids_mode_plan", "ingest_network_traffic_file", "analyze_network_traffic_file", "build_ids_baseline", "compare_network_baseline", "show_ids_alerts", "capture_network_metadata_sample", "normalize_network_target", "resolve_dns_records", "reverse_dns_lookup", "lookup_ip_rdap", "lookup_ip_geolocation", "get_public_ip_info", "inspect_tls_certificate", "scan_tcp_ports", "inspect_local_listening_ports", "inspect_local_network"] )
+    if "threat_intelligence" in intents:
+        suggested_tools.extend(["build_threat_intel_brief", "lookup_cve", "search_cves", "check_cisa_kev", "lookup_malware_hash", "hash_workspace_file", "add_malware_signature", "scan_workspace_file_signatures"] )
+    if "cryptography" in intents:
+        suggested_tools.extend(["list_crypto_algorithms", "encrypt_text", "decrypt_text", "encrypt_file", "decrypt_file"] )
     if "implementation" in intents or "refactoring" in intents or "debug" in intents:
-        suggested_tools.extend(["build_context_pack", "decompose_goal", "find_relevant_code_context", "semantic_search_workspace", "read_file", "apply_unified_diff", "validate_python_file"] )
+        suggested_tools.extend(["build_execution_dossier", "recommend_tool_chain", "plan_patch_strategy", "trace_goal_to_symbols", "build_validation_matrix", "score_execution_readiness", "build_context_pack", "decompose_goal", "find_relevant_code_context", "semantic_search_workspace", "read_file", "apply_unified_diff", "validate_python_file"] )
     elif "analysis" in intents:
-        suggested_tools.extend(["build_context_pack", "find_relevant_code_context", "semantic_search_workspace", "search_files", "summarize_python_file"] )
+        suggested_tools.extend(["build_execution_dossier", "recommend_tool_chain", "trace_goal_to_symbols", "map_tool_capability_graph", "build_context_pack", "find_relevant_code_context", "semantic_search_workspace", "search_files", "summarize_python_file"] )
     elif "validation" in intents:
-        suggested_tools.extend(["run_internal_self_tests", "validate_workspace_python", "run_self_improvement_validation"] )
+        suggested_tools.extend(["build_execution_dossier", "recommend_tool_chain", "build_validation_matrix", "score_execution_readiness", "inspect_tool_schema_health", "run_internal_self_tests", "validate_workspace_python", "run_self_improvement_validation"] )
     else:
-        suggested_tools.extend(["search_memory", "build_context_pack"] )
+        suggested_tools.extend(["recommend_tool_chain", "map_tool_capability_graph", "search_memory", "build_context_pack"] )
 
     suggested_roles: list[str] = []
     if "implementation" in intents:
@@ -1378,7 +2608,7 @@ def infer_task_profile(user_input: str) -> dict[str, Any]:
         suggested_roles.extend(["architect", "refactorer", "tester"] )
     if "debug" in intents or "validation" in intents:
         suggested_roles.extend(["tester", "reviewer"] )
-    if "analysis" in intents:
+    if "analysis" in intents or "network_intelligence" in intents or "threat_intelligence" in intents or "cryptography" in intents:
         suggested_roles.extend(["researcher", "planner", "critic"] )
     if "autonomy" in intents or risk_level != "low":
         suggested_roles.extend(["safety", "maintainer"] )
@@ -1398,6 +2628,7 @@ def infer_task_profile(user_input: str) -> dict[str, Any]:
     return {
         "intents": intents,
         "query_terms": terms,
+        "estimated_input_tokens": estimate_token_count(user_input),
         "write_intent": user_explicitly_requested_file_write(user_input),
         "tool_intent": user_input_has_tool_intent(user_input),
         "risk_level": risk_level,
@@ -2465,6 +3696,36 @@ def ask_model(
     provider_name, provider_config = get_provider_config(provider)
     selected_model = model or str(provider_config.get("model", config.get("default_model", MODEL)))
     selected_temperature = config.get("temperature", 0.25) if temperature is None else temperature
+    provider_name, provider_config, selected_model, selected_temperature, route_decision = resolve_model_route(
+        messages,
+        provider_name=provider_name,
+        provider_config=provider_config,
+        selected_model=selected_model,
+        selected_temperature=float(selected_temperature),
+        config=config,
+        explicit_model=model is not None,
+    )
+    prompt_budget = model_input_token_budget(route_decision, provider_config, config)
+    chars_per_token = float(config.get("model_router", {}).get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN))
+    messages_for_model = messages
+    compaction_meta: dict[str, Any] | None = None
+    if prompt_budget:
+        messages_for_model, compaction_meta = compact_messages_for_input_budget(
+            messages,
+            max_input_tokens=prompt_budget,
+            chars_per_token=chars_per_token,
+            min_message_tokens=safe_int(config.get("model_router", {}).get("min_compaction_tokens"), 256),
+        )
+        if compaction_meta.get("compacted"):
+            log_run_event(
+                "prompt_compacted_for_model_budget",
+                {
+                    "provider": provider_name,
+                    "model": selected_model,
+                    "route_name": route_decision.get("route_name"),
+                    **compaction_meta,
+                },
+            )
 
     stop_event = threading.Event()
     indicator: threading.Thread | None = None
@@ -2480,7 +3741,7 @@ def ask_model(
     try:
         try:
             return call_model_once(
-                messages,
+                messages_for_model,
                 provider_name=provider_name,
                 provider_config=provider_config,
                 model=selected_model,
@@ -2508,7 +3769,7 @@ def ask_model(
                 force=True,
             )
             return call_model_once(
-                messages,
+                messages_for_model,
                 provider_name=fallback_name,
                 provider_config=fallback_config,
                 model=fallback_model,
@@ -2834,13 +4095,16 @@ class AgentState:
 
     def record_tool_event(self, tool_name: str, args: dict[str, Any], result: ToolResult) -> None:
         self.consecutive_failures = 0 if result.ok else self.consecutive_failures + 1
+        history_args = redact_sensitive_payload(args)
+        if tool_name == "encrypt_text" and isinstance(history_args, dict) and "data" in history_args:
+            history_args["data"] = "<redacted plaintext input>"
         self.tool_history.append(
             {
                 "time": utc_now(),
                 "tool": tool_name,
-                "args": args,
+                "args": history_args,
                 "ok": result.ok,
-                "preview": trim_text(result.content, 400),
+                "preview": "<redacted sensitive output>" if tool_name in SENSITIVE_OUTPUT_TOOL_NAMES else redact_sensitive_text(trim_text(result.content, 400)),
             }
         )
         self.tool_history = self.tool_history[-120:]
@@ -2959,12 +4223,2509 @@ class AgentState:
         )
 
 
+def _control_server_log(event_type: str, payload: dict[str, Any]) -> None:
+    entry = {"time": utc_now(), "event": event_type, **payload}
+    try:
+        CONTROL_SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with CONTROL_SERVER_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    except OSError:
+        pass
+    log_run_event(f"control_server_{event_type}", payload)
+
+
+def _control_server_safe_host(host: str) -> bool:
+    cleaned = (host or "").strip().lower()
+    if cleaned in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _control_server_command_is_allowed(command_type: str, allowed: set[str] | None = None) -> bool:
+    cleaned = str(command_type or "").strip().lower()
+    if not cleaned:
+        return False
+    denied = {item.lower() for item in CONTROL_SERVER_DENIED_COMMAND_TYPES}
+    if cleaned in denied:
+        return False
+    suspicious_fragments = {
+        "shell",
+        "exec",
+        "payload",
+        "persist",
+        "exfil",
+        "download",
+        "upload",
+        "keylog",
+        "screenshot",
+    }
+    if any(fragment in cleaned for fragment in suspicious_fragments):
+        return False
+    allowed_set = {item.lower() for item in (allowed or CONTROL_SERVER_ALLOWED_COMMAND_TYPES)}
+    return cleaned in allowed_set
+
+
+def _json_dumps_line(payload: dict[str, Any]) -> bytes:
+    return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+
+
+def _safe_client_id(value: str, fallback: str = "") -> str:
+    candidate = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value or "").strip())[:80].strip("._-:")
+    return candidate or fallback or f"client-{uuid.uuid4().hex[:8]}"
+
+
+class AgentControlServer:
+    """Threaded local control plane for trusted agent clients.
+
+    Protocol:
+    1. Client sends one JSON line:
+       {"type":"hello","client_id":"worker-1","token":"...","capabilities":["status"]}
+    2. Server replies with a JSON-line welcome or error.
+    3. Server may route allow-listed command envelopes to selected clients.
+    4. Clients may reply with heartbeat, ack, status, or result JSON lines.
+
+    This class deliberately routes high-level coordination messages only. It is
+    not a remote shell, payload loader, persistence layer, or exfiltration path.
+    """
+
+    def __init__(
+        self,
+        host: str = CONTROL_SERVER_DEFAULT_HOST,
+        port: int = CONTROL_SERVER_DEFAULT_PORT,
+        *,
+        token: str = "",
+        require_token: bool = True,
+        max_clients: int = 16,
+        max_message_bytes: int = CONTROL_SERVER_MAX_PAYLOAD_BYTES,
+        allowed_command_types: list[str] | None = None,
+    ):
+        self.host = host or CONTROL_SERVER_DEFAULT_HOST
+        self.port = max(1, min(int(port or CONTROL_SERVER_DEFAULT_PORT), 65535))
+        self.token = token
+        self.require_token = bool(require_token)
+        self.max_clients = max(1, min(int(max_clients), 128))
+        self.max_message_bytes = max(1024, min(int(max_message_bytes), 1048576))
+        self.allowed_command_types = {
+            str(item).strip().lower()
+            for item in (allowed_command_types or sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES))
+            if str(item).strip()
+        }
+        self.clients: dict[str, dict[str, Any]] = {}
+        self.listener: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.lock = threading.RLock()
+        self.started_at = ""
+        self.last_error = ""
+
+    def start(self) -> dict[str, Any]:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return self.status()
+            if not _control_server_safe_host(self.host):
+                raise ValueError("Refusing to bind the control server to a non-loopback host without an explicit authorization gate.")
+            self.stop_event.clear()
+            listener = socket.socket(socket.AF_INET6 if ":" in self.host else socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((self.host, self.port))
+            listener.listen(self.max_clients)
+            listener.settimeout(0.5)
+            self.listener = listener
+            self.port = int(listener.getsockname()[1])
+            self.started_at = utc_now()
+            self.thread = threading.Thread(target=self.listen_for_connections, name="cerebro-control-server", daemon=True)
+            self.thread.start()
+        _control_server_log("started", {"host": self.host, "port": self.port, "require_token": self.require_token})
+        return self.status()
+
+    def stop(self) -> dict[str, Any]:
+        self.stop_event.set()
+        with self.lock:
+            listener = self.listener
+            self.listener = None
+            if listener is not None:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+            for client_id, record in list(self.clients.items()):
+                sock = record.get("socket")
+                try:
+                    if sock is not None:
+                        sock.close()
+                except OSError:
+                    pass
+                self.clients.pop(client_id, None)
+        _control_server_log("stopped", {"host": self.host, "port": self.port})
+        return self.status()
+
+    def listen_for_connections(self) -> None:
+        while not self.stop_event.is_set():
+            listener = self.listener
+            if listener is None:
+                break
+            try:
+                client_socket, address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not self.stop_event.is_set():
+                    self.last_error = str(exc)
+                    _control_server_log("accept_error", {"error": trim_text(str(exc), 500)})
+                break
+
+            with self.lock:
+                too_many_clients = len(self.clients) >= self.max_clients
+            if too_many_clients:
+                self._send_error_and_close(client_socket, "server_full")
+                continue
+
+            provisional_id = f"pending-{uuid.uuid4().hex[:8]}"
+            thread = threading.Thread(
+                target=self.handle_client_connection,
+                args=(provisional_id, client_socket, address),
+                name=f"cerebro-client-{provisional_id}",
+                daemon=True,
+            )
+            thread.start()
+
+    def handle_client_connection(self, client_id: str, client_socket: socket.socket, address: Any = None) -> None:
+        active_id = _safe_client_id(client_id)
+        try:
+            client_socket.settimeout(45)
+            hello = self._recv_json_line(client_socket)
+            if not isinstance(hello, dict) or hello.get("type") != "hello":
+                self._send_error_and_close(client_socket, "expected_hello")
+                return
+
+            supplied_token = str(hello.get("token", ""))
+            if self.require_token and not hmac.compare_digest(supplied_token, self.token):
+                self._send_error_and_close(client_socket, "auth_failed")
+                _control_server_log("auth_failed", {"address": repr(address)})
+                return
+
+            requested_id = _safe_client_id(str(hello.get("client_id", "")), fallback=active_id)
+            capabilities = [
+                str(item)[:80]
+                for item in hello.get("capabilities", [])
+                if isinstance(item, (str, int, float)) and str(item).strip()
+            ][:40]
+
+            with self.lock:
+                active_id = requested_id
+                if active_id in self.clients:
+                    active_id = f"{active_id}-{uuid.uuid4().hex[:6]}"
+                self.clients[active_id] = {
+                    "socket": client_socket,
+                    "address": repr(address),
+                    "connected_at": utc_now(),
+                    "last_seen": utc_now(),
+                    "capabilities": capabilities,
+                    "authenticated": True,
+                    "received": 1,
+                    "sent": 0,
+                    "last_message": {"type": "hello"},
+                }
+
+            self._send_json(
+                client_socket,
+                {
+                    "type": "welcome",
+                    "client_id": active_id,
+                    "server_time": utc_now(),
+                    "allowed_command_types": sorted(self.allowed_command_types),
+                },
+            )
+            _control_server_log("client_connected", {"client_id": active_id, "address": repr(address), "capabilities": capabilities})
+
+            while not self.stop_event.is_set():
+                message = self._recv_json_line(client_socket)
+                if message is None:
+                    break
+                if not isinstance(message, dict):
+                    self._send_json(client_socket, {"type": "error", "error": "message_must_be_json_object"})
+                    continue
+                message_type = str(message.get("type", "")).strip().lower()
+                if message_type not in {"heartbeat", "ack", "status", "result", "error"}:
+                    self._send_json(client_socket, {"type": "error", "error": "unsupported_client_message_type"})
+                    continue
+                with self.lock:
+                    record = self.clients.get(active_id)
+                    if record is not None:
+                        record["last_seen"] = utc_now()
+                        record["received"] = int(record.get("received", 0)) + 1
+                        record["last_message"] = {
+                            "type": message_type,
+                            "message_id": message.get("message_id", ""),
+                            "ok": message.get("ok", None),
+                            "preview": trim_text(json.dumps(message, sort_keys=True), 500),
+                        }
+                if message_type == "heartbeat":
+                    self._send_json(client_socket, {"type": "heartbeat_ack", "server_time": utc_now()})
+        except Exception as exc:
+            self.last_error = trim_text(str(exc), 500)
+            _control_server_log("client_error", {"client_id": active_id, "error": self.last_error})
+        finally:
+            with self.lock:
+                self.clients.pop(active_id, None)
+            try:
+                client_socket.close()
+            except OSError:
+                pass
+            _control_server_log("client_disconnected", {"client_id": active_id})
+
+    def route_command_to_clients(
+        self,
+        command_type: str,
+        payload: dict[str, Any] | None,
+        target_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        cleaned_command = str(command_type or "").strip().lower()
+        if not _control_server_command_is_allowed(cleaned_command, self.allowed_command_types):
+            raise ValueError(
+                f"Refusing unsafe or unsupported command_type {command_type!r}. "
+                f"Allowed types: {', '.join(sorted(self.allowed_command_types))}"
+            )
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object/dict")
+        serialized_payload = json.dumps(payload, sort_keys=True, default=str)
+        if len(serialized_payload.encode("utf-8")) > self.max_message_bytes:
+            raise ValueError(f"payload exceeds max_message_bytes={self.max_message_bytes}")
+
+        target_filter = {_safe_client_id(item) for item in target_ids or [] if str(item).strip()}
+        with self.lock:
+            candidate_items = [
+                (client_id, record)
+                for client_id, record in self.clients.items()
+                if not target_filter or client_id in target_filter
+            ]
+
+        message_id = uuid.uuid4().hex
+        envelope = {
+            "type": "command",
+            "message_id": message_id,
+            "command_type": cleaned_command,
+            "payload": payload,
+            "server_time": utc_now(),
+        }
+        delivered: list[str] = []
+        failed: list[dict[str, str]] = []
+        for client_id, record in candidate_items:
+            sock = record.get("socket")
+            if sock is None:
+                failed.append({"client_id": client_id, "error": "missing_socket"})
+                continue
+            try:
+                self._send_json(sock, envelope)
+                delivered.append(client_id)
+                with self.lock:
+                    current = self.clients.get(client_id)
+                    if current is not None:
+                        current["sent"] = int(current.get("sent", 0)) + 1
+                        current["last_sent"] = {"message_id": message_id, "command_type": cleaned_command}
+            except OSError as exc:
+                failed.append({"client_id": client_id, "error": trim_text(str(exc), 200)})
+
+        result = {
+            "ok": not failed,
+            "message_id": message_id,
+            "command_type": cleaned_command,
+            "target_count": len(candidate_items),
+            "delivered": delivered,
+            "failed": failed,
+        }
+        _control_server_log("command_routed", {k: v for k, v in result.items() if k != "failed"} | {"failed_count": len(failed)})
+        return result
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            clients = {
+                client_id: {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"socket"}
+                }
+                for client_id, record in sorted(self.clients.items())
+            }
+            running = bool(self.thread and self.thread.is_alive() and self.listener is not None)
+        return {
+            "running": running,
+            "host": self.host,
+            "port": self.port,
+            "started_at": self.started_at,
+            "require_token": self.require_token,
+            "max_clients": self.max_clients,
+            "max_message_bytes": self.max_message_bytes,
+            "allowed_command_types": sorted(self.allowed_command_types),
+            "client_count": len(clients),
+            "clients": clients,
+            "last_error": self.last_error,
+            "log_file": workspace_relative(CONTROL_SERVER_LOG_FILE),
+        }
+
+    def _recv_json_line(self, client_socket: socket.socket) -> Any:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = client_socket.recv(1)
+            if not chunk:
+                return None
+            if chunk == b"\n":
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > self.max_message_bytes:
+                raise ValueError(f"message exceeds max_message_bytes={self.max_message_bytes}")
+        raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        if not raw:
+            return None
+        return json.loads(raw)
+
+    def _send_json(self, client_socket: socket.socket, payload: dict[str, Any]) -> None:
+        client_socket.sendall(_json_dumps_line(payload))
+
+    def _send_error_and_close(self, client_socket: socket.socket, error: str) -> None:
+        try:
+            self._send_json(client_socket, {"type": "error", "error": error, "server_time": utc_now()})
+        except OSError:
+            pass
+        try:
+            client_socket.close()
+        except OSError:
+            pass
+
+
+CONTROL_SERVER: AgentControlServer | None = None
+CONTROL_SERVER_LOCK = threading.RLock()
+
+
+def control_server_config_from_agent_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or load_config()
+    parsed = config.get("control_server", {})
+    if not isinstance(parsed, dict):
+        parsed = {}
+    defaults = default_control_server_config()
+    merged = defaults | parsed
+    allowed = merged.get("allowed_command_types", sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES))
+    if not isinstance(allowed, list):
+        allowed = sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES)
+    merged["allowed_command_types"] = [
+        str(item).strip().lower()
+        for item in allowed
+        if str(item).strip() and _control_server_command_is_allowed(str(item).strip(), set(allowed))
+    ]
+    if not merged["allowed_command_types"]:
+        merged["allowed_command_types"] = sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES)
+    return merged
+
+
+def ensure_control_server_token(config: dict[str, Any] | None = None) -> str:
+    server_config = control_server_config_from_agent_config(config)
+    env_name = str(server_config.get("token_env", "CEREBRO_CONTROL_TOKEN")).strip()
+    if env_name and os.environ.get(env_name):
+        return str(os.environ[env_name])
+
+    token_path_value = str(server_config.get("token_file", ".agent_control_server_token")).strip() or ".agent_control_server_token"
+    token_path = resolve_workspace_path(token_path_value)
+    if token_path.exists():
+        try:
+            token = token_path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except OSError:
+            pass
+
+    token = secrets.token_urlsafe(32)
+    try:
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token + "\n", encoding="utf-8")
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        # Last-resort in-memory token. The server can still run for this process.
+        pass
+    return token
+
+
+def listen_for_connections(
+    host: str = "",
+    port: int = 0,
+    token: str = "",
+    authorized: bool = False,
+) -> dict[str, Any]:
+    """Start the safe local control server and listen for authenticated clients."""
+    global CONTROL_SERVER
+    config = load_config()
+    server_config = control_server_config_from_agent_config(config)
+    bind_host = host or str(server_config.get("bind_host") or CONTROL_SERVER_DEFAULT_HOST)
+    bind_port = int(port or server_config.get("port") or CONTROL_SERVER_DEFAULT_PORT)
+    if not _control_server_safe_host(bind_host) and not authorized:
+        return {
+            "ok": False,
+            "error": "Refusing non-loopback bind without authorized=True.",
+            "host": bind_host,
+            "port": bind_port,
+        }
+
+    require_token = bool(server_config.get("require_token", True))
+    resolved_token = token or (ensure_control_server_token(config) if require_token else "")
+
+    with CONTROL_SERVER_LOCK:
+        if CONTROL_SERVER and CONTROL_SERVER.status().get("running"):
+            return {"ok": True, **CONTROL_SERVER.status()}
+        CONTROL_SERVER = AgentControlServer(
+            host=bind_host,
+            port=bind_port,
+            token=resolved_token,
+            require_token=require_token,
+            max_clients=int(server_config.get("max_clients", 16)),
+            max_message_bytes=int(server_config.get("max_message_bytes", CONTROL_SERVER_MAX_PAYLOAD_BYTES)),
+            allowed_command_types=list(server_config.get("allowed_command_types", sorted(CONTROL_SERVER_ALLOWED_COMMAND_TYPES))),
+        )
+        status = CONTROL_SERVER.start()
+    return {"ok": True, **status, "token_hint": "Set CEREBRO_CONTROL_TOKEN or read .agent_control_server_token on this trusted host."}
+
+
+def handle_client_connection(client_id: str, socket: socket.socket) -> dict[str, Any]:
+    """Delegate one accepted client socket to the active control server."""
+    with CONTROL_SERVER_LOCK:
+        server = CONTROL_SERVER
+    if server is None:
+        return {"ok": False, "error": "control server is not running"}
+    thread = threading.Thread(
+        target=server.handle_client_connection,
+        args=(_safe_client_id(client_id), socket, "manual"),
+        daemon=True,
+        name=f"cerebro-client-{_safe_client_id(client_id)}",
+    )
+    thread.start()
+    return {"ok": True, "client_id": _safe_client_id(client_id)}
+
+
+def route_command_to_clients(
+    command_type: str,
+    payload: dict[str, Any] | None,
+    target_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Route one allow-listed coordination command to connected clients."""
+    with CONTROL_SERVER_LOCK:
+        server = CONTROL_SERVER
+    if server is None or not server.status().get("running"):
+        return {"ok": False, "error": "control server is not running"}
+    return {"ok": True, **server.route_command_to_clients(command_type, payload or {}, target_ids)}
+
+
+def stop_control_server() -> dict[str, Any]:
+    global CONTROL_SERVER
+    with CONTROL_SERVER_LOCK:
+        server = CONTROL_SERVER
+        if server is None:
+            return {"ok": True, "running": False, "message": "control server was not running"}
+        status = server.stop()
+        CONTROL_SERVER = None
+    return {"ok": True, **status}
+
+
+def control_server_status() -> dict[str, Any]:
+    with CONTROL_SERVER_LOCK:
+        server = CONTROL_SERVER
+    if server is None:
+        return {
+            "ok": True,
+            "running": False,
+            "host": CONTROL_SERVER_DEFAULT_HOST,
+            "port": CONTROL_SERVER_DEFAULT_PORT,
+            "client_count": 0,
+            "clients": {},
+        }
+    return {"ok": True, **server.status()}
+
+
+
 def build_tool_feedback(executed: list[tuple[str, ToolResult]], state: AgentState) -> str:
     sections = []
     for tool_name, result in executed:
         sections.append(f"Tool result for {tool_name}:\n{result.render()}")
     sections.append(f"Updated state:\n{state.context_summary()}")
     return "\n\n".join(sections)
+
+
+NETWORK_INFORMATION_TOOLS = {
+    "normalize_network_target",
+    "resolve_dns_records",
+    "reverse_dns_lookup",
+    "lookup_ip_rdap",
+    "lookup_ip_geolocation",
+    "get_public_ip_info",
+    "scan_tcp_ports",
+    "inspect_local_listening_ports",
+    "inspect_tls_certificate",
+    "inspect_local_network",
+    "build_network_intel_brief",
+    "ingest_network_traffic_file",
+    "analyze_network_traffic_file",
+    "build_ids_baseline",
+    "compare_network_baseline",
+    "capture_network_metadata_sample",
+    "build_ids_mode_plan",
+    "show_ids_alerts",
+}
+
+THREAT_INTEL_TOOLS = {
+    "lookup_cve",
+    "search_cves",
+    "check_cisa_kev",
+    "lookup_malware_hash",
+    "hash_workspace_file",
+    "add_malware_signature",
+    "scan_workspace_file_signatures",
+    "build_threat_intel_brief",
+}
+
+NETWORK_QUERY_KEYWORDS = {
+    "ip",
+    "ip address",
+    "public ip",
+    "external ip",
+    "wan ip",
+    "geolocation",
+    "geoip",
+    "asn",
+    "isp",
+    "rdap",
+    "whois",
+    "dns",
+    "reverse dns",
+    "ptr",
+    "open port",
+    "open ports",
+    "ports are open",
+    "listening ports",
+    "listening services",
+    "netstat",
+    "port scan",
+    "tls",
+    "certificate",
+    "local network",
+    "network info",
+    "network traffic",
+    "traffic capture",
+    "packet capture",
+    "packets",
+    "pcap",
+    "pcapng",
+    "ids",
+    "intrusion detection",
+    "suricata",
+    "zeek",
+    "eve.json",
+    "network flows",
+    "flow logs",
+    "beacon",
+    "anomaly",
+}
+
+
+def _looks_like_network_information_request(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    if not text:
+        return False
+    return any(keyword in text for keyword in NETWORK_QUERY_KEYWORDS)
+
+
+THREAT_INTEL_QUERY_KEYWORDS = {
+    "cve",
+    "cves",
+    "cvss",
+    "critical vulnerability",
+    "critical vulnerabilities",
+    "vulnerability",
+    "vulnerabilities",
+    "kev",
+    "known exploited",
+    "cisa kev",
+    "malware",
+    "malware signature",
+    "malware signatures",
+    "yara",
+    "ioc",
+    "indicator",
+    "hash",
+    "hash lookup",
+    "threat intel",
+    "threat intelligence",
+    "malwarebazaar",
+}
+
+
+def _looks_like_threat_intel_request(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    if not text:
+        return False
+    return any(keyword in text for keyword in THREAT_INTEL_QUERY_KEYWORDS) or bool(re.search(r"CVE-\d{4}-\d{4,}", text, re.I)) or bool(re.search(r"\b(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b", text))
+
+
+def _safe_join(values: Any, limit: int = 6) -> str:
+    if not isinstance(values, list):
+        return ""
+    cleaned = [str(item) for item in values if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit] + [f"+{len(values) - limit} more"]
+    return ", ".join(cleaned)
+
+
+def _network_payload(result: ToolResult) -> dict[str, Any]:
+    if isinstance(result.meta, dict) and result.meta:
+        return result.meta
+    try:
+        parsed = json.loads(result.content)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+CVE_ID_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+HASH_PATTERN = re.compile(r"^(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$")
+NVD_CVE_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CISA_KEV_URLS = [
+    "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+    "https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json",
+]
+MALWAREBAZAAR_API_URL = "https://mb-api.abuse.ch/api/v1/"
+
+
+def _normalize_cve_id(value: str) -> str:
+    candidate = str(value or "").strip().upper()
+    candidate = candidate.replace(" ", "")
+    return candidate
+
+
+def _is_cve_id(value: str) -> bool:
+    return bool(CVE_ID_PATTERN.match(_normalize_cve_id(value)))
+
+
+def _is_hash_indicator(value: str) -> bool:
+    return bool(HASH_PATTERN.match(str(value or "").strip()))
+
+
+def _hash_algorithm_for_value(value: str) -> str:
+    length = len(str(value or "").strip())
+    return {32: "md5", 40: "sha1", 64: "sha256"}.get(length, "unknown")
+
+
+def _threat_cache_read() -> dict[str, Any]:
+    if not THREAT_INTEL_CACHE_FILE.exists():
+        return {"schema_version": 1, "updated_at": "", "cisa_kev": {}, "nvd": {}, "malware_hashes": {}}
+    try:
+        parsed = json.loads(THREAT_INTEL_CACHE_FILE.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return {"schema_version": 1, "updated_at": "", "cisa_kev": {}, "nvd": {}, "malware_hashes": {}}
+    if not isinstance(parsed, dict):
+        return {"schema_version": 1, "updated_at": "", "cisa_kev": {}, "nvd": {}, "malware_hashes": {}}
+    parsed.setdefault("schema_version", 1)
+    parsed.setdefault("cisa_kev", {})
+    parsed.setdefault("nvd", {})
+    parsed.setdefault("malware_hashes", {})
+    return parsed
+
+
+def _threat_cache_write(cache: dict[str, Any]) -> None:
+    cache = dict(cache)
+    cache["updated_at"] = utc_now()
+    try:
+        THREAT_INTEL_CACHE_FILE.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _load_cisa_kev_catalog(*, refresh: bool = False, timeout: int = 12) -> tuple[dict[str, Any], list[str]]:
+    cache = _threat_cache_read()
+    warnings: list[str] = []
+    cached = cache.get("cisa_kev") if isinstance(cache.get("cisa_kev"), dict) else {}
+    if cached and not refresh:
+        return cached, warnings
+    headers = {"User-Agent": "Cerebro-Agent/1.0", "Accept": "application/json"}
+    for url in CISA_KEV_URLS:
+        try:
+            payload = http_get_json(url, headers=headers, timeout=timeout)
+        except Exception as exc:
+            warnings.append(f"KEV fetch failed from {url}: {trim_text(str(exc), 300)}")
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("vulnerabilities"), list):
+            payload["source_url"] = url
+            payload["fetched_at"] = utc_now()
+            cache["cisa_kev"] = payload
+            _threat_cache_write(cache)
+            return payload, warnings
+        warnings.append(f"KEV fetch from {url} did not return expected catalog shape.")
+    if cached:
+        warnings.append("Using cached KEV catalog because live refresh failed.")
+        return cached, warnings
+    return {"vulnerabilities": []}, warnings
+
+
+def _kev_index(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = catalog.get("vulnerabilities") if isinstance(catalog, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        cve_id = _normalize_cve_id(str(item.get("cveID") or item.get("cve_id") or item.get("cve") or ""))
+        if cve_id:
+            indexed[cve_id] = item
+    return indexed
+
+
+def _nvd_headers() -> dict[str, str]:
+    headers = {"User-Agent": "Cerebro-Agent/1.0", "Accept": "application/json"}
+    api_key = os.environ.get("NVD_API_KEY", "").strip()
+    if api_key:
+        headers["apiKey"] = api_key
+    return headers
+
+
+def _nvd_get(params: dict[str, Any], *, timeout: int = 15) -> dict[str, Any]:
+    clean_params = {str(k): v for k, v in params.items() if v not in (None, "", [])}
+    query = urllib.parse.urlencode(clean_params, doseq=True)
+    url = NVD_CVE_API_URL + (f"?{query}" if query else "")
+    payload = http_get_json(url, headers=_nvd_headers(), timeout=timeout)
+    if not isinstance(payload, dict):
+        raise ValueError("NVD returned a non-object JSON payload.")
+    return payload
+
+
+def _english_description(cve: dict[str, Any]) -> str:
+    descriptions = cve.get("descriptions") if isinstance(cve, dict) else []
+    if isinstance(descriptions, list):
+        for item in descriptions:
+            if isinstance(item, dict) and str(item.get("lang", "")).lower() == "en":
+                return str(item.get("value") or "")
+        for item in descriptions:
+            if isinstance(item, dict) and item.get("value"):
+                return str(item.get("value"))
+    return ""
+
+
+def _extract_cvss(cve: dict[str, Any]) -> dict[str, Any]:
+    metrics = cve.get("metrics") if isinstance(cve.get("metrics"), dict) else {}
+    priority = ["cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]
+    for key in priority:
+        rows = metrics.get(key)
+        if not isinstance(rows, list) or not rows:
+            continue
+        selected = rows[0] if isinstance(rows[0], dict) else {}
+        cvss_data = selected.get("cvssData") if isinstance(selected.get("cvssData"), dict) else {}
+        score = cvss_data.get("baseScore")
+        severity = cvss_data.get("baseSeverity") or selected.get("baseSeverity")
+        vector = cvss_data.get("vectorString")
+        if score is not None or severity or vector:
+            return {
+                "metric": key,
+                "base_score": score,
+                "base_severity": severity,
+                "vector": vector,
+                "exploitability_score": selected.get("exploitabilityScore"),
+                "impact_score": selected.get("impactScore"),
+                "source": selected.get("source"),
+                "type": selected.get("type"),
+            }
+    return {}
+
+
+def _extract_weaknesses(cve: dict[str, Any]) -> list[str]:
+    weaknesses: list[str] = []
+    for weakness in cve.get("weaknesses", []) if isinstance(cve.get("weaknesses"), list) else []:
+        if not isinstance(weakness, dict):
+            continue
+        for desc in weakness.get("description", []) if isinstance(weakness.get("description"), list) else []:
+            if isinstance(desc, dict) and desc.get("value"):
+                value = str(desc.get("value"))
+                if value not in weaknesses:
+                    weaknesses.append(value)
+    return weaknesses[:20]
+
+
+def _extract_cpes_from_nodes(nodes: Any, out: set[str]) -> None:
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for match in node.get("cpeMatch", []) if isinstance(node.get("cpeMatch"), list) else []:
+            if isinstance(match, dict):
+                criteria = str(match.get("criteria") or match.get("cpe23Uri") or "")
+                if criteria:
+                    out.add(criteria)
+        _extract_cpes_from_nodes(node.get("children"), out)
+
+
+def _extract_cpes(cve: dict[str, Any]) -> list[str]:
+    cpes: set[str] = set()
+    for config in cve.get("configurations", []) if isinstance(cve.get("configurations"), list) else []:
+        if isinstance(config, dict):
+            _extract_cpes_from_nodes(config.get("nodes"), cpes)
+    return sorted(cpes)[:80]
+
+
+def _normalize_nvd_vulnerability(item: dict[str, Any], kev: dict[str, Any] | None = None) -> dict[str, Any]:
+    cve = item.get("cve") if isinstance(item.get("cve"), dict) else item
+    cve_id = _normalize_cve_id(str(cve.get("id") or cve.get("cveId") or ""))
+    references = []
+    for ref in cve.get("references", []) if isinstance(cve.get("references"), list) else []:
+        if not isinstance(ref, dict):
+            continue
+        references.append({
+            "url": ref.get("url"),
+            "source": ref.get("source"),
+            "tags": ref.get("tags") if isinstance(ref.get("tags"), list) else [],
+        })
+    return {
+        "cve_id": cve_id,
+        "source_identifier": cve.get("sourceIdentifier"),
+        "published": cve.get("published"),
+        "last_modified": cve.get("lastModified"),
+        "status": cve.get("vulnStatus"),
+        "description": _english_description(cve),
+        "cvss": _extract_cvss(cve),
+        "weaknesses": _extract_weaknesses(cve),
+        "affected_cpes": _extract_cpes(cve),
+        "reference_count": len(references),
+        "references": references[:12],
+        "kev": kev or None,
+        "is_known_exploited": bool(kev),
+    }
+
+
+def _default_malware_signatures() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": utc_now(),
+        "signatures": [
+            {
+                "name": "EICAR Antivirus Test String",
+                "signature_type": "string",
+                "pattern": "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+                "severity": "test",
+                "tags": ["eicar", "test-file", "antivirus-validation"],
+                "description": "Benign EICAR test string used to validate malware-detection pipelines.",
+                "source": "built-in",
+                "created_at": utc_now(),
+            },
+            {
+                "name": "Suspicious PowerShell Download Cradle",
+                "signature_type": "regex",
+                "pattern": r"(?i)(powershell|pwsh).{0,160}(downloadstring|downloadfile|invoke-webrequest|iwr|webclient)",
+                "severity": "medium",
+                "tags": ["powershell", "download-cradle", "script"],
+                "description": "Detects common suspicious PowerShell web-download patterns in scripts/logs. This is heuristic and can false-positive.",
+                "source": "built-in",
+                "created_at": utc_now(),
+            },
+        ],
+    }
+
+
+def _load_malware_signatures(signature_path: str = "") -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    target = resolve_workspace_path(signature_path) if signature_path else MALWARE_SIGNATURES_FILE
+    if not target.exists():
+        catalog = _default_malware_signatures()
+        if not signature_path:
+            try:
+                target.write_text(json.dumps(catalog, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                warnings.append(f"Could not initialize default signature file: {exc}")
+        return catalog, warnings
+    try:
+        parsed = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return _default_malware_signatures(), [f"Could not parse signature file {workspace_relative(target)}: {exc}; using built-ins."]
+    if isinstance(parsed, list):
+        parsed = {"schema_version": 1, "updated_at": "", "signatures": parsed}
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("signatures"), list):
+        return _default_malware_signatures(), [f"Signature file {workspace_relative(target)} has unsupported shape; using built-ins."]
+    return parsed, warnings
+
+
+def _save_malware_signatures(catalog: dict[str, Any], signature_path: str = "") -> Path:
+    target = resolve_workspace_path(signature_path) if signature_path else MALWARE_SIGNATURES_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    catalog = dict(catalog)
+    catalog["schema_version"] = int(catalog.get("schema_version", 1) or 1)
+    catalog["updated_at"] = utc_now()
+    if not isinstance(catalog.get("signatures"), list):
+        catalog["signatures"] = []
+    target.write_text(json.dumps(catalog, indent=2, sort_keys=True), encoding="utf-8")
+    return target
+
+
+def _file_hashes(path: Path) -> dict[str, str]:
+    digesters = {"md5": hashlib.md5(), "sha1": hashlib.sha1(), "sha256": hashlib.sha256()}  # nosec: checksums are used as identifiers, not for trust decisions.
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            for hasher in digesters.values():
+                hasher.update(chunk)
+    return {name: hasher.hexdigest() for name, hasher in digesters.items()}
+
+
+CRYPTO_ENVELOPE_PREFIX = "cerebro.crypto.v1:"
+CRYPTO_DEFAULT_PBKDF2_ITERATIONS = 390_000
+CRYPTO_MAX_FILE_BYTES_DEFAULT = 50 * 1024 * 1024
+CRYPTO_SUPPORTED_ALGORITHMS = {
+    "aesgcm": {
+        "display": "AES-GCM",
+        "requires": "cryptography",
+        "authenticated": True,
+        "recommended": True,
+        "notes": "AEAD cipher; supports associated_data; derives a 256-bit key from passphrase by default.",
+    },
+    "chacha20poly1305": {
+        "display": "ChaCha20-Poly1305",
+        "requires": "cryptography",
+        "authenticated": True,
+        "recommended": True,
+        "notes": "AEAD cipher; supports associated_data; derives a 256-bit key from passphrase by default.",
+    },
+    "fernet": {
+        "display": "Fernet",
+        "requires": "cryptography",
+        "authenticated": True,
+        "recommended": True,
+        "notes": "High-level authenticated encryption token format; does not support associated_data.",
+    },
+    "xor_hmac_sha256": {
+        "display": "XOR stream + HMAC-SHA256",
+        "requires": "standard_library",
+        "authenticated": True,
+        "recommended": False,
+        "notes": "Portable fallback for experimentation/offline use. Prefer AES-GCM or ChaCha20-Poly1305 for serious data protection.",
+    },
+}
+
+
+def _crypto_b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _crypto_b64decode(value: str) -> bytes:
+    text = str(value or "").strip()
+    if not text:
+        return b""
+    text = text.replace("\n", "").replace(" ", "")
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.urlsafe_b64decode(text.encode("ascii"))
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 value: {exc}") from exc
+
+
+def _crypto_normalize_algorithm(algorithm: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", str(algorithm or "aesgcm").lower())
+    aliases = {
+        "aes": "aesgcm",
+        "aes256": "aesgcm",
+        "aes256gcm": "aesgcm",
+        "aesgcm": "aesgcm",
+        "chacha": "chacha20poly1305",
+        "chacha20": "chacha20poly1305",
+        "chacha20poly1305": "chacha20poly1305",
+        "fernet": "fernet",
+        "xor": "xor_hmac_sha256",
+        "xorhmac": "xor_hmac_sha256",
+        "xorhmacsha256": "xor_hmac_sha256",
+    }
+    normalized = aliases.get(cleaned, cleaned)
+    if normalized not in CRYPTO_SUPPORTED_ALGORITHMS:
+        supported = ", ".join(sorted(CRYPTO_SUPPORTED_ALGORITHMS))
+        raise ValueError(f"Unsupported algorithm `{algorithm}`. Supported algorithms: {supported}.")
+    return normalized
+
+
+def _crypto_optional_primitives() -> tuple[dict[str, Any], str]:
+    try:
+        from cryptography.fernet import Fernet  # type: ignore
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305  # type: ignore
+    except Exception as exc:
+        return {}, str(exc)
+    return {"AESGCM": AESGCM, "ChaCha20Poly1305": ChaCha20Poly1305, "Fernet": Fernet}, ""
+
+
+def _crypto_availability() -> dict[str, Any]:
+    primitives, error = _crypto_optional_primitives()
+    algorithms: dict[str, Any] = {}
+    for name, spec in CRYPTO_SUPPORTED_ALGORITHMS.items():
+        requires = spec["requires"]
+        available = requires == "standard_library" or bool(primitives)
+        algorithms[name] = dict(spec) | {"available": available}
+        if requires == "cryptography" and not available:
+            algorithms[name]["unavailable_reason"] = "Install the optional `cryptography` package to enable this algorithm." if not error else f"cryptography import failed: {error}"
+    return {
+        "schema_version": 1,
+        "default_algorithm": "aesgcm" if primitives else "xor_hmac_sha256",
+        "cryptography_available": bool(primitives),
+        "algorithms": algorithms,
+        "formats": {
+            "input": ["text", "base64", "hex"],
+            "decrypted_output": ["text", "base64", "hex"],
+            "encrypted_output": "armored envelope string prefixed with cerebro.crypto.v1:",
+        },
+        "keying": {
+            "passphrase": "PBKDF2-HMAC-SHA256 with per-message random 128-bit salt.",
+            "key_b64": "Raw URL-safe base64 key material. Do not paste long-term keys into prompts unless you accept local logging risk.",
+        },
+        "security_notes": [
+            "AES-GCM and ChaCha20-Poly1305 are preferred when cryptography is installed.",
+            "Fernet is a safe high-level option but does not support associated data.",
+            "xor_hmac_sha256 is authenticated but is a fallback, not a modern AEAD replacement.",
+            "The agent redacts passphrases/key_b64 values from tool-history arguments.",
+        ],
+    }
+
+
+def _crypto_bytes_from_input(data: str, input_format: str = "text") -> bytes:
+    fmt = str(input_format or "text").lower().strip()
+    if fmt in {"text", "utf8", "utf-8"}:
+        return str(data or "").encode("utf-8")
+    if fmt in {"base64", "b64"}:
+        return _crypto_b64decode(str(data or ""))
+    if fmt == "hex":
+        cleaned = re.sub(r"[^0-9a-fA-F]", "", str(data or ""))
+        if len(cleaned) % 2:
+            raise ValueError("Hex input has an odd number of digits.")
+        return bytes.fromhex(cleaned)
+    raise ValueError("input_format must be one of text, base64, or hex.")
+
+
+def _crypto_bytes_to_output(data: bytes, output_format: str = "text") -> tuple[str, str]:
+    fmt = str(output_format or "text").lower().strip()
+    if fmt in {"text", "utf8", "utf-8"}:
+        try:
+            return data.decode("utf-8"), "text"
+        except UnicodeDecodeError:
+            return _crypto_b64encode(data), "base64"
+    if fmt in {"base64", "b64"}:
+        return _crypto_b64encode(data), "base64"
+    if fmt == "hex":
+        return data.hex(), "hex"
+    raise ValueError("output_format must be one of text, base64, or hex.")
+
+
+def _crypto_resolve_key(
+    *,
+    algorithm: str,
+    passphrase: str = "",
+    key_b64: str = "",
+    salt: bytes = b"",
+    iterations: int = CRYPTO_DEFAULT_PBKDF2_ITERATIONS,
+) -> tuple[bytes, dict[str, Any]]:
+    passphrase_text = str(passphrase or "")
+    key_text = str(key_b64 or "").strip()
+    if bool(passphrase_text) == bool(key_text):
+        raise ValueError("Provide exactly one of passphrase or key_b64.")
+    if passphrase_text:
+        if not salt:
+            raise ValueError("PBKDF2 salt is required when using a passphrase.")
+        iterations = max(100_000, min(int(iterations or CRYPTO_DEFAULT_PBKDF2_ITERATIONS), 2_000_000))
+        key = hashlib.pbkdf2_hmac("sha256", passphrase_text.encode("utf-8"), salt, iterations, dklen=32)
+        return key, {"kdf": "pbkdf2_hmac_sha256", "iterations": iterations, "salt": _crypto_b64encode(salt)}
+
+    key = _crypto_b64decode(key_text)
+    if algorithm == "aesgcm" and len(key) not in {16, 24, 32}:
+        raise ValueError("AES-GCM key_b64 must decode to 16, 24, or 32 bytes.")
+    if algorithm in {"chacha20poly1305", "fernet", "xor_hmac_sha256"} and len(key) != 32:
+        raise ValueError(f"{algorithm} key_b64 must decode to exactly 32 bytes.")
+    return key, {"kdf": "raw_key_b64", "key_length_bytes": len(key)}
+
+
+def _crypto_xor_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    output = bytearray()
+    counter = 0
+    while len(output) < length:
+        block = hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+        output.extend(block)
+        counter += 1
+    return bytes(output[:length])
+
+
+def _crypto_pack_envelope(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return CRYPTO_ENVELOPE_PREFIX + _crypto_b64encode(raw)
+
+
+def _crypto_parse_envelope(envelope_text: str) -> dict[str, Any]:
+    text = str(envelope_text or "").strip()
+    if text.startswith(CRYPTO_ENVELOPE_PREFIX):
+        raw = _crypto_b64decode(text[len(CRYPTO_ENVELOPE_PREFIX):])
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid crypto envelope JSON: {exc}") from exc
+    else:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Encrypted input must be a cerebro.crypto.v1 armored token or JSON envelope.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Crypto envelope must decode to a JSON object.")
+    if int(parsed.get("schema_version", 0) or 0) != 1:
+        raise ValueError("Unsupported crypto envelope schema_version.")
+    return parsed
+
+
+def _crypto_encrypt_bytes(
+    plaintext: bytes,
+    *,
+    algorithm: str = "aesgcm",
+    passphrase: str = "",
+    key_b64: str = "",
+    associated_data: str = "",
+    iterations: int = CRYPTO_DEFAULT_PBKDF2_ITERATIONS,
+) -> tuple[str, dict[str, Any]]:
+    normalized = _crypto_normalize_algorithm(algorithm)
+    primitives, import_error = _crypto_optional_primitives()
+    if CRYPTO_SUPPORTED_ALGORITHMS[normalized]["requires"] == "cryptography" and not primitives:
+        raise RuntimeError(f"Algorithm `{normalized}` requires the optional `cryptography` package. Import error: {import_error}")
+    salt = secrets.token_bytes(16) if passphrase else b""
+    key, key_meta = _crypto_resolve_key(algorithm=normalized, passphrase=passphrase, key_b64=key_b64, salt=salt, iterations=iterations)
+    aad = str(associated_data or "").encode("utf-8")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "algorithm": normalized,
+        "created_at": utc_now(),
+        "plaintext_length": len(plaintext),
+        "associated_data_sha256": hashlib.sha256(aad).hexdigest() if aad else "",
+    } | key_meta
+
+    if normalized == "aesgcm":
+        nonce = secrets.token_bytes(12)
+        ciphertext = primitives["AESGCM"](key).encrypt(nonce, plaintext, aad or None)
+        payload |= {"nonce": _crypto_b64encode(nonce), "ciphertext": _crypto_b64encode(ciphertext)}
+    elif normalized == "chacha20poly1305":
+        nonce = secrets.token_bytes(12)
+        ciphertext = primitives["ChaCha20Poly1305"](key).encrypt(nonce, plaintext, aad or None)
+        payload |= {"nonce": _crypto_b64encode(nonce), "ciphertext": _crypto_b64encode(ciphertext)}
+    elif normalized == "fernet":
+        if aad:
+            raise ValueError("Fernet does not support associated_data; use aesgcm or chacha20poly1305 when AAD is required.")
+        fernet_key = base64.urlsafe_b64encode(key)
+        token = primitives["Fernet"](fernet_key).encrypt(plaintext)
+        payload |= {"token": token.decode("ascii")}
+    elif normalized == "xor_hmac_sha256":
+        nonce = secrets.token_bytes(16)
+        stream = _crypto_xor_keystream(key, nonce, len(plaintext))
+        ciphertext = bytes(left ^ right for left, right in zip(plaintext, stream))
+        tag = hmac.new(key, b"cerebro-xor-hmac-sha256-v1" + nonce + aad + ciphertext, hashlib.sha256).digest()
+        payload |= {"nonce": _crypto_b64encode(nonce), "ciphertext": _crypto_b64encode(ciphertext), "tag": _crypto_b64encode(tag)}
+    else:
+        raise ValueError(f"Unsupported algorithm: {normalized}")
+
+    return _crypto_pack_envelope(payload), payload
+
+
+def _crypto_decrypt_bytes(
+    encrypted_text: str,
+    *,
+    passphrase: str = "",
+    key_b64: str = "",
+    associated_data: str = "",
+) -> tuple[bytes, dict[str, Any]]:
+    envelope = _crypto_parse_envelope(encrypted_text)
+    normalized = _crypto_normalize_algorithm(str(envelope.get("algorithm") or ""))
+    primitives, import_error = _crypto_optional_primitives()
+    if CRYPTO_SUPPORTED_ALGORITHMS[normalized]["requires"] == "cryptography" and not primitives:
+        raise RuntimeError(f"Algorithm `{normalized}` requires the optional `cryptography` package. Import error: {import_error}")
+    kdf = str(envelope.get("kdf") or "")
+    if kdf == "pbkdf2_hmac_sha256":
+        if not passphrase:
+            raise ValueError("This envelope was encrypted with a passphrase-derived key; passphrase is required.")
+        salt = _crypto_b64decode(str(envelope.get("salt") or ""))
+        iterations = int(envelope.get("iterations") or CRYPTO_DEFAULT_PBKDF2_ITERATIONS)
+        key, _ = _crypto_resolve_key(algorithm=normalized, passphrase=passphrase, key_b64="", salt=salt, iterations=iterations)
+    elif kdf == "raw_key_b64":
+        if not key_b64:
+            raise ValueError("This envelope was encrypted with raw key material; key_b64 is required.")
+        key, _ = _crypto_resolve_key(algorithm=normalized, passphrase="", key_b64=key_b64, salt=b"")
+    else:
+        raise ValueError(f"Unsupported or missing kdf in envelope: {kdf!r}")
+
+    aad = str(associated_data or "").encode("utf-8")
+    expected_aad_hash = str(envelope.get("associated_data_sha256") or "")
+    actual_aad_hash = hashlib.sha256(aad).hexdigest() if aad else ""
+    if expected_aad_hash and expected_aad_hash != actual_aad_hash:
+        raise ValueError("associated_data does not match this envelope.")
+
+    if normalized == "aesgcm":
+        nonce = _crypto_b64decode(str(envelope.get("nonce") or ""))
+        ciphertext = _crypto_b64decode(str(envelope.get("ciphertext") or ""))
+        plaintext = primitives["AESGCM"](key).decrypt(nonce, ciphertext, aad or None)
+    elif normalized == "chacha20poly1305":
+        nonce = _crypto_b64decode(str(envelope.get("nonce") or ""))
+        ciphertext = _crypto_b64decode(str(envelope.get("ciphertext") or ""))
+        plaintext = primitives["ChaCha20Poly1305"](key).decrypt(nonce, ciphertext, aad or None)
+    elif normalized == "fernet":
+        if aad:
+            raise ValueError("Fernet envelopes do not accept associated_data.")
+        token = str(envelope.get("token") or "").encode("ascii")
+        plaintext = primitives["Fernet"](base64.urlsafe_b64encode(key)).decrypt(token)
+    elif normalized == "xor_hmac_sha256":
+        nonce = _crypto_b64decode(str(envelope.get("nonce") or ""))
+        ciphertext = _crypto_b64decode(str(envelope.get("ciphertext") or ""))
+        tag = _crypto_b64decode(str(envelope.get("tag") or ""))
+        expected_tag = hmac.new(key, b"cerebro-xor-hmac-sha256-v1" + nonce + aad + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected_tag):
+            raise ValueError("Ciphertext authentication failed; passphrase/key, AAD, or data may be wrong.")
+        stream = _crypto_xor_keystream(key, nonce, len(ciphertext))
+        plaintext = bytes(left ^ right for left, right in zip(ciphertext, stream))
+    else:
+        raise ValueError(f"Unsupported algorithm: {normalized}")
+
+    meta = {
+        "schema_version": envelope.get("schema_version"),
+        "algorithm": normalized,
+        "kdf": kdf,
+        "plaintext_length": len(plaintext),
+        "created_at": envelope.get("created_at"),
+        "associated_data_used": bool(aad),
+    }
+    return plaintext, meta
+
+
+def _default_encrypted_output_path(input_path: Path) -> Path:
+    return input_path.with_name(input_path.name + ".cenc")
+
+
+def _default_decrypted_output_path(input_path: Path) -> Path:
+    name = input_path.name
+    if name.endswith(".cenc"):
+        return input_path.with_name(name[:-5] or "decrypted.bin")
+    return input_path.with_name(name + ".decrypted")
+
+
+def _scan_signature_against_bytes(signature: dict[str, Any], data: bytes, text: str, hashes: dict[str, str]) -> dict[str, Any] | None:
+    name = str(signature.get("name") or "unnamed_signature")
+    sig_type = str(signature.get("signature_type") or signature.get("type") or "string").lower().strip()
+    pattern = str(signature.get("pattern") or "")
+    if not pattern:
+        return None
+    evidence: dict[str, Any] = {"signature_type": sig_type}
+    try:
+        if sig_type in {"hash", "md5", "sha1", "sha256"}:
+            expected = pattern.lower().strip()
+            if expected in {value.lower() for value in hashes.values()}:
+                evidence["hash_algorithm"] = _hash_algorithm_for_value(expected)
+                evidence["hash"] = expected
+            else:
+                return None
+        elif sig_type == "regex":
+            match = re.search(pattern, text, flags=re.MULTILINE)
+            if not match:
+                return None
+            evidence["offset"] = match.start()
+            evidence["matched_preview"] = trim_text(match.group(0), 120)
+        elif sig_type == "hex":
+            hex_text = re.sub(r"[^0-9a-fA-F]", "", pattern)
+            if len(hex_text) % 2:
+                return None
+            needle = bytes.fromhex(hex_text)
+            offset = data.find(needle)
+            if offset < 0:
+                return None
+            evidence["offset"] = offset
+            evidence["byte_length"] = len(needle)
+        elif sig_type == "string":
+            offset = text.find(pattern)
+            if offset < 0:
+                return None
+            evidence["offset"] = offset
+            evidence["matched_preview"] = trim_text(pattern, 120)
+        elif sig_type == "yara":
+            try:
+                import yara  # type: ignore
+            except Exception as exc:
+                return {"name": name, "matched": False, "warning": f"YARA signature skipped because yara-python is unavailable: {exc}"}
+            try:
+                rules = yara.compile(source=pattern)
+                matches = rules.match(data=data)
+            except Exception as exc:
+                return {"name": name, "matched": False, "warning": f"YARA signature compile/match failed: {exc}"}
+            if not matches:
+                return None
+            evidence["yara_matches"] = [str(match) for match in matches[:20]]
+        else:
+            return None
+    except Exception as exc:
+        return {"name": name, "matched": False, "warning": f"Signature scan error: {exc}"}
+    return {
+        "name": name,
+        "matched": True,
+        "severity": str(signature.get("severity") or "medium"),
+        "tags": signature.get("tags") if isinstance(signature.get("tags"), list) else [],
+        "description": signature.get("description", ""),
+        "source": signature.get("source", ""),
+        "evidence": evidence,
+    }
+
+
+IDS_SUSPICIOUS_PORTS: dict[int, str] = {
+    21: "FTP cleartext service",
+    23: "Telnet cleartext service",
+    135: "Windows RPC exposure",
+    139: "NetBIOS exposure",
+    445: "SMB exposure",
+    1433: "Microsoft SQL Server exposure",
+    1521: "Oracle database exposure",
+    3306: "MySQL exposure",
+    3389: "Remote Desktop exposure",
+    4444: "Common reverse-shell/metasploit listener port",
+    5432: "PostgreSQL exposure",
+    5900: "VNC exposure",
+    6667: "IRC/C2-like port",
+    6379: "Redis exposure",
+    9200: "Elasticsearch exposure",
+    11211: "Memcached exposure",
+    2323: "Common IoT Telnet alternate port",
+    31337: "Common backdoor-style port",
+}
+
+
+def _ids_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ids_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, "", "-"):
+            return default
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ids_is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _ids_ip_scope(value: str) -> dict[str, Any]:
+    try:
+        ip = ipaddress.ip_address(str(value))
+    except ValueError:
+        return {"valid": False, "scope": "unknown"}
+    if ip.is_private:
+        scope = "private"
+    elif ip.is_loopback:
+        scope = "loopback"
+    elif ip.is_link_local:
+        scope = "link_local"
+    elif ip.is_multicast:
+        scope = "multicast"
+    elif ip.is_global:
+        scope = "global"
+    else:
+        scope = "special"
+    return {
+        "valid": True,
+        "version": ip.version,
+        "scope": scope,
+        "is_private": ip.is_private,
+        "is_global": ip.is_global,
+        "is_loopback": ip.is_loopback,
+        "is_link_local": ip.is_link_local,
+        "is_multicast": ip.is_multicast,
+        "is_reserved": ip.is_reserved,
+    }
+
+
+def _ids_dns_entropy_like(query: str) -> float:
+    lowered = re.sub(r"[^a-z0-9]", "", str(query or "").lower())
+    if not lowered:
+        return 0.0
+    counts = collections.Counter(lowered)
+    total = len(lowered)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * (0 if p <= 0 else __import__("math").log2(p))
+    return round(entropy, 3)
+
+
+def _ids_normalize_flow(raw: dict[str, Any], *, source: str = "unknown") -> dict[str, Any]:
+    def pick(*keys: str) -> Any:
+        for key in keys:
+            if key in raw and raw.get(key) not in (None, "", "-"):
+                return raw.get(key)
+        return ""
+
+    event_type = str(pick("event_type", "_path", "type", "kind") or "flow").lower()
+    src_ip = str(pick("src_ip", "source.ip", "id.orig_h", "source_ip", "src", "saddr", "client_ip") or "")
+    dst_ip = str(pick("dest_ip", "dst_ip", "destination.ip", "id.resp_h", "destination_ip", "dst", "daddr", "server_ip") or "")
+    src_port = _ids_int(pick("src_port", "source.port", "id.orig_p", "sport", "source_port"), 0)
+    dst_port = _ids_int(pick("dest_port", "dst_port", "destination.port", "id.resp_p", "dport", "destination_port"), 0)
+    proto = str(pick("proto", "protocol", "trans_proto", "ip_proto") or "").upper()
+    if not proto and dst_port:
+        proto = "TCP/UDP"
+    ts_raw = pick("timestamp", "ts", "@timestamp", "frame.time_epoch", "time")
+    ts = _ids_float(ts_raw, 0.0)
+    if not ts and isinstance(ts_raw, str):
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ts = 0.0
+
+    alert = raw.get("alert") if isinstance(raw.get("alert"), dict) else {}
+    dns = raw.get("dns") if isinstance(raw.get("dns"), dict) else {}
+    tls = raw.get("tls") if isinstance(raw.get("tls"), dict) else {}
+    http = raw.get("http") if isinstance(raw.get("http"), dict) else {}
+
+    dns_query = str(pick("dns_query", "query") or dns.get("rrname") or dns.get("query") or "")
+    tls_sni = str(pick("tls_sni", "server_name") or tls.get("sni") or tls.get("subject") or "")
+    http_host = str(pick("http_host", "host") or http.get("hostname") or http.get("http_host") or "")
+
+    flow = {
+        "ts": ts,
+        "source": source,
+        "event_type": event_type,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "proto": proto,
+        "bytes": _ids_int(pick("bytes", "orig_bytes", "resp_bytes", "flow.bytes_toserver", "flow.bytes_toclient"), 0),
+        "packets": _ids_int(pick("packets", "pkts", "orig_pkts", "resp_pkts"), 0),
+        "dns_query": dns_query,
+        "tls_sni": tls_sni,
+        "http_host": http_host,
+        "alert_signature": str(alert.get("signature") or pick("alert_signature", "signature") or ""),
+        "alert_category": str(alert.get("category") or pick("alert_category", "category") or ""),
+        "alert_severity": _ids_int(alert.get("severity") or pick("alert_severity", "severity"), 0),
+    }
+    flow["src_scope"] = _ids_ip_scope(src_ip).get("scope", "unknown") if src_ip else "unknown"
+    flow["dst_scope"] = _ids_ip_scope(dst_ip).get("scope", "unknown") if dst_ip else "unknown"
+    return flow
+
+
+def _ids_parse_jsonl(text: str, *, limit: int, source: str) -> tuple[list[dict[str, Any]], list[str]]:
+    flows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if len(flows) >= limit:
+            break
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            if line_number <= 5:
+                warnings.append(f"line {line_number}: not valid JSON")
+            continue
+        if isinstance(parsed, dict):
+            flows.append(_ids_normalize_flow(parsed, source=source))
+    return flows, warnings
+
+
+def _ids_parse_csv(text: str, *, limit: int, source: str) -> tuple[list[dict[str, Any]], list[str]]:
+    flows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    try:
+        reader = csv.DictReader(text.splitlines())
+        for row in reader:
+            if len(flows) >= limit:
+                break
+            if isinstance(row, dict):
+                flows.append(_ids_normalize_flow(row, source=source))
+    except csv.Error as exc:
+        warnings.append(f"CSV parse warning: {exc}")
+    return flows, warnings
+
+
+def _ids_parse_zeek_conn(text: str, *, limit: int, source: str) -> tuple[list[dict[str, Any]], list[str]]:
+    fields: list[str] = []
+    flows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for line in text.splitlines():
+        if len(flows) >= limit:
+            break
+        if line.startswith("#fields"):
+            fields = line.split("\t")[1:]
+            continue
+        if line.startswith("#") or not line.strip():
+            continue
+        values = line.split("\t")
+        if not fields or len(values) != len(fields):
+            continue
+        raw = dict(zip(fields, values))
+        flows.append(_ids_normalize_flow(raw, source=source))
+    if not fields:
+        warnings.append("No Zeek #fields header found; parsed zero Zeek rows unless generic parsing succeeded.")
+    return flows, warnings
+
+
+def _ids_parse_generic_text(text: str, *, limit: int, source: str) -> tuple[list[dict[str, Any]], list[str]]:
+    flows: list[dict[str, Any]] = []
+    pattern = re.compile(r"(?P<src>\b(?:\d{1,3}\.){3}\d{1,3}\b)(?::(?P<src_port>\d{1,5}))?.{0,80}?(?:->|to|>|dst|dest|destination).{0,20}?(?P<dst>\b(?:\d{1,3}\.){3}\d{1,3}\b)(?::(?P<dst_port>\d{1,5}))?", re.I)
+    for match in pattern.finditer(text):
+        if len(flows) >= limit:
+            break
+        flows.append(_ids_normalize_flow({
+            "src_ip": match.group("src"),
+            "src_port": match.group("src_port") or 0,
+            "dest_ip": match.group("dst"),
+            "dest_port": match.group("dst_port") or 0,
+            "proto": "UNKNOWN",
+            "event_type": "text_match",
+        }, source=source))
+    return flows, [] if flows else ["Generic text parser found no IP-to-IP flow-like records."]
+
+
+def _ids_parse_pcap_classic(data: bytes, *, limit: int, source: str) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    flows: list[dict[str, Any]] = []
+    if len(data) < 24:
+        return [], ["PCAP file is too small to contain a global header."]
+    magic = data[:4]
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
+        endian = "<"
+    elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        endian = ">"
+    else:
+        return [], ["Not a classic PCAP file. PCAPNG requires tshark/Zeek/Suricata conversion before built-in parsing."]
+    offset = 24
+    while offset + 16 <= len(data) and len(flows) < limit:
+        try:
+            ts_sec, ts_frac, incl_len, _orig_len = struct.unpack(endian + "IIII", data[offset:offset + 16])
+        except struct.error:
+            break
+        offset += 16
+        packet = data[offset:offset + incl_len]
+        offset += incl_len
+        if len(packet) < 14:
+            continue
+        eth_type = int.from_bytes(packet[12:14], "big")
+        l3_offset = 14
+        if eth_type == 0x8100 and len(packet) >= 18:
+            eth_type = int.from_bytes(packet[16:18], "big")
+            l3_offset = 18
+        if eth_type != 0x0800 or len(packet) < l3_offset + 20:
+            continue
+        ip_header = packet[l3_offset:]
+        version = ip_header[0] >> 4
+        ihl = (ip_header[0] & 0x0F) * 4
+        if version != 4 or len(ip_header) < ihl + 4:
+            continue
+        proto_num = ip_header[9]
+        src_ip = socket.inet_ntoa(ip_header[12:16])
+        dst_ip = socket.inet_ntoa(ip_header[16:20])
+        l4 = ip_header[ihl:]
+        src_port = dst_port = 0
+        proto = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto_num, str(proto_num))
+        dns_query = ""
+        if proto_num in {6, 17} and len(l4) >= 4:
+            src_port = int.from_bytes(l4[0:2], "big")
+            dst_port = int.from_bytes(l4[2:4], "big")
+            if proto_num == 17 and (src_port == 53 or dst_port == 53) and len(l4) > 20:
+                dns_query = _ids_decode_dns_query(l4[8:])
+        flows.append(_ids_normalize_flow({
+            "ts": float(ts_sec) + (float(ts_frac) / 1_000_000.0),
+            "src_ip": src_ip,
+            "dest_ip": dst_ip,
+            "src_port": src_port,
+            "dest_port": dst_port,
+            "proto": proto,
+            "bytes": len(packet),
+            "packets": 1,
+            "dns_query": dns_query,
+            "event_type": "pcap_packet",
+        }, source=source))
+    return flows, warnings
+
+
+def _ids_decode_dns_query(payload: bytes) -> str:
+    if len(payload) < 12:
+        return ""
+    offset = 12
+    labels: list[str] = []
+    jumps = 0
+    try:
+        while offset < len(payload) and jumps < 20:
+            length = payload[offset]
+            if length == 0:
+                break
+            if length & 0xC0:
+                break
+            offset += 1
+            if offset + length > len(payload):
+                break
+            label = payload[offset:offset + length].decode("ascii", errors="ignore")
+            if label:
+                labels.append(label)
+            offset += length
+            jumps += 1
+    except Exception:
+        return ""
+    return ".".join(labels)
+
+
+def _ids_read_traffic_records(path: str, *, input_format: str = "auto", limit: int = 5000) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    target = resolve_workspace_path(path)
+    if not target.exists() or not target.is_file():
+        raise ValueError(f"Traffic source does not exist or is not a file: {path}")
+    limit = max(1, min(int(limit), 50000))
+    suffix = target.suffix.lower()
+    fmt = str(input_format or "auto").lower().strip()
+    source = workspace_relative(target)
+    warnings: list[str] = []
+    flows: list[dict[str, Any]] = []
+    if fmt == "auto":
+        if suffix in {".pcap", ".cap"}:
+            fmt = "pcap"
+        elif suffix in {".jsonl", ".eve"}:
+            fmt = "jsonl"
+        elif suffix == ".csv":
+            fmt = "csv"
+        elif suffix in {".log", ".txt", ""}:
+            sample = target.read_text(encoding="utf-8", errors="replace")[:2000]
+            fmt = "zeek" if "#fields" in sample and "id.orig_h" in sample else "text"
+        else:
+            fmt = "text"
+    if fmt in {"pcap", "classic_pcap"}:
+        data = target.read_bytes()[:64 * 1024 * 1024]
+        flows, warnings = _ids_parse_pcap_classic(data, limit=limit, source=source)
+    else:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        if fmt in {"jsonl", "eve", "suricata"}:
+            flows, warnings = _ids_parse_jsonl(text, limit=limit, source=source)
+        elif fmt in {"zeek", "conn", "conn.log"}:
+            flows, warnings = _ids_parse_zeek_conn(text, limit=limit, source=source)
+        elif fmt == "csv":
+            flows, warnings = _ids_parse_csv(text, limit=limit, source=source)
+        else:
+            flows, warnings = _ids_parse_generic_text(text, limit=limit, source=source)
+    return flows, {"path": source, "format": fmt, "limit": limit, "warnings": warnings}
+
+
+def _ids_alert(severity: str, category: str, title: str, evidence: dict[str, Any], recommendation: str) -> dict[str, Any]:
+    return {
+        "time": utc_now(),
+        "severity": severity,
+        "category": category,
+        "title": title,
+        "evidence": evidence,
+        "recommendation": recommendation,
+    }
+
+
+def _ids_analyze_flows(flows: list[dict[str, Any]], *, baseline: dict[str, Any] | None = None, sensitivity: str = "medium") -> dict[str, Any]:
+    baseline = baseline or {}
+    sensitivity = str(sensitivity or "medium").lower()
+    port_scan_threshold = {"low": 30, "medium": 18, "high": 10}.get(sensitivity, 18)
+    fanout_threshold = {"low": 60, "medium": 35, "high": 20}.get(sensitivity, 35)
+    beacon_min = {"low": 12, "medium": 8, "high": 5}.get(sensitivity, 8)
+    alerts: list[dict[str, Any]] = []
+    src_counter: collections.Counter[str] = collections.Counter()
+    dst_counter: collections.Counter[str] = collections.Counter()
+    port_counter: collections.Counter[int] = collections.Counter()
+    proto_counter: collections.Counter[str] = collections.Counter()
+    dns_counter: collections.Counter[str] = collections.Counter()
+    per_src_ports: dict[str, set[int]] = collections.defaultdict(set)
+    per_src_dsts: dict[str, set[str]] = collections.defaultdict(set)
+    per_pair_times: dict[tuple[str, str, int, str], list[float]] = collections.defaultdict(list)
+    external_dsts: set[str] = set()
+    dst_ports_seen: set[int] = set()
+    protocols_seen: set[str] = set()
+
+    for flow in flows:
+        src = str(flow.get("src_ip") or "")
+        dst = str(flow.get("dst_ip") or "")
+        port = _ids_int(flow.get("dst_port"), 0)
+        proto = str(flow.get("proto") or "UNKNOWN").upper()
+        if src:
+            src_counter[src] += 1
+        if dst:
+            dst_counter[dst] += 1
+        if port:
+            port_counter[port] += 1
+            dst_ports_seen.add(port)
+        if proto:
+            proto_counter[proto] += 1
+            protocols_seen.add(proto)
+        if src and port:
+            per_src_ports[src].add(port)
+        if src and dst:
+            per_src_dsts[src].add(dst)
+        if dst and _ids_ip_scope(dst).get("scope") == "global":
+            external_dsts.add(dst)
+        ts = _ids_float(flow.get("ts"), 0.0)
+        if ts and src and dst:
+            per_pair_times[(src, dst, port, proto)].append(ts)
+        dns_query = str(flow.get("dns_query") or "")
+        if dns_query:
+            dns_counter[dns_query] += 1
+        if flow.get("alert_signature"):
+            severity_num = _ids_int(flow.get("alert_severity"), 2)
+            severity = "high" if severity_num <= 1 else "medium" if severity_num <= 3 else "low"
+            alerts.append(_ids_alert(
+                severity,
+                "upstream_ids_alert",
+                str(flow.get("alert_signature")),
+                {"src_ip": src, "dst_ip": dst, "dst_port": port, "category": flow.get("alert_category")},
+                "Investigate the upstream IDS alert, then confirm host ownership and whether the destination service is expected.",
+            ))
+        if port in IDS_SUSPICIOUS_PORTS:
+            src_scope = flow.get("src_scope")
+            dst_scope = flow.get("dst_scope")
+            severity = "high" if port in {23, 2323, 3389, 4444, 5900, 6667, 31337} and (src_scope == "global" or dst_scope == "global") else "medium"
+            alerts.append(_ids_alert(
+                severity,
+                "suspicious_service_port",
+                f"Traffic involving {IDS_SUSPICIOUS_PORTS[port]} ({port})",
+                {"src_ip": src, "dst_ip": dst, "dst_port": port, "proto": proto},
+                "Verify whether this service is expected. Restrict exposure, require strong authentication, or block if unauthorized.",
+            ))
+        if dns_query:
+            entropy = _ids_dns_entropy_like(dns_query)
+            if len(dns_query) > 80 or entropy >= 3.8:
+                alerts.append(_ids_alert(
+                    "medium",
+                    "suspicious_dns",
+                    "Long or high-entropy DNS query observed",
+                    {"query": dns_query[:160], "length": len(dns_query), "entropy": entropy, "src_ip": src},
+                    "Check whether the query belongs to legitimate software. High-entropy or unusually long domains can indicate tunneling, DGA, or tracking noise.",
+                ))
+
+    for src, ports in per_src_ports.items():
+        if len(ports) >= port_scan_threshold:
+            alerts.append(_ids_alert(
+                "high" if len(ports) >= port_scan_threshold * 2 else "medium",
+                "possible_port_scan",
+                f"One source touched {len(ports)} destination ports",
+                {"src_ip": src, "unique_dst_ports": sorted(ports)[:80]},
+                "Validate whether this is an authorized scanner. If not, isolate/denylist the source and review target host logs.",
+            ))
+    for src, dsts in per_src_dsts.items():
+        if len(dsts) >= fanout_threshold:
+            alerts.append(_ids_alert(
+                "medium",
+                "possible_fanout_scan",
+                f"One source contacted {len(dsts)} unique destinations",
+                {"src_ip": src, "unique_dst_count": len(dsts), "sample_dst_ips": sorted(dsts)[:30]},
+                "Check for discovery scans, malware propagation, or noisy inventory tooling.",
+            ))
+    for key, times in per_pair_times.items():
+        if len(times) < beacon_min:
+            continue
+        ordered = sorted(times)
+        intervals = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1) if ordered[i + 1] > ordered[i]]
+        if len(intervals) < beacon_min - 1:
+            continue
+        avg = sum(intervals) / len(intervals)
+        if avg <= 0:
+            continue
+        variance = sum((item - avg) ** 2 for item in intervals) / len(intervals)
+        jitter_ratio = (variance ** 0.5) / avg
+        if 5 <= avg <= 3600 and jitter_ratio < 0.18:
+            src, dst, port, proto = key
+            alerts.append(_ids_alert(
+                "medium",
+                "possible_beaconing",
+                "Regular repeated connection pattern observed",
+                {"src_ip": src, "dst_ip": dst, "dst_port": port, "proto": proto, "samples": len(times), "avg_interval_seconds": round(avg, 2), "jitter_ratio": round(jitter_ratio, 3)},
+                "Correlate with process/endpoint logs. Regular callbacks may be benign telemetry or command-and-control behavior.",
+            ))
+
+    if baseline:
+        known_ports = {int(item) for item in baseline.get("dst_ports", []) if str(item).isdigit()}
+        known_protocols = {str(item).upper() for item in baseline.get("protocols", [])}
+        known_external = set(str(item) for item in baseline.get("external_destinations", []))
+        new_ports = sorted(port for port in dst_ports_seen if port and port not in known_ports)
+        new_protocols = sorted(proto for proto in protocols_seen if proto and proto not in known_protocols)
+        new_external = sorted(dst for dst in external_dsts if dst not in known_external)
+        if new_ports:
+            alerts.append(_ids_alert("medium", "baseline_deviation", "New destination ports observed versus baseline", {"new_ports": new_ports[:80]}, "Review whether the new ports are expected for this host/network segment."))
+        if new_protocols:
+            alerts.append(_ids_alert("low", "baseline_deviation", "New protocols observed versus baseline", {"new_protocols": new_protocols}, "Confirm whether these protocol changes are expected."))
+        if len(new_external) >= 5:
+            alerts.append(_ids_alert("medium", "baseline_deviation", "New external destinations observed versus baseline", {"new_external_destinations": new_external[:50], "count": len(new_external)}, "Review new external destinations against application changes, updates, and threat intelligence."))
+
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    alerts.sort(key=lambda item: (-severity_rank.get(str(item.get("severity")), 0), str(item.get("category")), str(item.get("title"))))
+    summary = {
+        "flow_count": len(flows),
+        "top_sources": src_counter.most_common(10),
+        "top_destinations": dst_counter.most_common(10),
+        "top_destination_ports": port_counter.most_common(20),
+        "protocols": proto_counter.most_common(10),
+        "top_dns_queries": dns_counter.most_common(10),
+        "external_destination_count": len(external_dsts),
+        "alerts": alerts[:100],
+        "alert_count": len(alerts),
+        "severity_counts": dict(collections.Counter(str(alert.get("severity", "info")) for alert in alerts)),
+    }
+    return summary
+
+
+def _ids_baseline_from_flows(flows: list[dict[str, Any]], *, label: str = "baseline") -> dict[str, Any]:
+    dst_ports = sorted({_ids_int(flow.get("dst_port"), 0) for flow in flows if _ids_int(flow.get("dst_port"), 0)})
+    protocols = sorted({str(flow.get("proto") or "UNKNOWN").upper() for flow in flows if flow.get("proto")})
+    external = sorted({str(flow.get("dst_ip")) for flow in flows if _ids_ip_scope(str(flow.get("dst_ip") or "")).get("scope") == "global"})
+    return {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "label": label,
+        "flow_count": len(flows),
+        "dst_ports": dst_ports,
+        "protocols": protocols,
+        "external_destinations": external[:1000],
+    }
+
+
+def _ids_append_alerts(alerts: list[dict[str, Any]], *, source_path: str = "") -> int:
+    if not alerts:
+        return 0
+    try:
+        IDS_ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with IDS_ALERTS_FILE.open("a", encoding="utf-8") as handle:
+            for alert in alerts:
+                handle.write(json.dumps(dict(alert) | {"source_path": source_path}, sort_keys=True) + "\n")
+        return len(alerts)
+    except OSError:
+        return 0
+
+def summarize_network_tool_result(tool_name: str, result: ToolResult) -> str:
+    """Create a user-facing summary for network tools instead of dumping raw JSON/state."""
+    payload = _network_payload(result)
+    if not payload:
+        status = "succeeded" if result.ok else "failed"
+        return f"Network lookup {status}: {trim_text(result.content, 1200)}"
+
+    lines: list[str] = []
+    generated = payload.get("generated_at")
+    if tool_name == "get_public_ip_info":
+        public_ip = payload.get("public_ip") or payload.get("ip") or "unknown"
+        lines.append(f"Your public IP address appears to be **{public_ip}**.")
+        source = payload.get("source")
+        if source:
+            lines.append(f"Source: {source}.")
+        classification = payload.get("classification")
+        if isinstance(classification, dict):
+            flags = [key for key in ("is_private", "is_global", "is_loopback", "is_reserved") if classification.get(key)]
+            if flags:
+                lines.append("Classification: " + ", ".join(flags).replace("is_", "") + ".")
+        geo = payload.get("geolocation")
+        if isinstance(geo, dict) and geo:
+            city = geo.get("city")
+            region = geo.get("region")
+            country = geo.get("country")
+            location = ", ".join(str(x) for x in (city, region, country) if x)
+            org = geo.get("org") or geo.get("isp")
+            asn = geo.get("asn")
+            if location:
+                lines.append(f"Approximate GeoIP location: {location}.")
+            if org or asn:
+                lines.append(f"Network/ISP hint: {org or 'unknown'}{f' ({asn})' if asn else ''}.")
+        rdap = payload.get("rdap")
+        if isinstance(rdap, dict) and rdap:
+            name = rdap.get("name")
+            start = rdap.get("start_address")
+            end = rdap.get("end_address")
+            handle = rdap.get("handle")
+            if name or handle:
+                lines.append(f"RDAP allocation: {name or handle}.")
+            if start and end:
+                lines.append(f"Registered range: {start} – {end}.")
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            lines.append("Some enrichment sources failed, but the primary IP lookup succeeded.")
+        lines.append("Note: GeoIP/ISP data is approximate and may reflect VPN, proxy, carrier-grade NAT, or ISP routing rather than your exact physical location.")
+        return "\n".join(lines)
+
+    if tool_name == "lookup_ip_geolocation":
+        ip = payload.get("ip") or payload.get("target") or "unknown"
+        if payload.get("skipped"):
+            return f"GeoIP lookup skipped for **{ip}**: {payload.get('reason', 'target is not a public IP address')}."
+        lines.append(f"GeoIP result for **{ip}**:")
+        location = ", ".join(str(x) for x in (payload.get("city"), payload.get("region"), payload.get("country")) if x)
+        if location:
+            lines.append(f"Approximate location: {location}.")
+        if payload.get("isp") or payload.get("org") or payload.get("asn"):
+            lines.append(f"Network/ISP hint: {payload.get('isp') or payload.get('org') or 'unknown'}{f' ({payload.get('asn')})' if payload.get('asn') else ''}.")
+        if payload.get("timezone"):
+            lines.append(f"Timezone: {payload.get('timezone')}.")
+        lines.append("GeoIP is approximate, not proof of a precise physical address.")
+        return "\n".join(lines)
+
+    if tool_name == "lookup_ip_rdap":
+        if payload.get("skipped"):
+            return f"RDAP lookup skipped: {payload.get('reason', 'target is not a public IP address')}."
+        lines.append(f"RDAP result for **{payload.get('ip') or payload.get('target', 'target')}**:")
+        for label, key in (("Name", "name"), ("Handle", "handle"), ("Type", "type"), ("Country", "country")):
+            value = payload.get(key)
+            if value:
+                lines.append(f"{label}: {value}")
+        if payload.get("start_address") and payload.get("end_address"):
+            lines.append(f"Range: {payload.get('start_address')} – {payload.get('end_address')}")
+        entities = _safe_join(payload.get("entity_handles"))
+        if entities:
+            lines.append(f"Entity handles: {entities}")
+        return "\n".join(lines)
+
+    if tool_name == "resolve_dns_records":
+        target = payload.get("target") or payload.get("host") or "target"
+        addresses = _safe_join(payload.get("addresses") or payload.get("records") or payload.get("ips"), limit=12)
+        return f"DNS resolution for **{target}**: {addresses or 'no records returned'}."
+
+    if tool_name == "reverse_dns_lookup":
+        ip = payload.get("ip") or payload.get("target") or "target"
+        names = _safe_join(payload.get("hostnames") or payload.get("names") or payload.get("ptr"), limit=8)
+        if payload.get("hostname"):
+            names = str(payload.get("hostname"))
+        return f"Reverse DNS for **{ip}**: {names or 'no PTR record found'}."
+
+    if tool_name == "scan_tcp_ports":
+        target = payload.get("target") or payload.get("host") or "target"
+        open_ports = payload.get("open_ports") or payload.get("open") or []
+        closed_ports = payload.get("closed_ports") or payload.get("closed") or []
+        filtered_ports = payload.get("filtered_ports") or payload.get("filtered") or []
+        open_text = _safe_join(open_ports, limit=32) or "none detected"
+        lines.append(f"TCP scan summary for **{target}**: open ports: {open_text}.")
+        if isinstance(closed_ports, list):
+            lines.append(f"Closed/refused ports checked: {len(closed_ports)}.")
+        if isinstance(filtered_ports, list) and filtered_ports:
+            lines.append(f"Timed out/filtered ports checked: {len(filtered_ports)}.")
+        if payload.get("warnings"):
+            lines.append("Warnings: " + _safe_join(payload.get("warnings"), limit=4))
+        return "\n".join(lines)
+
+    if tool_name == "inspect_local_listening_ports":
+        entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+        tcp_entries = [row for row in entries if str(row.get("protocol", "")).upper().startswith("TCP")]
+        udp_entries = [row for row in entries if str(row.get("protocol", "")).upper().startswith("UDP")]
+        lines.append("Local listening-port summary for this machine:")
+        if not entries:
+            lines.append("No listening TCP/UDP ports were detected by the available local OS command.")
+        else:
+            lines.append(f"Detected {len(entries)} listening socket(s): {len(tcp_entries)} TCP and {len(udp_entries)} UDP.")
+            for row in entries[:20]:
+                protocol = str(row.get("protocol") or "?").upper()
+                address = str(row.get("local_address") or row.get("address") or "?")
+                port = row.get("port", "?")
+                state = str(row.get("state") or "listening")
+                exposure = str(row.get("exposure") or "unknown")
+                pid = row.get("pid")
+                process = row.get("process")
+                owner = f" pid={pid}" if pid else ""
+                if process:
+                    owner += f" process={process}"
+                lines.append(f"• {protocol} {address}:{port} — {state}, {exposure}{owner}")
+            if len(entries) > 20:
+                lines.append(f"…plus {len(entries) - 20} more socket(s).")
+        if payload.get("command"):
+            lines.append("Source: local OS listening-socket table.")
+        if payload.get("warnings"):
+            lines.append("Warnings: " + _safe_join(payload.get("warnings"), limit=4))
+        lines.append("This is a local-host inventory, not a blind scan of every device on the LAN. For another device, provide a single authorized target IP/hostname and ports.")
+        return "\n".join(lines)
+
+    if tool_name == "inspect_tls_certificate":
+        target = payload.get("target") or payload.get("host") or "target"
+        lines.append(f"TLS certificate summary for **{target}**:")
+        for label, key in (("Subject", "subject"), ("Issuer", "issuer"), ("Valid from", "not_before"), ("Valid until", "not_after"), ("SHA-256 fingerprint", "sha256_fingerprint"), ("TLS version", "tls_version"), ("Cipher", "cipher")):
+            value = payload.get(key)
+            if value:
+                lines.append(f"{label}: {value}")
+        sans = _safe_join(payload.get("subject_alt_names"), limit=8)
+        if sans:
+            lines.append(f"Subject alternative names: {sans}")
+        return "\n".join(lines)
+
+    if tool_name == "inspect_local_network":
+        lines.append("Local network summary:")
+        for label, key in (("Hostname", "hostname"), ("FQDN", "fqdn")):
+            value = payload.get(key)
+            if value:
+                lines.append(f"{label}: {value}")
+        local_ips = _safe_join(payload.get("local_ips") or payload.get("addresses"), limit=12)
+        if local_ips:
+            lines.append(f"Local IPs: {local_ips}")
+        resolvers = _safe_join(payload.get("resolver_hints") or payload.get("dns_servers"), limit=8)
+        if resolvers:
+            lines.append(f"Resolver hints: {resolvers}")
+        return "\n".join(lines)
+
+    if tool_name in {"ingest_network_traffic_file", "analyze_network_traffic_file", "compare_network_baseline"}:
+        source = payload.get("path") or payload.get("source_path") or "traffic source"
+        flow_count = payload.get("flow_count", 0)
+        lines.append(f"Network traffic analysis for **{source}**:")
+        lines.append(f"Normalized flow/packet records: {flow_count}.")
+        severity_counts = payload.get("severity_counts") or {}
+        alert_count = payload.get("alert_count", 0)
+        if alert_count:
+            sev_text = ", ".join(f"{key}={value}" for key, value in severity_counts.items()) or str(alert_count)
+            lines.append(f"IDS-style alerts: {alert_count} ({sev_text}).")
+            for alert in (payload.get("alerts") or [])[:8]:
+                lines.append(f"• {str(alert.get('severity', 'info')).upper()} — {alert.get('title')} [{alert.get('category')}]")
+                evidence = alert.get("evidence") if isinstance(alert.get("evidence"), dict) else {}
+                if evidence:
+                    compact_evidence = json.dumps(evidence, sort_keys=True)
+                    lines.append(f"  Evidence: {trim_text(compact_evidence, 220)}")
+                if alert.get("recommendation"):
+                    lines.append(f"  Next: {alert.get('recommendation')}")
+            if alert_count > 8:
+                lines.append(f"…plus {alert_count - 8} more alert(s).")
+        else:
+            lines.append("No IDS-style alerts were generated by the built-in heuristics.")
+        top_ports = payload.get("top_destination_ports") or []
+        if top_ports:
+            lines.append("Top destination ports: " + ", ".join(f"{port}/{count}" for port, count in top_ports[:10]) + ".")
+        top_sources = payload.get("top_sources") or []
+        if top_sources:
+            lines.append("Top sources: " + ", ".join(f"{ip} ({count})" for ip, count in top_sources[:6]) + ".")
+        warnings = payload.get("warnings") or []
+        if warnings:
+            lines.append("Warnings: " + _safe_join(warnings, limit=4))
+        if payload.get("alerts_recorded"):
+            lines.append(f"Recorded alerts to `{workspace_relative(IDS_ALERTS_FILE)}`.")
+        return "\n".join(lines)
+
+    if tool_name == "build_ids_baseline":
+        return (
+            f"IDS baseline built for **{payload.get('label', 'baseline')}** from {payload.get('flow_count', 0)} flow(s).\n"
+            f"Known destination ports: {_safe_join(payload.get('dst_ports'), limit=20) or 'none'}.\n"
+            f"Known protocols: {_safe_join(payload.get('protocols'), limit=10) or 'none'}.\n"
+            f"Saved baseline: `{payload.get('baseline_path', workspace_relative(IDS_BASELINE_FILE))}`."
+        )
+
+    if tool_name == "capture_network_metadata_sample":
+        lines.append("Network metadata capture sample:")
+        lines.append(f"Status: {'success' if result.ok else 'failed'}.")
+        if payload.get("output_path"):
+            lines.append(f"Metadata output: `{payload.get('output_path')}`.")
+        if payload.get("packet_count") is not None:
+            lines.append(f"Captured metadata rows: {payload.get('packet_count')}.")
+        if payload.get("command"):
+            lines.append("Capture adapter: tshark metadata-only fields.")
+        if payload.get("warnings"):
+            lines.append("Warnings: " + _safe_join(payload.get("warnings"), limit=5))
+        lines.append("No packet payloads are intentionally retained by this tool.")
+        return "\n".join(lines)
+
+    if tool_name == "build_ids_mode_plan":
+        lines.append("IDS mode plan:")
+        lines.append(f"Mode: {payload.get('mode', 'offline')}.")
+        for step in payload.get("recommended_sequence", [])[:12]:
+            if isinstance(step, dict):
+                lines.append(f"• {step.get('tool')}: {step.get('purpose')}")
+        if payload.get("safety_rules"):
+            lines.append("Safety rules: " + _safe_join(payload.get("safety_rules"), limit=6))
+        return "\n".join(lines)
+
+    if tool_name == "show_ids_alerts":
+        alerts = payload.get("alerts") if isinstance(payload.get("alerts"), list) else []
+        lines.append(f"Stored IDS alerts: {len(alerts)} shown of {payload.get('total_alerts', len(alerts))} total.")
+        for alert in alerts[:20]:
+            lines.append(f"• {str(alert.get('severity', 'info')).upper()} — {alert.get('title')} [{alert.get('category')}] at {alert.get('time')}")
+        return "\n".join(lines)
+
+    # Fallback for normalize_network_target/build_network_intel_brief and future network tools.
+    title = tool_name.replace("_", " ").title()
+    compact = {k: v for k, v in payload.items() if k not in {"raw", "raw_keys"}}
+    rendered = json.dumps(compact, indent=2)
+    return f"{title}:\n```json\n{trim_text(rendered, 1800)}\n```"
+
+
+def summarize_threat_intel_tool_result(tool_name: str, result: ToolResult) -> str:
+    payload = _network_payload(result)
+    lines: list[str] = []
+    if not result.ok:
+        return f"{tool_name} failed: {trim_text(result.content, 1000)}"
+
+    if tool_name == "lookup_cve":
+        cve = payload.get("cve") if isinstance(payload.get("cve"), dict) else {}
+        lines.append(f"CVE lookup for **{cve.get('cve_id', payload.get('cve_id', 'unknown'))}**:")
+        cvss = cve.get("cvss") if isinstance(cve.get("cvss"), dict) else {}
+        if cvss:
+            lines.append(f"CVSS: {cvss.get('base_severity', 'unknown')} {cvss.get('base_score', '')} ({cvss.get('metric', 'metric unknown')}).")
+        if cve.get("is_known_exploited"):
+            kev = cve.get("kev") if isinstance(cve.get("kev"), dict) else {}
+            lines.append(f"CISA KEV: YES — added {kev.get('dateAdded', 'unknown date')}; due date {kev.get('dueDate', 'n/a')}.")
+        else:
+            lines.append("CISA KEV: not listed in the loaded KEV catalog.")
+        if cve.get("description"):
+            lines.append(f"Description: {trim_text(str(cve.get('description')), 700)}")
+        if cve.get("weaknesses"):
+            lines.append("Weaknesses: " + _safe_join(cve.get("weaknesses"), limit=8))
+        if cve.get("reference_count"):
+            lines.append(f"References: {cve.get('reference_count')} total; first {min(12, int(cve.get('reference_count') or 0))} retained in metadata.")
+        return "\n".join(lines)
+
+    if tool_name == "search_cves":
+        rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+        lines.append(f"CVE search returned {len(rows)} shown of {payload.get('total_results', len(rows))} total result(s).")
+        for row in rows[:10]:
+            cvss = row.get("cvss") if isinstance(row.get("cvss"), dict) else {}
+            kev = " KEV" if row.get("is_known_exploited") else ""
+            lines.append(f"• {row.get('cve_id')}: {cvss.get('base_severity', 'unknown')} {cvss.get('base_score', '')}{kev} — {trim_text(str(row.get('description', '')), 180)}")
+        return "\n".join(lines)
+
+    if tool_name == "check_cisa_kev":
+        rows = payload.get("matches") if isinstance(payload.get("matches"), list) else []
+        lines.append(f"CISA KEV matches: {len(rows)} shown of {payload.get('match_count', len(rows))}.")
+        for row in rows[:12]:
+            lines.append(f"• {row.get('cveID')}: {row.get('vendorProject')} {row.get('product')} — added {row.get('dateAdded')}; due {row.get('dueDate')}")
+        if payload.get("warnings"):
+            lines.append("Warnings: " + _safe_join(payload.get("warnings"), limit=4))
+        return "\n".join(lines)
+
+    if tool_name == "lookup_malware_hash":
+        status = payload.get("query_status") or payload.get("status")
+        lines.append(f"Malware hash lookup for **{payload.get('hash', 'unknown')}**: {status}.")
+        rows = payload.get("data") if isinstance(payload.get("data"), list) else []
+        for row in rows[:5]:
+            signatures = row.get("signature") or row.get("clamav") or row.get("file_name") or "unknown signature"
+            tags = _safe_join(row.get("tags"), limit=8)
+            lines.append(f"• {row.get('sha256_hash', row.get('md5_hash', 'sample'))}: {signatures}; file type={row.get('file_type', 'unknown')}; tags={tags or 'none'}")
+        if not rows and status in {"hash_not_found", "file_not_found"}:
+            lines.append("No known MalwareBazaar record was returned for that hash.")
+        return "\n".join(lines)
+
+    if tool_name == "hash_workspace_file":
+        lines.append(f"File hashes for `{payload.get('path')}`:")
+        hashes = payload.get("hashes") if isinstance(payload.get("hashes"), dict) else {}
+        for name in ("md5", "sha1", "sha256"):
+            if hashes.get(name):
+                lines.append(f"{name.upper()}: `{hashes.get(name)}`")
+        if payload.get("malware_lookup"):
+            lookup = payload.get("malware_lookup") if isinstance(payload.get("malware_lookup"), dict) else {}
+            lines.append(f"MalwareBazaar status: {lookup.get('query_status', lookup.get('status', 'unknown'))}.")
+        return "\n".join(lines)
+
+    if tool_name == "scan_workspace_file_signatures":
+        lines.append(f"Signature scan for `{payload.get('path')}`: {payload.get('match_count', 0)} match(es) across {payload.get('file_count', 0)} file(s).")
+        for match in payload.get("matches", [])[:12]:
+            lines.append(f"• {match.get('severity', 'info').upper()} — {match.get('signature')} in `{match.get('path')}` ({match.get('signature_type')})")
+        if payload.get("warnings"):
+            lines.append("Warnings: " + _safe_join(payload.get("warnings"), limit=6))
+        return "\n".join(lines)
+
+    if tool_name == "add_malware_signature":
+        return f"Saved malware signature `{payload.get('name')}` to `{payload.get('signature_path')}`. Total signatures: {payload.get('signature_count')}."
+
+    if tool_name == "build_threat_intel_brief":
+        lines.append(f"Threat-intel brief for `{payload.get('indicator')}`:")
+        for finding in payload.get("findings", [])[:12]:
+            if isinstance(finding, dict):
+                lines.append(f"• {finding.get('type')}: {finding.get('summary')}")
+        for step in payload.get("recommended_sequence", [])[:8]:
+            if isinstance(step, dict):
+                lines.append(f"Next tool: {step.get('tool')} — {step.get('purpose')}")
+        return "\n".join(lines)
+
+    return trim_text(result.content, 1200)
+
+
+
+def _looks_like_tool_inventory_request(user_input: str) -> bool:
+    """Detect direct requests for the agent's own tool inventory.
+
+    These should be answered from the live registry, not from model memory, so
+    the response cannot drift, omit newly added tools, or stop halfway through a
+    hand-written capability overview.
+    """
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    if not text:
+        return False
+    if not any(term in text for term in ("tool", "tools", "capabilities", "capability inventory")):
+        return False
+
+    inventory_phrases = (
+        "tool inventory",
+        "tools inventory",
+        "list of tools",
+        "list the tools",
+        "table of tools",
+        "table of the tools",
+        "tools and what they do",
+        "what tools",
+        "which tools",
+        "all tools",
+        "available tools",
+        "registered tools",
+        "tools cerebro has access to",
+        "tools do you have access to",
+        "tools you have access to",
+        "capabilities overview",
+        "capability inventory",
+    )
+    if any(phrase in text for phrase in inventory_phrases):
+        return True
+
+    # Covers natural phrasing like: "give me a list of the tools CEREBRO has access to".
+    asks_to_show = re.search(r"\b(?:give|show|list|display|print|return|make)\b", text) is not None
+    asks_inventory = re.search(r"\btools?\b", text) is not None and re.search(
+        r"\b(?:access|available|registered|have|has|do|does|what they do)\b",
+        text,
+    ) is not None
+    return asks_to_show and asks_inventory
+
+
+def _tool_inventory_category(name: str, description: str = "") -> str:
+    token_text = f"{name} {description}".lower()
+
+    if any(term in token_text for term in ("cve", "kev", "malware", "signature", "yara", "threat-intel", "threat intelligence", "malwarebazaar")):
+        return "Threat Intelligence"
+    if any(term in token_text for term in ("csv", "jsonl", "sqlite", "database", "archive", "zip", "tar", "pdf", "image", "json api", "html", "crawl", "security headers", "json schema", "entity", "manifest", "compare", "process", "environment", "external tool", "plugin", "media metadata")):
+        return "Data, Documents & External Tools"
+    if any(term in token_text for term in ("network", "dns", "rdap", "geoip", "geolocation", "tls", "ssl", "port", "traffic", "ids", "intrusion", "pcap", "suricata", "zeek", "packet", "baseline")):
+        return "Network & IDS"
+    if any(term in token_text for term in ("model", "llm", "provider", "router", "route", "runtime", "dependency", "prompt", "context budget", "token")):
+        return "Models, Runtime & Context"
+    if any(term in token_text for term in ("checkpoint", "self-improve", "self improvement", "improvement", "experiment", "autonomy", "cycle ledger", "rollback", "change impact", "control state", "control mode")):
+        return "Self-Improvement & Change Control"
+    if any(term in token_text for term in ("team", "subagent", "manager", "role", "meta", "quality gate", "execution dossier", "tool chain", "risk register", "validation matrix", "patch strategy", "readiness", "goal")):
+        return "Planning & Multi-Agent Orchestration"
+    if any(term in token_text for term in ("repository", "entrypoint", "api surface", "data flow", "error log", "python", "complexity", "import graph", "duplicate", "refactor", "code graph", "symbol", "callers", "orphan", "hotspot", "codebase", "function", "class")):
+        return "Code Intelligence"
+    if any(term in token_text for term in ("task", "blackboard", "memory", "profile", "plan", "history", "config", "run-log", "run history")):
+        return "State, Memory & Tasks"
+    if any(term in token_text for term in ("file", "workspace", "json", "write", "append", "replace", "diff", "search", "git", "pytest", "ruff", "smoke-test", "command", "path", "directory")):
+        return "Workspace, Files & Validation"
+    return "General Utilities"
+
+
+def _escape_markdown_table_cell(value: Any, *, max_chars: int = 140) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = text.replace("|", r"\|")
+    if len(text) > max_chars:
+        text = text[: max(1, max_chars - 1)].rstrip() + "…"
+    return text
+
+
+def render_registered_tool_inventory(tools: "AgentTools", *, include_schemas: bool = False) -> str:
+    """Render a complete, deterministic inventory from the live tool registry.
+
+    The inventory is intentionally grouped into several narrow tables instead of
+    one giant table. That keeps Windows Command Prompt from wrapping rows into a
+    hard-to-read wall of borders when the registry grows past 100 tools.
+    """
+    specs = list(tools.tool_specs.values())
+    categorized: dict[str, list[ToolSpec]] = collections.defaultdict(list)
+    for spec in specs:
+        categorized[_tool_inventory_category(spec.name, spec.description)].append(spec)
+
+    category_order = [
+        "Workspace, Files & Validation",
+        "Code Intelligence",
+        "Planning & Multi-Agent Orchestration",
+        "Self-Improvement & Change Control",
+        "Models, Runtime & Context",
+        "Data, Documents & External Tools",
+        "Network & IDS",
+        "Threat Intelligence",
+        "State, Memory & Tasks",
+        "General Utilities",
+    ]
+    risk_labels = {
+        TOOL_RISK_READ_ONLY: "read-only",
+        TOOL_RISK_WRITE_FILE: "writes files",
+        TOOL_RISK_RUN_COMMAND: "runs command",
+        TOOL_RISK_AGENTIC: "agentic",
+        TOOL_RISK_MEMORY: "memory/state",
+        TOOL_RISK_CONTROL: "control",
+    }
+
+    lines: list[str] = []
+    lines.append(f"CEREBRO TOOL INVENTORY — {len(specs)} registered tools")
+    lines.append("")
+    lines.append("This inventory is generated directly from the live tool registry, so it reflects the tools the agent can actually call.")
+    lines.append("")
+    lines.append("| Category | Count |")
+    lines.append("|---|---:|")
+    for category in category_order:
+        count = len(categorized.get(category, []))
+        if count:
+            lines.append(f"| {category} | {count} |")
+
+    lines.append("")
+    lines.append("Full tool list by category:")
+
+    row_index = 0
+    for category in category_order:
+        category_specs = sorted(categorized.get(category, []), key=lambda item: item.name)
+        if not category_specs:
+            continue
+        lines.append("")
+        lines.append(f"### {category} ({len(category_specs)})")
+        lines.append("")
+        lines.append("| # | Tool | Risk | What it does |")
+        lines.append("|---:|---|---|---|")
+        for spec in category_specs:
+            row_index += 1
+            description = _escape_markdown_table_cell(spec.description, max_chars=95)
+            risk = risk_labels.get(spec.risk, spec.risk)
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(row_index),
+                        _escape_markdown_table_cell(spec.name, max_chars=38),
+                        _escape_markdown_table_cell(risk, max_chars=18),
+                        description,
+                    ]
+                )
+                + " |"
+            )
+
+    if include_schemas:
+        lines.append("")
+        lines.append("Tool argument schemas:")
+        lines.append("")
+        for spec in sorted(specs, key=lambda item: item.name):
+            schema_text = json.dumps(spec.schema, sort_keys=True)
+            lines.append(f"- `{spec.name}`: `{_escape_markdown_table_cell(schema_text, max_chars=220)}`")
+
+    return "\n".join(lines)
+
+def build_direct_tool_inventory_response(user_input: str, tools: "AgentTools") -> str | None:
+    if not _looks_like_tool_inventory_request(user_input):
+        return None
+    include_schemas = any(term in str(user_input or "").lower() for term in ("schema", "schemas", "arguments", "args", "parameters"))
+    return render_registered_tool_inventory(tools, include_schemas=include_schemas)
+
+def summarize_tool_results_for_user(user_input: str, executed: list[tuple[str, ToolResult]]) -> str:
+    summaries: list[str] = []
+    for tool_name, result in executed:
+        if tool_name in NETWORK_INFORMATION_TOOLS:
+            summaries.append(summarize_network_tool_result(tool_name, result))
+        elif tool_name in THREAT_INTEL_TOOLS:
+            summaries.append(summarize_threat_intel_tool_result(tool_name, result))
+        elif result.ok:
+            summaries.append(trim_text(result.content, 1200))
+        else:
+            summaries.append(f"{tool_name} failed: {trim_text(result.content, 800)}")
+    return "\n\n".join(item for item in summaries if item.strip()) or "I ran the requested tool, but it returned no displayable output."
+
+
+def should_finalize_after_tool_result(user_input: str, executed: list[tuple[str, ToolResult]]) -> bool:
+    if not executed:
+        return False
+    tool_names = {name for name, _ in executed}
+    if tool_names & NETWORK_INFORMATION_TOOLS and _looks_like_network_information_request(user_input):
+        return True
+    if tool_names & THREAT_INTEL_TOOLS and _looks_like_threat_intel_request(user_input):
+        return True
+    return False
+
+
+def _looks_like_local_open_ports_request(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    if not text:
+        return False
+    port_phrases = ("open ports", "open port", "listening ports", "listening services", "netstat", "ports are open")
+    local_scope = ("this network", "my network", "local network", "this computer", "my computer", "this machine", "localhost", "local host", "on this network")
+    if any(phrase in text for phrase in port_phrases) and any(scope in text for scope in local_scope):
+        return True
+    # Treat short, target-less port questions as local-host diagnostics rather than hallucinating a shell command.
+    if any(phrase in text for phrase in port_phrases) and not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|[a-z0-9.-]+\.[a-z]{2,}", text):
+        return True
+    return False
+
+
+def _looks_like_ids_mode_request(user_input: str) -> bool:
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    ids_terms = ("ids", "intrusion detection", "network traffic", "packet capture", "traffic capture", "pcap", "suricata", "zeek", "analyze traffic", "monitor traffic")
+    return any(term in text for term in ids_terms)
+
+
+def build_direct_network_tool_action(user_input: str) -> dict[str, Any] | None:
+    """Return a deterministic one-tool action for simple network questions.
+
+    This prevents the model from answering with an inert command like `netstat`
+    when a safe, registered diagnostic tool already exists. Broad LAN scanning is
+    intentionally not inferred from vague wording.
+    """
+    text = re.sub(r"\s+", " ", str(user_input or "").lower()).strip()
+    if not _looks_like_network_information_request(text):
+        return None
+    if _looks_like_ids_mode_request(text) and not re.search(r"\b(?:analy[sz]e|ingest|parse)\b.*\b[\w./\\ -]+\.(?:pcap|cap|jsonl|eve|log|csv|txt)\b", text):
+        live_requested = any(term in text for term in ("live", "start", "monitor", "capture"))
+        return {
+            "type": "tool",
+            "tool": "build_ids_mode_plan",
+            "args": {"mode": "live" if live_requested else "offline", "duration_seconds": 30, "authorized": False},
+            "why": "Build a safe IDS-mode plan before capturing or analyzing network traffic.",
+        }
+    if _looks_like_local_open_ports_request(text):
+        return {
+            "type": "tool",
+            "tool": "inspect_local_listening_ports",
+            "args": {"include_udp": True, "include_process_names": True, "limit": 100},
+            "why": "Inspect local listening ports with a bounded read-only OS diagnostic instead of emitting a shell command.",
+        }
+    if any(phrase in text for phrase in ("my ip", "ip address", "public ip", "external ip", "wan ip")) and not any(phrase in text for phrase in ("open port", "open ports", "port scan", "listening")):
+        return {
+            "type": "tool",
+            "tool": "get_public_ip_info",
+            "args": {"enrich": True, "timeout": 10},
+            "why": "Answer the direct public-IP question with the public IP lookup tool.",
+        }
+    return None
+
+
+def build_direct_threat_intel_tool_action(user_input: str) -> dict[str, Any] | None:
+    """Return a deterministic one-tool action for simple CVE/hash/signature requests."""
+    text = re.sub(r"\s+", " ", str(user_input or "")).strip()
+    lowered = text.lower()
+    if not _looks_like_threat_intel_request(text):
+        return None
+    cve_match = re.search(r"CVE-\d{4}-\d{4,}", text, re.I)
+    if cve_match:
+        cve_id = _normalize_cve_id(cve_match.group(0))
+        if "kev" in lowered or "known exploited" in lowered:
+            return {
+                "type": "tool",
+                "tool": "check_cisa_kev",
+                "args": {"cve_id": cve_id, "limit": 10, "refresh": False, "timeout": 12},
+                "why": "Check whether the supplied CVE is listed in CISA KEV.",
+            }
+        return {
+            "type": "tool",
+            "tool": "lookup_cve",
+            "args": {"cve_id": cve_id, "include_kev": True, "timeout": 15},
+            "why": "Look up the supplied CVE and enrich it with KEV status.",
+        }
+    hash_match = re.search(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b", text)
+    if hash_match:
+        return {
+            "type": "tool",
+            "tool": "lookup_malware_hash",
+            "args": {"file_hash": hash_match.group(0), "timeout": 15},
+            "why": "Enrich the supplied file hash through a defensive malware-intelligence lookup.",
+        }
+    if any(term in lowered for term in ("signature", "signatures", "yara")):
+        return {
+            "type": "tool",
+            "tool": "build_threat_intel_brief",
+            "args": {"indicator": text, "include_cve": True, "include_malware": True},
+            "why": "Build a safe threat-intelligence plan for malware signature work.",
+        }
+    return None
 
 
 def user_explicitly_requested_file_write(user_input: str) -> bool:
@@ -3087,6 +6848,49 @@ def run_agent(
     ]
     log_run_event("turn_started", {"input": user_input, "turn": state.turns_completed, "depth": depth})
 
+    direct_network_action = build_direct_network_tool_action(user_input)
+    if direct_network_action is not None and direct_network_action.get("tool") in tools.tools:
+        executed = execute_action(direct_network_action, tools, user_input=user_input)
+        final_content = summarize_tool_results_for_user(user_input, executed)
+        state.record_conversation_turn(user_input, final_content)
+        log_run_event(
+            "turn_finished_after_direct_network_tool",
+            {
+                "tools": [name for name, _ in executed],
+                "final": trim_text(final_content, 2000),
+                "depth": depth,
+            },
+        )
+        return final_content
+
+    direct_threat_action = build_direct_threat_intel_tool_action(user_input)
+    if direct_threat_action is not None and direct_threat_action.get("tool") in tools.tools:
+        executed = execute_action(direct_threat_action, tools, user_input=user_input)
+        final_content = summarize_tool_results_for_user(user_input, executed)
+        state.record_conversation_turn(user_input, final_content)
+        log_run_event(
+            "turn_finished_after_direct_threat_intel_tool",
+            {
+                "tools": [name for name, _ in executed],
+                "final": trim_text(final_content, 2000),
+                "depth": depth,
+            },
+        )
+        return final_content
+
+    direct_tool_inventory = build_direct_tool_inventory_response(user_input, tools)
+    if direct_tool_inventory is not None:
+        state.record_conversation_turn(user_input, direct_tool_inventory)
+        log_run_event(
+            "turn_finished_after_direct_tool_inventory",
+            {
+                "tool_count": len(tools.tool_specs),
+                "final": trim_text(direct_tool_inventory, 2000),
+                "depth": depth,
+            },
+        )
+        return direct_tool_inventory
+
     for step in range(1, step_limit + 1):
         reply = ask_model(messages, model=model, provider=provider, temperature=temperature)
         action = parse_model_reply(reply, tool_names=set(tools.tools))
@@ -3111,6 +6915,20 @@ def run_agent(
             why = action.get("why")
             if isinstance(why, str):
                 state.add_reflection(f"Successful action: {why}")
+
+        if should_finalize_after_tool_result(user_input, executed):
+            final_content = summarize_tool_results_for_user(user_input, executed)
+            state.record_conversation_turn(user_input, final_content)
+            log_run_event(
+                "turn_finished_after_tool_summary",
+                {
+                    "step": step,
+                    "tools": [name for name, _ in executed],
+                    "final": trim_text(final_content, 2000),
+                    "depth": depth,
+                },
+            )
+            return final_content
 
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": build_tool_feedback(executed, state)})
@@ -3165,6 +6983,16 @@ class AgentTools:
         add("show_role_telemetry", "Show role call history and success telemetry.", {}, TOOL_RISK_READ_ONLY, self.show_role_telemetry)
         add("recommend_team", "Recommend a small role team deterministically from task, context, templates, and telemetry.", {"task": "objective", "context": "optional context"}, TOOL_RISK_READ_ONLY, self.recommend_team)
         add("list_tool_specs", "List registered tools, schemas, and risk levels.", {}, TOOL_RISK_READ_ONLY, self.list_tool_specs)
+        add("audit_tool_coverage", "Audit registered tool coverage, recent tool reliability, and capability gaps for a goal.", {"objective": "optional objective", "include_specs": False}, TOOL_RISK_READ_ONLY, self.audit_tool_coverage)
+        add("recommend_tool_chain", "Recommend a safe ordered tool chain for an objective with gates, fallbacks, and validation steps.", {"objective": "user objective", "context": "optional context", "path": "."}, TOOL_RISK_READ_ONLY, self.recommend_tool_chain)
+        add("build_execution_dossier", "Build a compact execution dossier: context, team, tool chain, model route, acceptance criteria, and risks.", {"objective": "user objective", "path": ".", "context": "optional context", "limit": 5}, TOOL_RISK_READ_ONLY, self.build_execution_dossier)
+        add("inspect_tool_schema_health", "Audit registered tool schemas against callable signatures and flag schema/function drift.", {}, TOOL_RISK_READ_ONLY, self.inspect_tool_schema_health)
+        add("map_tool_capability_graph", "Map tools into capabilities, entrypoints, and recommended edges for a goal.", {"objective": "optional objective", "include_edges": True}, TOOL_RISK_READ_ONLY, self.map_tool_capability_graph)
+        add("mine_tool_usage_patterns", "Mine recent tool history and run logs for successful/failed tool-use patterns.", {"limit": 120}, TOOL_RISK_READ_ONLY, self.mine_tool_usage_patterns)
+        add("trace_goal_to_symbols", "Trace a natural-language goal to likely files, Python symbols, call impact, and search evidence.", {"objective": "user objective", "path": ".", "limit": 5}, TOOL_RISK_READ_ONLY, self.trace_goal_to_symbols)
+        add("build_validation_matrix", "Build a validation plan matrix for an objective and changed files without executing the checks.", {"objective": "user objective", "changed_files": [], "path": ".", "risk_level": ""}, TOOL_RISK_READ_ONLY, self.build_validation_matrix)
+        add("plan_patch_strategy", "Plan the smallest reversible patch strategy with targets, checkpoints, validation, and rollback gates.", {"objective": "user objective", "target_path": ".", "context": "optional context", "max_files": 3}, TOOL_RISK_READ_ONLY, self.plan_patch_strategy)
+        add("score_execution_readiness", "Score whether the agent has enough evidence, target clarity, validation, and rollback readiness to act.", {"objective": "user objective", "context": "optional context", "candidate": "", "changed_files": []}, TOOL_RISK_READ_ONLY, self.score_execution_readiness)
         add("decompose_goal", "Infer task intent, risk, roles, tools, acceptance criteria, and a first execution plan.", {"goal": "user objective", "context": "optional context"}, TOOL_RISK_READ_ONLY, self.decompose_goal)
         add("build_context_pack", "Build a compact situational context pack from memory, profile, blackboard, tasks, git, recent files, TODOs, and code intelligence.", {"objective": "user objective", "path": ".", "limit": 8}, TOOL_RISK_READ_ONLY, self.build_context_pack)
         add("manager_policy", "Choose a direct, single-agent, or team execution strategy.", {"task": "user objective", "context": "optional context"}, TOOL_RISK_AGENTIC, self.manager_policy)
@@ -3195,6 +7023,85 @@ class AgentTools:
         add("clear_blackboard", "Clear the shared blackboard.", {}, TOOL_RISK_MEMORY, self.clear_blackboard)
         add("show_config", "Show the active agent configuration.", {}, TOOL_RISK_READ_ONLY, self.show_config)
         add("list_llm_routes", "Show configured LLM providers and role-to-provider/model routing.", {}, TOOL_RISK_READ_ONLY, self.list_llm_routes)
+        add("show_model_router", "Show token-aware model-router thresholds and route targets.", {}, TOOL_RISK_READ_ONLY, self.show_model_router)
+        add("validate_model_router_config", "Validate model-router routes, budgets, providers, and compaction settings.", {}, TOOL_RISK_READ_ONLY, self.validate_model_router_config)
+        add("recommend_model_route", "Estimate prompt size and show which provider/model route would be used without calling a model.", {"prompt": "text to estimate", "path": "optional/file.py", "role": "optional role", "provider": "optional provider", "model": "optional model"}, TOOL_RISK_READ_ONLY, self.recommend_model_route)
+        add("list_available_models", "List configured, cached, and static model options across providers without making live API calls unless refresh=true.", {"provider": "", "refresh": False, "include_static": True, "limit": 200}, TOOL_RISK_READ_ONLY, self.list_available_models)
+        add("discover_available_models", "Call provider model-list APIs, cache live model ids, and report missing credentials or discovery errors.", {"provider": "", "save": True, "timeout": 12}, TOOL_RISK_READ_ONLY, self.discover_available_models)
+        add("recommend_model_selection", "Score available models for a role/objective/context requirement and recommend the best provider/model choices.", {"objective": "task objective", "role": "", "provider": "", "required_context_tokens": 0, "prefer": "", "limit": 8, "refresh": False}, TOOL_RISK_READ_ONLY, self.recommend_model_selection)
+        add("build_model_portfolio", "Recommend a multi-role model portfolio for fast, coding, reasoning, long-context, local, and open-weight needs.", {"objective": "overall workload", "refresh": False}, TOOL_RISK_READ_ONLY, self.build_model_portfolio)
+        add("set_model_selection", "Persist a selected provider/model to the default route, a role route, or a model-router route.", {"provider": "openai", "model": "gpt-4.1", "scope": "default|role|router", "role": "", "route_name": "", "allow_unknown": False}, TOOL_RISK_CONTROL, self.set_model_selection)
+        add("configure_llm_provider", "Add or update a configurable LLM provider, including OpenAI-compatible endpoints for new vendors.", {"name": "provider_name", "provider_type": "openai_compatible", "base_url": "https://...", "api_key_env": "PROVIDER_API_KEY", "model": "", "model_list_endpoint": "", "overwrite": False}, TOOL_RISK_CONTROL, self.configure_llm_provider)
+        add("route_multi_model_task", "Plan a multi-model execution strategy by assigning providers/models to roles and execution phases.", {"objective": "task objective", "path": ".", "prefer": "", "required_context_tokens": 0, "refresh": False}, TOOL_RISK_READ_ONLY, self.route_multi_model_task)
+        add("inspect_runtime_environment", "Inspect Python/runtime/provider environment readiness without exposing secret values.", {"include_packages": True, "include_env": True}, TOOL_RISK_READ_ONLY, self.inspect_runtime_environment)
+        add("audit_dependency_health", "Audit Python imports, optional packages, and dependency-file health for the workspace.", {"path": ".", "recursive": True, "limit": 200}, TOOL_RISK_READ_ONLY, self.audit_dependency_health)
+        add("inspect_prompt_surface", "Audit manager, role, quality, and self-improvement prompts for size, tool mentions, and instruction drift.", {"include_snippets": False}, TOOL_RISK_READ_ONLY, self.inspect_prompt_surface)
+        add("build_context_budget_plan", "Plan prompt/context packing against a model input budget before sending large files or dossiers to an LLM.", {"objective": "task objective", "path": ".", "role": "planner", "provider": "", "model": "", "max_input_tokens": 0}, TOOL_RISK_READ_ONLY, self.build_context_budget_plan)
+        add("propose_test_plan_for_symbol", "Propose targeted validation and regression tests for a Python symbol or file without writing tests.", {"symbol": "function_or_class", "path": ".", "objective": "optional objective", "limit": 8}, TOOL_RISK_READ_ONLY, self.propose_test_plan_for_symbol)
+        add("simulate_tool_execution_plan", "Dry-run a recommended tool sequence and report preconditions, gates, fallbacks, and expected evidence.", {"objective": "task objective", "path": ".", "context": ""}, TOOL_RISK_READ_ONLY, self.simulate_tool_execution_plan)
+        add("build_risk_register", "Build a risk register for an objective with likelihood, impact, mitigations, owners, and validation gates.", {"objective": "task objective", "path": ".", "context": "", "changed_files": []}, TOOL_RISK_READ_ONLY, self.build_risk_register)
+        add("map_repository_structure", "Map repository directories, extension mix, important files, and likely architecture boundaries.", {"path": ".", "max_depth": 3, "include_hidden": False}, TOOL_RISK_READ_ONLY, self.map_repository_structure)
+        add("inspect_project_entrypoints", "Find runnable entrypoints, CLI guards, scripts, app factories, and common project launch files.", {"path": ".", "recursive": True, "limit": 120}, TOOL_RISK_READ_ONLY, self.inspect_project_entrypoints)
+        add("extract_api_surface", "Extract public functions/classes, signatures, docstrings, and module surface from Python files.", {"path": ".", "recursive": True, "include_private": False, "limit": 120}, TOOL_RISK_READ_ONLY, self.extract_api_surface)
+        add("trace_data_flow", "Approximate data/control flow for a symbol or objective using static Python AST analysis.", {"objective": "task objective", "symbol": "", "path": ".", "limit": 8}, TOOL_RISK_READ_ONLY, self.trace_data_flow)
+        add("inspect_error_log", "Parse a traceback or log file/text into exception, frames, missing modules, and likely next checks.", {"path": "", "text": "", "limit": 40}, TOOL_RISK_READ_ONLY, self.inspect_error_log)
+        add("inspect_config_surface", "Inventory config/env/build files and redact secret-like values before previewing them.", {"path": ".", "include_preview": True, "preview_lines": 8}, TOOL_RISK_READ_ONLY, self.inspect_config_surface)
+        add("fetch_url_text", "Fetch bounded text from an HTTP(S) URL for documentation/research, denying local/private hosts unless allowed.", {"url": "https://example.com", "max_chars": 6000, "timeout": 10, "allow_local": False}, TOOL_RISK_READ_ONLY, self.fetch_url_text)
+        add("inspect_http_endpoint", "Inspect HTTP(S) endpoint status and headers without downloading the full body.", {"url": "https://example.com", "timeout": 10, "allow_local": False}, TOOL_RISK_READ_ONLY, self.inspect_http_endpoint)
+        add("fetch_json_api", "Call a bounded JSON HTTP(S) API endpoint with SSRF guardrails, optional POST body, and parsed JSON output.", {"url": "https://api.example.com/data", "method": "GET", "headers": {}, "body": {}, "max_chars": 20000, "timeout": 10, "allow_local": False}, TOOL_RISK_READ_ONLY, self.fetch_json_api)
+        add("extract_html_metadata", "Fetch bounded HTML and extract title, meta tags, canonical URL, headings, and normalized links with SSRF guardrails.", {"url": "https://example.com", "max_chars": 100000, "timeout": 10, "allow_local": False, "link_limit": 100}, TOOL_RISK_READ_ONLY, self.extract_html_metadata)
+        add("check_http_security_headers", "Evaluate common HTTP security headers for an endpoint and return missing/weak controls.", {"url": "https://example.com", "timeout": 10, "allow_local": False}, TOOL_RISK_READ_ONLY, self.check_http_security_headers)
+        add("crawl_url_map", "Perform a bounded same-host crawl and build a small URL/title/status/link map with SSRF guardrails.", {"start_url": "https://example.com", "max_pages": 10, "max_depth": 1, "timeout": 10, "allow_local": False, "same_host_only": True}, TOOL_RISK_READ_ONLY, self.crawl_url_map)
+        add("infer_json_schema", "Infer a compact structural schema from a workspace JSON or JSONL file, or from provided JSON text.", {"path": "data.json", "json_text": "", "max_items": 1000, "max_depth": 6}, TOOL_RISK_READ_ONLY, self.infer_json_schema)
+        add("extract_text_entities", "Extract URLs, emails, IPs, CVEs, hashes, and redacted secret-like strings from workspace text files.", {"path": ".", "recursive": True, "entity_types": [], "limit": 200, "max_file_chars": 200000}, TOOL_RISK_READ_ONLY, self.extract_text_entities)
+        add("generate_file_manifest", "Generate a bounded file inventory with sizes, mtimes, MIME guesses, extensions, and optional SHA256 hashes.", {"path": ".", "recursive": True, "include_hashes": True, "max_files": 500, "max_bytes_per_hash": 10485760}, TOOL_RISK_READ_ONLY, self.generate_file_manifest)
+        add("compare_workspace_files", "Compare two workspace files with hashes and a bounded unified diff for text files.", {"left_path": "old.txt", "right_path": "new.txt", "max_chars": 20000}, TOOL_RISK_READ_ONLY, self.compare_workspace_files)
+        add("inspect_python_environment", "Inspect the active Python runtime, virtual environment, import path, and installed packages without exposing secrets.", {"include_packages": True, "include_env": False, "package_limit": 200}, TOOL_RISK_READ_ONLY, self.inspect_python_environment)
+        add("inspect_process_table", "Inspect a bounded local process table using OS diagnostics, with optional filtering and command-line redaction.", {"filter": "", "limit": 100, "include_command": False}, TOOL_RISK_READ_ONLY, self.inspect_process_table)
+        add("profile_csv_file", "Profile a workspace CSV/TSV file: columns, missing values, numeric ranges, samples, and row counts.", {"path": "data.csv", "delimiter": "", "sample_rows": 5, "max_rows": 10000}, TOOL_RISK_READ_ONLY, self.profile_csv_file)
+        add("inspect_jsonl_file", "Inspect a JSONL/NDJSON log file and summarize keys, parse errors, samples, and value type frequencies.", {"path": "events.jsonl", "limit": 5000, "sample_rows": 5}, TOOL_RISK_READ_ONLY, self.inspect_jsonl_file)
+        add("query_sqlite_database", "Run a read-only SELECT/WITH/PRAGMA query against a workspace SQLite database and return bounded rows.", {"path": "data.db", "query": "SELECT name FROM sqlite_master", "limit": 100, "timeout": 5}, TOOL_RISK_READ_ONLY, self.query_sqlite_database)
+        add("inspect_archive_file", "Inventory a ZIP/TAR archive without extracting it, including size totals and path-traversal warnings.", {"path": "archive.zip", "limit": 200}, TOOL_RISK_READ_ONLY, self.inspect_archive_file)
+        add("extract_pdf_text", "Extract bounded text from a workspace PDF using pypdf/PyPDF2 when available; no OCR or image parsing.", {"path": "document.pdf", "max_pages": 10, "max_chars": 20000}, TOOL_RISK_READ_ONLY, self.extract_pdf_text)
+        add("inspect_image_metadata", "Inspect basic image metadata and optional EXIF using Pillow when available without modifying the image.", {"path": "image.png", "include_exif": False}, TOOL_RISK_READ_ONLY, self.inspect_image_metadata)
+        add("list_external_tools", "List safe external command tools declared in .agent_external_tools.json so Cerebro can use local scanners and CLIs deliberately.", {"manifest_path": ".agent_external_tools.json"}, TOOL_RISK_READ_ONLY, self.list_external_tools)
+        add("run_external_tool", "Run a manifest-declared external command tool with no shell, bounded timeout, workspace path guards, and authorization gates.", {"tool_name": "bandit_scan", "args": {"path": "."}, "manifest_path": ".agent_external_tools.json", "authorized": False, "timeout": 30}, TOOL_RISK_RUN_COMMAND, self.run_external_tool)
+        add("normalize_network_target", "Normalize a hostname, URL, IP address, or CIDR and classify network safety properties.", {"target": "example.com", "resolve": False, "allow_private": False}, TOOL_RISK_READ_ONLY, self.normalize_network_target)
+        add("resolve_dns_records", "Resolve A/AAAA records for a hostname with private-address guardrails.", {"target": "example.com", "record_type": "A", "allow_private": False, "timeout": 5}, TOOL_RISK_READ_ONLY, self.resolve_dns_records)
+        add("reverse_dns_lookup", "Perform reverse DNS/PTR lookup for one IP address.", {"ip": "8.8.8.8", "allow_private": False}, TOOL_RISK_READ_ONLY, self.reverse_dns_lookup)
+        add("lookup_ip_rdap", "Look up public IP network registration and ASN hints through RDAP.", {"target": "8.8.8.8", "timeout": 10}, TOOL_RISK_READ_ONLY, self.lookup_ip_rdap)
+        add("lookup_ip_geolocation", "Look up public IP geolocation, ASN/org, and ISP-like metadata using bounded public APIs.", {"target": "8.8.8.8", "timeout": 10}, TOOL_RISK_READ_ONLY, self.lookup_ip_geolocation)
+        add("get_public_ip_info", "Discover this machine's public IP and optionally enrich it with geolocation/ASN data.", {"enrich": True, "timeout": 10}, TOOL_RISK_READ_ONLY, self.get_public_ip_info)
+        add("scan_tcp_ports", "Perform a bounded TCP connect scan against a single authorized host; public targets require allow_public=true.", {"target": "127.0.0.1", "ports": "22,80,443", "timeout": 0.5, "allow_public": False, "max_ports": 32}, TOOL_RISK_RUN_COMMAND, self.scan_tcp_ports)
+        add("inspect_local_listening_ports", "Inspect TCP/UDP ports currently listening on this machine using bounded local OS diagnostics; this is not a LAN sweep.", {"include_udp": True, "include_process_names": True, "limit": 100}, TOOL_RISK_READ_ONLY, self.inspect_local_listening_ports)
+        add("inspect_tls_certificate", "Inspect a TLS certificate and handshake metadata for a host/port without saving certificate material.", {"target": "example.com", "port": 443, "server_name": "", "timeout": 5, "allow_private": False}, TOOL_RISK_READ_ONLY, self.inspect_tls_certificate)
+        add("inspect_local_network", "Inspect local hostname, addresses, resolver hints, and optional bounded OS network command output.", {"include_command_output": False}, TOOL_RISK_READ_ONLY, self.inspect_local_network)
+        add("start_control_server", "Start a localhost-only authenticated control server for trusted agent clients; no shell or payload execution.", {"host": "", "port": 0, "authorized": False}, TOOL_RISK_CONTROL, self.start_control_server)
+        add("show_control_server", "Show status, safe command types, and authenticated connected clients for the control server.", {}, TOOL_RISK_READ_ONLY, self.show_control_server)
+        add("route_control_command", "Route an allow-listed JSON coordination command to connected trusted clients.", {"command_type": "ping", "payload": {}, "target_ids": []}, TOOL_RISK_CONTROL, self.route_control_command)
+        add("stop_control_server", "Stop the control server and disconnect clients.", {}, TOOL_RISK_CONTROL, self.stop_control_server)
+        add("build_network_intel_brief", "Build a safe network intelligence brief and recommended probe sequence for an IP/domain/URL.", {"target": "example.com", "include_scan_plan": True, "allow_public_scan": False}, TOOL_RISK_READ_ONLY, self.build_network_intel_brief)
+        add("ingest_network_traffic_file", "Ingest a workspace PCAP/Suricata EVE/Zeek conn.log/CSV/JSONL/text traffic source into normalized metadata-only flow records.", {"path": "traffic.pcap", "input_format": "auto", "limit": 5000}, TOOL_RISK_READ_ONLY, self.ingest_network_traffic_file)
+        add("analyze_network_traffic_file", "Analyze normalized network traffic records with IDS-style heuristics and optional baseline comparison.", {"path": "traffic.pcap", "input_format": "auto", "limit": 5000, "baseline_path": "", "sensitivity": "medium", "record_alerts": True}, TOOL_RISK_MEMORY, self.analyze_network_traffic_file)
+        add("build_ids_baseline", "Build and save a simple IDS baseline from known-good traffic metadata.", {"path": "known_good.pcap", "input_format": "auto", "label": "home-network-baseline", "limit": 10000, "baseline_path": ".agent_ids_baseline.json"}, TOOL_RISK_MEMORY, self.build_ids_baseline)
+        add("compare_network_baseline", "Compare a traffic source against a saved IDS baseline and report deviations.", {"path": "current.pcap", "input_format": "auto", "baseline_path": ".agent_ids_baseline.json", "limit": 10000, "sensitivity": "medium", "record_alerts": True}, TOOL_RISK_MEMORY, self.compare_network_baseline)
+        add("capture_network_metadata_sample", "Capture a short live network metadata sample using tshark when explicitly authorized; stores metadata only, no payloads.", {"interface": "", "duration_seconds": 15, "max_packets": 200, "output_path": ".agent_ids_captures/sample.jsonl", "authorized": False}, TOOL_RISK_RUN_COMMAND, self.capture_network_metadata_sample)
+        add("build_ids_mode_plan", "Build a defensive IDS-mode plan for offline log ingestion or explicitly authorized live metadata capture.", {"mode": "offline", "source_path": "", "duration_seconds": 30, "interface": "", "authorized": False}, TOOL_RISK_READ_ONLY, self.build_ids_mode_plan)
+        add("show_ids_alerts", "Show recent IDS-style alerts recorded by network traffic analysis tools.", {"limit": 20, "min_severity": "info"}, TOOL_RISK_READ_ONLY, self.show_ids_alerts)
+        add("lookup_cve", "Look up one CVE in NVD and optionally enrich it with CISA KEV known-exploited status.", {"cve_id": "CVE-2024-3094", "include_kev": True, "timeout": 15}, TOOL_RISK_READ_ONLY, self.lookup_cve)
+        add("search_cves", "Search NVD CVEs by keyword, CPE, severity, publication window, or last-modified window with optional KEV enrichment.", {"keyword": "OpenSSH", "cpe_name": "", "cvss_severity": "", "published_days": 0, "modified_days": 0, "limit": 20, "include_kev": True, "timeout": 15}, TOOL_RISK_READ_ONLY, self.search_cves)
+        add("check_cisa_kev", "Search the CISA Known Exploited Vulnerabilities catalog by CVE, vendor, product, or keyword.", {"cve_id": "", "vendor": "", "product": "", "keyword": "", "limit": 50, "refresh": False, "timeout": 12}, TOOL_RISK_READ_ONLY, self.check_cisa_kev)
+        add("lookup_malware_hash", "Query MalwareBazaar for metadata about a file hash without downloading malware samples.", {"file_hash": "sha256/md5/sha1", "timeout": 15}, TOOL_RISK_READ_ONLY, self.lookup_malware_hash)
+        add("hash_workspace_file", "Calculate MD5/SHA1/SHA256 for a workspace file and optionally look up the SHA256 in MalwareBazaar.", {"path": "sample.bin", "lookup_malware_bazaar": False, "timeout": 15}, TOOL_RISK_READ_ONLY, self.hash_workspace_file)
+        add("list_crypto_algorithms", "List supported encryption/decryption algorithms, availability, formats, and security notes.", {}, TOOL_RISK_READ_ONLY, self.list_crypto_algorithms)
+        add("encrypt_text", "Encrypt UTF-8 text, base64 data, or hex data into a portable authenticated crypto envelope.", {"data": "secret text", "algorithm": "aesgcm", "passphrase": "", "key_b64": "", "input_format": "text", "associated_data": "", "iterations": 390000}, TOOL_RISK_READ_ONLY, self.encrypt_text)
+        add("decrypt_text", "Decrypt a Cerebro crypto envelope and return text, base64, or hex output.", {"encrypted_text": "cerebro.crypto.v1:...", "passphrase": "", "key_b64": "", "output_format": "text", "associated_data": ""}, TOOL_RISK_READ_ONLY, self.decrypt_text)
+        add("encrypt_file", "Encrypt a workspace file into a portable authenticated crypto envelope file.", {"input_path": "secret.bin", "output_path": "", "algorithm": "aesgcm", "passphrase": "", "key_b64": "", "associated_data": "", "iterations": 390000, "overwrite": False, "max_bytes": 52428800}, TOOL_RISK_WRITE_FILE, self.encrypt_file)
+        add("decrypt_file", "Decrypt a workspace crypto envelope file back to bytes.", {"input_path": "secret.bin.cenc", "output_path": "", "passphrase": "", "key_b64": "", "associated_data": "", "overwrite": False, "max_bytes": 52428800}, TOOL_RISK_WRITE_FILE, self.decrypt_file)
+        add("add_malware_signature", "Add or update a local defensive malware signature for string, regex, hex, hash, or YARA matching.", {"name": "signature name", "pattern": "pattern", "signature_type": "string", "severity": "medium", "tags": [], "description": "", "source": "local", "overwrite": False, "signature_path": ""}, TOOL_RISK_MEMORY, self.add_malware_signature)
+        add("scan_workspace_file_signatures", "Scan workspace file(s) with local malware signatures and optional yara-python support; never executes suspect files.", {"path": "sample.bin", "signature_path": "", "recursive": False, "max_files": 50, "max_bytes_per_file": 5242880, "use_yara": True}, TOOL_RISK_READ_ONLY, self.scan_workspace_file_signatures)
+        add("build_threat_intel_brief", "Build a defensive threat-intelligence brief and recommended tool sequence for a CVE, hash, product, or malware-signature task.", {"indicator": "CVE/hash/product/signature goal", "include_cve": True, "include_malware": True}, TOOL_RISK_READ_ONLY, self.build_threat_intel_brief)
+        add("build_toolbox_brief", "Recommend the most useful tool groups and next probes for a goal, including sub-agent usage guidance.", {"objective": "task objective", "path": "."}, TOOL_RISK_READ_ONLY, self.build_toolbox_brief)
         add("show_workspace_stats", "Summarize workspace file counts, sizes, and extension mix.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.show_workspace_stats)
         add("show_run_history", "Summarize recent run-log events.", {"limit": 20}, TOOL_RISK_READ_ONLY, self.show_run_history)
         add("index_codebase", "Index Python symbols in workspace files.", {"path": ".", "recursive": True}, TOOL_RISK_READ_ONLY, self.index_codebase)
@@ -3224,6 +7131,10 @@ class AgentTools:
         add("show_cycle_ledger", "Show the persistent self-improvement cycle ledger.", {"limit": 10}, TOOL_RISK_READ_ONLY, self.show_cycle_ledger)
         add("generate_health_report", "Summarize platform health, risks, and recommended next improvements.", {"goal": "improve this codebase"}, TOOL_RISK_READ_ONLY, self.generate_health_report)
         add("generate_planning_brief", "Generate a pre-flight execution brief for the next autonomous improvement.", {"goal": "improve this codebase"}, TOOL_RISK_READ_ONLY, self.generate_planning_brief)
+        add("scan_workspace_secrets", "Scan workspace text files for likely exposed credentials, private keys, tokens, and high-entropy secret candidates with redacted evidence.", {"path": ".", "recursive": True, "max_files": 200, "max_bytes_per_file": 1048576, "include_low_confidence": False}, TOOL_RISK_READ_ONLY, self.scan_workspace_secrets)
+        add("build_workspace_snapshot", "Build a compact operational snapshot of files, code surface, tool registry, config posture, and recent state without modifying files.", {"path": ".", "recursive": True, "max_files": 250, "include_hashes": False}, TOOL_RISK_READ_ONLY, self.build_workspace_snapshot)
+        add("analyze_unified_diff_impact", "Analyze a unified diff or current git diff for changed files, risk signals, touched Python symbols, and recommended validation steps.", {"diff": "", "path": ".", "max_diff_chars": 40000}, TOOL_RISK_READ_ONLY, self.analyze_unified_diff_impact)
+        add("create_diagnostic_bundle", "Write a redacted diagnostic JSON bundle with workspace snapshot, tool schema health, config posture, run history, and validation hints.", {"path": ".", "output_path": ".agent_diagnostics/latest_diagnostic_bundle.json", "max_files": 200}, TOOL_RISK_WRITE_FILE, self.create_diagnostic_bundle)
         add("run_internal_self_tests", "Run deterministic internal checks for parser, registry, policy, and planning invariants.", {}, TOOL_RISK_READ_ONLY, self.run_internal_self_tests)
         add("update_plan", "Replace the current in-memory plan.", {"items": ["step 1", "step 2"]}, TOOL_RISK_MEMORY, self.update_plan)
         add("show_plan", "Show the current in-memory plan.", {}, TOOL_RISK_READ_ONLY, self.show_plan)
@@ -3831,6 +7742,5090 @@ class AgentTools:
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
+    def audit_tool_coverage(self, objective: str = "", include_specs: bool = False) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        profile = infer_task_profile(objective_text) if objective_text else {}
+
+        risk_counts: dict[str, int] = {}
+        capability_keywords = {
+            "workspace_io": {"file", "path", "read", "write", "append", "replace", "diff", "json"},
+            "search_and_context": {"search", "context", "semantic", "relevant", "recent", "todo"},
+            "code_intelligence": {"code", "symbol", "graph", "call", "complexity", "import", "duplicate", "hotspot", "orphan", "refactor"},
+            "planning_and_strategy": {"plan", "dossier", "chain", "strategy", "decompose", "readiness", "matrix", "coverage"},
+            "validation": {"validate", "test", "pytest", "ruff", "smoke", "policy", "readiness"},
+            "tooling_intelligence": {"tool", "schema", "capability", "coverage", "usage", "chain", "dossier"},
+            "autonomy": {"self", "improve", "cycle", "checkpoint", "rollback", "experiment", "learning", "planning", "health"},
+            "collaboration": {"team", "role", "subagent", "manager", "meta", "quality", "disagreement"},
+            "state_and_memory": {"memory", "profile", "task", "blackboard", "history", "ledger", "config"},
+            "model_routing": {"model", "provider", "route", "router", "llm", "token"},
+        }
+        capabilities: dict[str, list[str]] = {name: [] for name in capability_keywords}
+        tool_rows: list[dict[str, Any]] = []
+        for name, spec in sorted(self.tool_specs.items()):
+            risk_counts[spec.risk] = risk_counts.get(spec.risk, 0) + 1
+            haystack = f"{name} {spec.description}".lower()
+            matched_caps: list[str] = []
+            for capability, keywords in capability_keywords.items():
+                if any(keyword in haystack for keyword in keywords):
+                    capabilities[capability].append(name)
+                    matched_caps.append(capability)
+            row = {
+                "name": name,
+                "risk": spec.risk,
+                "capabilities": matched_caps,
+            }
+            if include_specs:
+                row["description"] = spec.description
+                row["schema"] = spec.schema
+            tool_rows.append(row)
+
+        recent = self.state.tool_history[-80:]
+        by_tool: dict[str, dict[str, Any]] = {}
+        for event in recent:
+            tool_name = str(event.get("tool", ""))
+            if not tool_name:
+                continue
+            stats = by_tool.setdefault(tool_name, {"calls": 0, "successes": 0, "failures": 0, "last_ok": None, "last_preview": ""})
+            stats["calls"] += 1
+            if event.get("ok"):
+                stats["successes"] += 1
+            else:
+                stats["failures"] += 1
+            stats["last_ok"] = bool(event.get("ok"))
+            stats["last_preview"] = trim_text(str(event.get("preview", "")), 180)
+        for stats in by_tool.values():
+            stats["success_rate"] = round(stats["successes"] / max(1, stats["calls"]), 3)
+
+        suggested_tools = profile.get("suggested_tools", []) if profile else []
+        missing_suggested_tools = [tool for tool in suggested_tools if tool not in self.tools]
+        capability_gaps = [name for name, tools in capabilities.items() if not tools]
+
+        recommendations: list[str] = []
+        if objective_text:
+            recommendations.append("Use recommend_tool_chain for the concrete ordered tool sequence before acting.")
+        if any(item.get("failures", 0) for item in by_tool.values()):
+            recommendations.append("Recent tool failures exist; prefer lower-risk read-only probes before write or command tools.")
+        if "validation" not in capability_gaps:
+            recommendations.append("Validation coverage is available; every code edit should finish with a compile/smoke/policy check.")
+        if "code_intelligence" not in capability_gaps:
+            recommendations.append("Code intelligence tools are available; use symbol impact and hotspots before refactoring shared helpers.")
+        if not recommendations:
+            recommendations.append("Tool registry looks broad enough for normal agentic coding and analysis work.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "task_profile": profile,
+            "tool_count": len(self.tool_specs),
+            "risk_counts": risk_counts,
+            "capabilities": {name: sorted(tools) for name, tools in capabilities.items()},
+            "capability_gaps": capability_gaps,
+            "suggested_tools": suggested_tools,
+            "missing_suggested_tools": missing_suggested_tools,
+            "recent_tool_reliability": by_tool,
+            "least_recent_or_unused_tools": [name for name in sorted(self.tools) if name not in by_tool][:20],
+            "recommendations": recommendations,
+            "tools": tool_rows if include_specs else [row["name"] for row in tool_rows],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def recommend_tool_chain(self, objective: str, context: str = "", path: str = ".") -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        context_text = str(context or "")
+        scope = workspace_relative(resolve_workspace_path(path))
+        profile = infer_task_profile(f"{objective_text}\n{context_text}")
+        intents = set(profile.get("intents", []))
+        write_intent = bool(profile.get("write_intent"))
+        risk_level = str(profile.get("risk_level", "low"))
+
+        phases: list[dict[str, Any]] = []
+
+        def add_phase(name: str, purpose: str, tools: list[str], gate: str = "", fallback: str = "") -> None:
+            available_tools = [tool for tool in tools if tool in self.tools]
+            missing_tools = [tool for tool in tools if tool not in self.tools]
+            phases.append(
+                {
+                    "phase": len(phases) + 1,
+                    "name": name,
+                    "purpose": purpose,
+                    "tools": available_tools,
+                    "missing_tools": missing_tools,
+                    "gate": gate,
+                    "fallback": fallback,
+                }
+            )
+
+        add_phase(
+            "profile_and_scope",
+            "Classify intent, estimate risk, and gather a compact workspace briefing before choosing edits.",
+            ["decompose_goal", "audit_tool_coverage", "map_tool_capability_graph", "mine_tool_usage_patterns", "build_context_pack"],
+            "Proceed only after the objective, path scope, and risk level are explicit.",
+        )
+
+        if "analysis" in intents or "conversation" in intents:
+            add_phase(
+                "evidence_search",
+                "Find relevant files, memory, code symbols, TODOs, and recent workspace evidence.",
+                ["semantic_search_workspace", "find_relevant_code_context", "trace_goal_to_symbols", "search_files", "summarize_python_file"],
+                "Cite exact files/symbols in the next decision; do not guess from filenames alone.",
+            )
+
+        if "network_intelligence" in intents:
+            add_phase(
+                "network_reconnaissance",
+                "Classify the network target, resolve addresses, enrich public IP ownership/context, and gate any active checks.",
+                ["build_network_intel_brief", "normalize_network_target", "resolve_dns_records", "reverse_dns_lookup", "lookup_ip_rdap", "lookup_ip_geolocation", "inspect_tls_certificate", "scan_tcp_ports"],
+                "Active port checks require clear authorization; public targets require allow_public=true and bounded port lists.",
+                "If active checks are not authorized, return a passive DNS/RDAP/GeoIP brief only.",
+            )
+            if any(term in objective_text.lower() for term in ["ids", "traffic", "packet", "pcap", "suricata", "zeek", "flow", "flows", "intrusion", "beacon", "anomaly"]):
+                add_phase(
+                    "ids_traffic_analysis",
+                    "Ingest traffic metadata, normalize flows, generate IDS-style alerts, and optionally compare against a known-good baseline.",
+                    ["build_ids_mode_plan", "ingest_network_traffic_file", "analyze_network_traffic_file", "build_ids_baseline", "compare_network_baseline", "show_ids_alerts", "capture_network_metadata_sample"],
+                    "Live capture requires explicit authorization and remains bounded, metadata-only, and local to owned/authorized networks.",
+                    "If live capture is unavailable, analyze PCAP/Suricata EVE/Zeek/CSV/JSONL files offline.",
+                )
+
+        if "debug" in intents:
+            add_phase(
+                "failure_localization",
+                "Localize the failure before editing by combining static symbol context with safe validation.",
+                ["trace_goal_to_symbols", "find_relevant_code_context", "analyze_symbol_impact", "run_python_smoke_test", "validate_python_file"],
+                "A fix is not ready until the failure surface or likely failing symbol is named.",
+                "If the bug cannot be reproduced, produce a minimal diagnostic plan instead of editing broadly.",
+            )
+
+        if "implementation" in intents:
+            add_phase(
+                "feature_slice",
+                "Select the smallest useful implementation slice and identify impacted symbols.",
+                ["trace_goal_to_symbols", "find_relevant_code_context", "analyze_symbol_impact", "plan_patch_strategy", "recommend_team"],
+                "Only edit after the target file and acceptance criteria are known.",
+            )
+
+        if "refactoring" in intents:
+            add_phase(
+                "refactor_safety",
+                "Measure blast radius and hotspot risk before moving or rewriting code.",
+                ["build_code_graph", "rank_code_hotspots", "trace_goal_to_symbols", "analyze_symbol_impact", "find_callers"],
+                "Do not refactor a high fan-in helper without a validation plan and rollback point.",
+            )
+
+        if write_intent:
+            add_phase(
+                "rollback_and_patch",
+                "Create rollback readiness, then apply the smallest reversible edit.",
+                ["plan_patch_strategy", "create_checkpoint", "read_file", "apply_unified_diff", "replace_in_file"],
+                "Use apply_unified_diff or exact replacement; avoid broad rewrites unless explicitly requested.",
+                "If a patch fails, read the file around the target and retry with a narrower diff.",
+            )
+
+        if "autonomy" in intents:
+            add_phase(
+                "autonomy_governance",
+                "Use health, planning, cycle ledger, and policy before starting or continuing self-improvement loops.",
+                ["generate_health_report", "generate_planning_brief", "show_cycle_ledger", "self_improve_codebase"],
+                "Autonomous loops must remain interruptible and cannot recursively call self_improve_codebase.",
+            )
+
+        if "validation" in intents or write_intent or risk_level != "low":
+            add_phase(
+                "validation_and_policy",
+                "Validate behavior, summarize change impact, and check autonomy policy when risk is elevated.",
+                ["build_validation_matrix", "validate_python_file", "validate_workspace_python", "run_self_improvement_validation", "analyze_change_impact", "evaluate_autonomy_policy", "git_diff", "score_execution_readiness"],
+                "Final answer must report what validation proves and what remains untested.",
+                "If validation or policy fails, restore checkpoint or report the exact blocking condition.",
+            )
+
+        add_phase(
+            "final_synthesis",
+            "Produce a concise final result with files changed, evidence, risks, and next action.",
+            ["score_execution_readiness", "quality_gate", "meta_review", "show_history"],
+            "Finish with a user-visible answer, not raw tool JSON.",
+        )
+
+        flattened_tools: list[str] = []
+        for phase in phases:
+            for tool in phase.get("tools", []):
+                if tool not in flattened_tools:
+                    flattened_tools.append(tool)
+
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "task_profile": profile,
+            "phases": phases,
+            "tool_sequence": flattened_tools,
+            "risk_controls": {
+                "write_intent": write_intent,
+                "risk_level": risk_level,
+                "requires_checkpoint": write_intent or "autonomy" in intents,
+                "requires_policy_check": write_intent or risk_level != "low" or "autonomy" in intents,
+                "requires_validation": write_intent or bool({"debug", "implementation", "refactoring", "validation", "autonomy"}.intersection(intents)),
+            },
+            "decision_rules": [
+                "Use read-only probes first unless the user explicitly requested file changes.",
+                "Escalate from direct execution to team execution when architecture, policy, or validation could disagree.",
+                "Prefer one small patch plus validation over a large patch with uncertain blast radius.",
+                "After any failed tool call, retry with a narrower input or switch to a lower-risk diagnostic tool.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_execution_dossier(self, objective: str, path: str = ".", context: str = "", limit: int = 5) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        limit = max(1, min(int(limit), 12))
+        scope = workspace_relative(resolve_workspace_path(path))
+
+        decomposition = self.decompose_goal(goal=objective_text, context=context)
+        tool_chain = self.recommend_tool_chain(objective=objective_text, context=context, path=scope)
+        team = self.recommend_team(task=objective_text, context=context)
+        context_pack = self.build_context_pack(objective=objective_text, path=scope, limit=limit)
+        audit = self.audit_tool_coverage(objective=objective_text, include_specs=False)
+        tool_schema_health = self.inspect_tool_schema_health()
+        capability_graph = self.map_tool_capability_graph(objective=objective_text, include_edges=True)
+        symbol_trace = self.trace_goal_to_symbols(objective=objective_text, path=scope, limit=limit)
+        patch_strategy = self.plan_patch_strategy(objective=objective_text, target_path=scope, context=context, max_files=limit)
+        validation_matrix = self.build_validation_matrix(objective=objective_text, changed_files=patch_strategy.meta.get("candidate_files", []) if patch_strategy.ok else [], path=scope)
+        readiness = self.score_execution_readiness(objective=objective_text, context=context, changed_files=patch_strategy.meta.get("candidate_files", []) if patch_strategy.ok else [])
+
+        role = "planner"
+        if team.ok and team.meta.get("roles"):
+            role = str(team.meta["roles"][0])
+        route_probe_prompt = "\n\n".join(
+            [
+                objective_text,
+                trim_text(context, 1200),
+                trim_text(context_pack.content if context_pack.ok else "", 2400),
+            ]
+        )
+        model_route = self.recommend_model_route(prompt=route_probe_prompt, role=role)
+        model_selection = self.recommend_model_selection(objective=objective_text, role=role, required_context_tokens=safe_int(model_route.meta.get("estimated_input_tokens"), 0) if model_route.ok else 0, limit=5)
+
+        risks: list[str] = []
+        profile = decomposition.meta.get("task_profile", {}) if decomposition.ok else infer_task_profile(objective_text)
+        if profile.get("write_intent"):
+            risks.append("File-write intent detected; checkpoint and validation are required before finalizing.")
+        if profile.get("risk_level") != "low":
+            risks.append(f"Risk level is {profile.get('risk_level')}; policy and rollback evidence should be explicit.")
+        if context_pack.ok and context_pack.meta.get("workspace", {}).get("code_hotspots", {}).get("hotspots"):
+            risks.append("Code hotspots exist; avoid broad edits to high-blast-radius symbols without call impact analysis.")
+        if not risks:
+            risks.append("No elevated deterministic risk signals found; still validate any code changes.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "decomposition": decomposition.meta if decomposition.ok else {"error": decomposition.content},
+            "recommended_team": team.meta if team.ok else {"error": team.content},
+            "tool_chain": tool_chain.meta if tool_chain.ok else {"error": tool_chain.content},
+            "context_pack_summary": {
+                "ok": context_pack.ok,
+                "semantic_matches": context_pack.meta.get("workspace", {}).get("semantic_matches", [])[:limit] if context_pack.ok else [],
+                "relevant_code_symbols": context_pack.meta.get("workspace", {}).get("relevant_code_symbols", [])[:limit] if context_pack.ok else [],
+                "relevant_todos": context_pack.meta.get("workspace", {}).get("relevant_todos", [])[:limit] if context_pack.ok else [],
+                "recommendations": context_pack.meta.get("recommendations", []) if context_pack.ok else [],
+            },
+            "tool_coverage": {
+                "tool_count": audit.meta.get("tool_count") if audit.ok else None,
+                "capability_gaps": audit.meta.get("capability_gaps", []) if audit.ok else [],
+                "risk_counts": audit.meta.get("risk_counts", {}) if audit.ok else {},
+                "schema_health_ok": tool_schema_health.meta.get("schema_health_ok") if tool_schema_health.ok else None,
+            },
+            "capability_graph_summary": {
+                "node_count": capability_graph.meta.get("node_count") if capability_graph.ok else None,
+                "edge_count": capability_graph.meta.get("edge_count") if capability_graph.ok else None,
+                "entrypoints": capability_graph.meta.get("entrypoints", {}) if capability_graph.ok else {},
+            },
+            "symbol_trace_summary": {
+                "ok": symbol_trace.ok,
+                "candidate_files": symbol_trace.meta.get("candidate_files", [])[:limit] if symbol_trace.ok else [],
+                "candidate_symbols": symbol_trace.meta.get("candidate_symbols", [])[:limit] if symbol_trace.ok else [],
+                "recommendations": symbol_trace.meta.get("recommendations", []) if symbol_trace.ok else [symbol_trace.content],
+            },
+            "patch_strategy_summary": {
+                "ok": patch_strategy.ok,
+                "candidate_files": patch_strategy.meta.get("candidate_files", []) if patch_strategy.ok else [],
+                "patch_steps": patch_strategy.meta.get("patch_steps", []) if patch_strategy.ok else [],
+                "rollback_plan": patch_strategy.meta.get("rollback_plan", []) if patch_strategy.ok else [],
+            },
+            "validation_matrix_summary": {
+                "ok": validation_matrix.ok,
+                "minimum_pass_set": validation_matrix.meta.get("minimum_pass_set", []) if validation_matrix.ok else [],
+                "missing_tools": validation_matrix.meta.get("missing_tools", []) if validation_matrix.ok else [],
+            },
+            "readiness": readiness.meta if readiness.ok else {"error": readiness.content},
+            "model_route": model_route.meta if model_route.ok else {"error": model_route.content},
+            "model_selection": model_selection.meta if model_selection.ok else {"error": model_selection.content},
+            "risks": risks,
+            "acceptance_criteria": decomposition.meta.get("acceptance_criteria", []) if decomposition.ok else [],
+            "next_best_action": (
+                "Run the first read-only phase in the recommended tool chain, then patch only after the dossier evidence identifies a narrow target."
+                if profile.get("tool_intent")
+                else "Answer directly unless the user asks to inspect or modify files."
+            ),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_tool_schema_health(self) -> ToolResult:
+        rows: list[dict[str, Any]] = []
+        issues: list[dict[str, Any]] = []
+        risk_by_tool = {name: spec.risk for name, spec in self.tool_specs.items()}
+        valid_risks = {
+            TOOL_RISK_READ_ONLY,
+            TOOL_RISK_WRITE_FILE,
+            TOOL_RISK_RUN_COMMAND,
+            TOOL_RISK_AGENTIC,
+            TOOL_RISK_MEMORY,
+            TOOL_RISK_CONTROL,
+        }
+
+        for name, spec in sorted(self.tool_specs.items()):
+            try:
+                signature = inspect.signature(spec.function)
+                parameters = signature.parameters
+            except (TypeError, ValueError) as exc:
+                row = {
+                    "tool": name,
+                    "risk": spec.risk,
+                    "schema_keys": sorted(spec.schema),
+                    "signature_error": str(exc),
+                    "issues": ["signature_unavailable"],
+                }
+                rows.append(row)
+                issues.append({"tool": name, "issue": "signature_unavailable", "detail": str(exc)})
+                continue
+
+            param_names = [
+                param_name
+                for param_name, param in parameters.items()
+                if param_name != "self" and param.kind not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+            ]
+            accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+            required_params = [
+                param_name
+                for param_name, param in parameters.items()
+                if param_name != "self"
+                and param.default is inspect._empty
+                and param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+            ]
+            schema_keys = sorted(str(key) for key in spec.schema.keys())
+            missing_required = [param for param in required_params if param not in spec.schema]
+            extra_schema = [key for key in schema_keys if key not in param_names and not accepts_kwargs]
+            row_issues: list[str] = []
+            if missing_required:
+                row_issues.append("missing_required_schema_keys")
+                for param in missing_required:
+                    issues.append({"tool": name, "issue": "missing_required_schema_key", "detail": param})
+            if extra_schema:
+                row_issues.append("extra_schema_keys")
+                for key in extra_schema:
+                    issues.append({"tool": name, "issue": "extra_schema_key", "detail": key})
+            if spec.risk not in valid_risks:
+                row_issues.append("unknown_risk_level")
+                issues.append({"tool": name, "issue": "unknown_risk_level", "detail": spec.risk})
+            if not spec.description.strip():
+                row_issues.append("missing_description")
+                issues.append({"tool": name, "issue": "missing_description", "detail": "description is empty"})
+            rows.append(
+                {
+                    "tool": name,
+                    "risk": spec.risk,
+                    "parameters": param_names,
+                    "required_parameters": required_params,
+                    "schema_keys": schema_keys,
+                    "accepts_kwargs": accepts_kwargs,
+                    "issues": row_issues,
+                }
+            )
+
+        severe_issues = [item for item in issues if item.get("issue") in {"missing_required_schema_key", "unknown_risk_level", "signature_unavailable"}]
+        payload = {
+            "generated_at": utc_now(),
+            "tool_count": len(self.tool_specs),
+            "schema_health_ok": not severe_issues,
+            "issue_count": len(issues),
+            "severe_issue_count": len(severe_issues),
+            "issues": issues,
+            "tools": rows,
+            "risk_by_tool": risk_by_tool,
+            "recommendations": [
+                "Fix missing required schema keys before delegating that tool to a model."
+                if severe_issues
+                else "Tool schemas are aligned well enough for deterministic JSON tool calling.",
+                "Treat extra schema keys as documentation drift unless the callable accepts **kwargs.",
+                "Run this after adding or renaming any tool method.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def map_tool_capability_graph(self, objective: str = "", include_edges: bool = True) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        capability_keywords = {
+            "workspace_io": {"file", "path", "read", "write", "append", "replace", "diff", "json", "checkpoint", "restore"},
+            "search_and_context": {"search", "context", "semantic", "relevant", "recent", "todo", "trace", "scope"},
+            "code_intelligence": {"code", "symbol", "graph", "call", "complexity", "import", "duplicate", "hotspot", "orphan", "refactor"},
+            "planning_and_strategy": {"plan", "dossier", "chain", "strategy", "decompose", "readiness", "matrix", "coverage"},
+            "validation": {"validate", "test", "pytest", "ruff", "smoke", "policy", "quality", "readiness"},
+            "autonomy": {"self", "improve", "cycle", "checkpoint", "rollback", "experiment", "learning", "planning", "health"},
+            "collaboration": {"team", "role", "subagent", "manager", "meta", "quality", "disagreement"},
+            "state_and_memory": {"memory", "profile", "task", "blackboard", "history", "ledger", "config", "usage"},
+            "model_routing": {"model", "provider", "route", "router", "llm", "token"},
+            "tooling_intelligence": {"tool", "schema", "capability", "coverage", "usage", "chain", "dossier"},
+        }
+        nodes: dict[str, dict[str, Any]] = {}
+        capabilities: dict[str, list[str]] = {capability: [] for capability in capability_keywords}
+        for name, spec in sorted(self.tool_specs.items()):
+            haystack = f"{name} {spec.description} {' '.join(map(str, spec.schema.keys()))}".lower()
+            matched = [
+                capability
+                for capability, keywords in capability_keywords.items()
+                if any(keyword in haystack for keyword in keywords)
+            ]
+            if not matched:
+                matched = ["uncategorized"]
+            for capability in matched:
+                capabilities.setdefault(capability, []).append(name)
+            nodes[name] = {
+                "risk": spec.risk,
+                "capabilities": matched,
+                "description": spec.description,
+            }
+
+        chain_tools: list[str] = []
+        phases: list[dict[str, Any]] = []
+        if objective_text:
+            chain = self.recommend_tool_chain(objective=objective_text, path=".")
+            if chain.ok:
+                chain_tools = list(chain.meta.get("tool_sequence", []))
+                phases = list(chain.meta.get("phases", []))
+
+        edges: list[dict[str, Any]] = []
+        if include_edges:
+            for first, second in zip(chain_tools, chain_tools[1:]):
+                edges.append({"from": first, "to": second, "kind": "recommended_sequence", "objective": objective_text})
+            default_edges = [
+                ("decompose_goal", "build_context_pack", "scope_to_context"),
+                ("build_context_pack", "trace_goal_to_symbols", "context_to_targets"),
+                ("trace_goal_to_symbols", "plan_patch_strategy", "targets_to_patch_plan"),
+                ("plan_patch_strategy", "create_checkpoint", "patch_plan_to_rollback"),
+                ("create_checkpoint", "apply_unified_diff", "rollback_to_patch"),
+                ("apply_unified_diff", "build_validation_matrix", "patch_to_validation_plan"),
+                ("build_validation_matrix", "run_self_improvement_validation", "validation_plan_to_execution"),
+                ("run_self_improvement_validation", "score_execution_readiness", "validation_to_readiness"),
+                ("score_execution_readiness", "quality_gate", "readiness_to_final_gate"),
+            ]
+            for source, target, kind in default_edges:
+                if source in self.tools and target in self.tools:
+                    edge = {"from": source, "to": target, "kind": kind}
+                    if edge not in edges:
+                        edges.append(edge)
+
+        entrypoints = {
+            "analysis": [tool for tool in ["build_execution_dossier", "decompose_goal", "build_context_pack", "semantic_search_workspace"] if tool in self.tools],
+            "implementation": [tool for tool in ["build_execution_dossier", "trace_goal_to_symbols", "plan_patch_strategy", "create_checkpoint"] if tool in self.tools],
+            "debug": [tool for tool in ["trace_goal_to_symbols", "analyze_symbol_impact", "run_python_smoke_test", "build_validation_matrix"] if tool in self.tools],
+            "validation": [tool for tool in ["build_validation_matrix", "run_self_improvement_validation", "score_execution_readiness", "quality_gate"] if tool in self.tools],
+            "autonomy": [tool for tool in ["generate_health_report", "generate_planning_brief", "show_cycle_ledger", "evaluate_autonomy_policy"] if tool in self.tools],
+        }
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "capabilities": {name: sorted(values) for name, values in capabilities.items()},
+            "uncategorized": capabilities.get("uncategorized", []),
+            "entrypoints": entrypoints,
+            "objective_tool_sequence": chain_tools,
+            "objective_phases": phases,
+            "edges": edges,
+            "nodes": nodes,
+            "recommendations": [
+                "Start with an entrypoint tool instead of ad hoc file reads for complex goals.",
+                "Use capability graph edges as a default route, not as a hard rule; user instructions still dominate.",
+                "Prefer read-only planning and tracing tools before write-file or shell-command tools.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def mine_tool_usage_patterns(self, limit: int = 120) -> ToolResult:
+        limit = max(1, min(int(limit), 500))
+        history_events = [
+            {
+                "time": item.get("time"),
+                "tool": item.get("tool"),
+                "ok": bool(item.get("ok")),
+                "source": "state.tool_history",
+                "preview": item.get("preview", ""),
+            }
+            for item in self.state.tool_history[-limit:]
+            if item.get("tool")
+        ]
+        run_events: list[dict[str, Any]] = []
+        for event in load_run_events(limit=limit):
+            payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+            if event.get("event") == "tool_executed" and payload.get("tool"):
+                run_events.append(
+                    {
+                        "time": event.get("time"),
+                        "tool": payload.get("tool"),
+                        "ok": bool(payload.get("ok")),
+                        "source": "run_log",
+                        "preview": payload.get("preview", ""),
+                    }
+                )
+        events = sorted([*history_events, *run_events], key=lambda item: str(item.get("time") or ""))[-limit:]
+        stats: dict[str, dict[str, Any]] = {}
+        transitions: dict[str, dict[str, Any]] = {}
+        for event in events:
+            tool = str(event.get("tool", ""))
+            if not tool:
+                continue
+            bucket = stats.setdefault(tool, {"calls": 0, "successes": 0, "failures": 0, "sources": set()})
+            bucket["calls"] += 1
+            bucket["sources"].add(str(event.get("source", "")))
+            if event.get("ok"):
+                bucket["successes"] += 1
+            else:
+                bucket["failures"] += 1
+        for first, second in zip(events, events[1:]):
+            first_tool = str(first.get("tool", ""))
+            second_tool = str(second.get("tool", ""))
+            if not first_tool or not second_tool:
+                continue
+            key = f"{first_tool} -> {second_tool}"
+            bucket = transitions.setdefault(key, {"from": first_tool, "to": second_tool, "count": 0, "success_after": 0, "failure_after": 0})
+            bucket["count"] += 1
+            if second.get("ok"):
+                bucket["success_after"] += 1
+            else:
+                bucket["failure_after"] += 1
+
+        normalized_stats = []
+        for tool, bucket in stats.items():
+            calls = max(1, int(bucket.get("calls", 0)))
+            normalized_stats.append(
+                {
+                    "tool": tool,
+                    "calls": bucket["calls"],
+                    "successes": bucket["successes"],
+                    "failures": bucket["failures"],
+                    "success_rate": round(bucket["successes"] / calls, 3),
+                    "sources": sorted(bucket.get("sources", [])),
+                }
+            )
+        normalized_stats.sort(key=lambda item: (-int(item["calls"]), item["tool"]))
+        transition_rows = list(transitions.values())
+        for row in transition_rows:
+            row["success_after_rate"] = round(row["success_after"] / max(1, row["count"]), 3)
+        transition_rows.sort(key=lambda item: (-int(item["count"]), -float(item["success_after_rate"]), item["from"], item["to"]))
+
+        unreliable = [row for row in normalized_stats if row["calls"] >= 2 and row["success_rate"] < 0.75]
+        reliable = [row for row in normalized_stats if row["calls"] >= 2 and row["success_rate"] >= 0.9]
+        payload = {
+            "generated_at": utc_now(),
+            "event_count": len(events),
+            "tool_stats": normalized_stats,
+            "top_transitions": transition_rows[:20],
+            "reliable_tools": reliable[:15],
+            "unreliable_tools": unreliable[:15],
+            "recommendations": [
+                "Prefer reliable read-only tools early in a turn; reserve unreliable or high-risk tools for after narrowing context.",
+                "Repeated failed transitions indicate a prompt/tool schema mismatch or overly broad task decomposition."
+                if unreliable
+                else "No recurring unreliable tool pattern detected in the sampled history.",
+                "Use this together with inspect_tool_schema_health when a model keeps calling tools incorrectly.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def trace_goal_to_symbols(self, objective: str, path: str = ".", limit: int = 5) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        limit = max(1, min(int(limit), 12))
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+
+        semantic = self.semantic_search_workspace(objective_text, workspace_relative(target), limit=limit, max_file_chars=16000)
+        code = self.find_relevant_code_context(objective_text, workspace_relative(target), limit=limit)
+        graph = self.build_code_graph(workspace_relative(target), recursive=target.is_dir())
+        symbol_rows: list[dict[str, Any]] = []
+        if code.ok:
+            for symbol in code.meta.get("symbols", [])[:limit]:
+                name = str(symbol.get("name") or symbol.get("qualified_name") or "")
+                qualified_name = str(symbol.get("qualified_name") or name)
+                impact = self.analyze_symbol_impact(name) if name else ToolResult(False, "No symbol name.")
+                symbol_rows.append(
+                    {
+                        "path": symbol.get("path"),
+                        "line": symbol.get("line"),
+                        "kind": symbol.get("kind"),
+                        "name": name,
+                        "qualified_name": qualified_name,
+                        "score": symbol.get("score"),
+                        "risk_level": symbol.get("risk_level"),
+                        "line_count": symbol.get("line_count"),
+                        "decision_points": symbol.get("decision_points"),
+                        "call_count": symbol.get("call_count"),
+                        "impact": impact.meta if impact.ok else {"ok": False, "error": impact.content},
+                        "reasons": symbol.get("reasons", []),
+                    }
+                )
+
+        candidate_files: dict[str, dict[str, Any]] = {}
+        if semantic.ok:
+            for match in semantic.meta.get("matches", [])[:limit]:
+                rel = str(match.get("path", ""))
+                if rel:
+                    candidate_files.setdefault(rel, {"path": rel, "semantic_score": match.get("score"), "snippets": []})
+                    candidate_files[rel]["snippets"] = match.get("snippets", [])[:2]
+        for symbol in symbol_rows:
+            rel = str(symbol.get("path", ""))
+            if rel:
+                row = candidate_files.setdefault(rel, {"path": rel, "semantic_score": None, "snippets": []})
+                row.setdefault("symbols", []).append(
+                    {
+                        "name": symbol.get("qualified_name"),
+                        "line": symbol.get("line"),
+                        "score": symbol.get("score"),
+                        "risk_level": symbol.get("risk_level"),
+                    }
+                )
+
+        recommendations: list[str] = []
+        if symbol_rows:
+            top = symbol_rows[0]
+            recommendations.append(f"Inspect {top.get('path')}:{top.get('line')} ({top.get('qualified_name')}) first; it is the top code-symbol match.")
+            if any(str(row.get("impact", {}).get("risk_level", row.get("risk_level"))) in {"medium", "high"} for row in symbol_rows[:3]):
+                recommendations.append("At least one top target has non-low impact; use plan_patch_strategy before editing.")
+        elif candidate_files:
+            top_path = next(iter(candidate_files))
+            recommendations.append(f"No Python symbol dominated; inspect semantically matched file {top_path} first.")
+        else:
+            recommendations.append("No strong workspace target found; broaden the query or ask for a more specific file/path.")
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "path": workspace_relative(target),
+            "semantic_search_ok": semantic.ok,
+            "code_context_ok": code.ok,
+            "code_graph_ok": graph.ok,
+            "candidate_files": list(candidate_files.values())[:limit],
+            "candidate_symbols": symbol_rows,
+            "recommendations": recommendations,
+            "errors": [
+                {"tool": "semantic_search_workspace", "error": semantic.content} if not semantic.ok else {},
+                {"tool": "find_relevant_code_context", "error": code.content} if not code.ok else {},
+                {"tool": "build_code_graph", "error": graph.content} if not graph.ok else {},
+            ],
+        }
+        ok = bool(candidate_files or symbol_rows)
+        return ToolResult(ok, json.dumps(payload, indent=2), meta=payload)
+
+    def build_validation_matrix(
+        self,
+        objective: str = "",
+        changed_files: list[str] | str | None = None,
+        path: str = ".",
+        risk_level: str = "",
+    ) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        profile = infer_task_profile(objective_text) if objective_text else {"intents": [], "risk_level": "low", "write_intent": False}
+        resolved_risk = str(risk_level or profile.get("risk_level") or "low")
+        if isinstance(changed_files, str):
+            raw_files = [item.strip() for item in re.split(r"[,\n]", changed_files) if item.strip()]
+        else:
+            raw_files = [str(item).strip() for item in (changed_files or []) if str(item).strip()]
+        target = resolve_workspace_path(path)
+        scoped_path = workspace_relative(target)
+
+        file_rows: list[dict[str, Any]] = []
+        suffixes: set[str] = set()
+        for raw in raw_files:
+            try:
+                resolved = resolve_workspace_path(raw)
+                rel = workspace_relative(resolved)
+            except Exception:
+                rel = raw
+                resolved = WORKSPACE_ROOT / raw
+            suffix = Path(rel).suffix.lower()
+            suffixes.add(suffix)
+            file_rows.append(
+                {
+                    "path": rel,
+                    "suffix": suffix,
+                    "exists": resolved.exists(),
+                    "is_python": suffix == ".py",
+                    "is_json": suffix == ".json",
+                    "is_agent_control_plane": Path(rel).name.startswith(".agent_") or Path(rel).name == Path(active_agent_file()).name,
+                }
+            )
+
+        matrix: list[dict[str, Any]] = []
+
+        def add_check(name: str, tool: str, purpose: str, when: str, blocking: bool, evidence_strength: str, args: dict[str, Any]) -> None:
+            matrix.append(
+                {
+                    "order": len(matrix) + 1,
+                    "name": name,
+                    "tool": tool,
+                    "purpose": purpose,
+                    "when": when,
+                    "blocking": blocking,
+                    "evidence_strength": evidence_strength,
+                    "args": args,
+                    "available": tool in self.tools,
+                }
+            )
+
+        python_files = [row["path"] for row in file_rows if row.get("is_python")]
+        json_files = [row["path"] for row in file_rows if row.get("is_json")]
+        add_check("inspect_status", "git_status", "Capture current workspace state before trusting validation.", "always", False, "low", {})
+        if python_files:
+            for file_path in python_files[:8]:
+                add_check("compile_python_file", "validate_python_file", f"Compile-check {file_path}.", "changed Python file", True, "medium", {"path": file_path})
+        elif ".py" in suffixes or target.suffix.lower() == ".py" or target.is_dir():
+            add_check("compile_python_scope", "validate_workspace_python", "Compile-check Python files in scope.", "Python scope or unknown changed Python set", True, "medium", {"path": scoped_path, "recursive": target.is_dir()})
+        if json_files:
+            for file_path in json_files[:8]:
+                add_check("validate_json_file", "validate_json_file", f"Parse-check {file_path}.", "changed JSON file", True, "medium", {"path": file_path})
+        if any(Path(row["path"]).name.startswith("agent") and row["suffix"] == ".py" for row in file_rows) or "implementation" in profile.get("intents", []) or "refactoring" in profile.get("intents", []):
+            add_check("internal_self_tests", "run_internal_self_tests", "Run deterministic control-plane tests after agent changes.", "agent/control-plane change", True, "high", {})
+        if profile.get("write_intent") or raw_files:
+            add_check("self_improvement_validation", "run_self_improvement_validation", "Run compile/smoke/optional pytest/ruff and diff status.", "after file edits", True, "high", {"path": scoped_path})
+            add_check("diff_review", "git_diff", "Review exact patch before final answer.", "after file edits", True, "medium", {"path": scoped_path})
+        if resolved_risk != "low" or profile.get("write_intent"):
+            add_check("policy_check", "evaluate_autonomy_policy", "Check change impact against autonomy risk budget.", "medium/high risk or file-write intent", True, "high", {"impact": {"risk_level": resolved_risk}, "changed_files": raw_files})
+        add_check("final_readiness", "score_execution_readiness", "Verify evidence, target clarity, validation, and rollback readiness before finalizing.", "before final answer", True, "medium", {"objective": objective_text, "changed_files": raw_files})
+
+        missing_tools = sorted({row["tool"] for row in matrix if not row["available"]})
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "path": scoped_path,
+            "risk_level": resolved_risk,
+            "changed_files": file_rows,
+            "matrix": matrix,
+            "missing_tools": missing_tools,
+            "minimum_pass_set": [row["name"] for row in matrix if row["blocking"]],
+            "recommendations": [
+                "Execute blocking checks after patching and before summarizing success.",
+                "For Python agent changes, compile plus run_internal_self_tests is the minimum useful validation.",
+                "If policy_check fails, restore checkpoint or reduce the patch scope before continuing.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def plan_patch_strategy(self, objective: str, target_path: str = ".", context: str = "", max_files: int = 3) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        max_files = max(1, min(int(max_files), 10))
+        target = resolve_workspace_path(target_path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {target_path}")
+        profile = infer_task_profile(f"{objective_text}\n{context}")
+        trace = self.trace_goal_to_symbols(objective_text, workspace_relative(target), limit=max_files)
+        chain = self.recommend_tool_chain(objective_text, context=context, path=workspace_relative(target))
+
+        candidate_files: list[str] = []
+        if trace.ok:
+            for row in trace.meta.get("candidate_symbols", []):
+                rel = str(row.get("path", ""))
+                if rel and rel not in candidate_files:
+                    candidate_files.append(rel)
+            for row in trace.meta.get("candidate_files", []):
+                rel = str(row.get("path", ""))
+                if rel and rel not in candidate_files:
+                    candidate_files.append(rel)
+        if not candidate_files and target.is_file():
+            candidate_files.append(workspace_relative(target))
+        candidate_files = candidate_files[:max_files]
+        validation = self.build_validation_matrix(objective_text, changed_files=candidate_files, path=workspace_relative(target), risk_level=str(profile.get("risk_level", "low")))
+
+        patch_steps: list[dict[str, Any]] = [
+            {
+                "step": 1,
+                "action": "create_checkpoint",
+                "tool": "create_checkpoint",
+                "args": {"label": "before-targeted-patch"},
+                "reason": "Make rollback concrete before any write.",
+            },
+            {
+                "step": 2,
+                "action": "read_targets",
+                "tool": "read_file",
+                "args": {"path": candidate_files[0] if candidate_files else workspace_relative(target)},
+                "reason": "Inspect exact current content around the intended edit.",
+            },
+            {
+                "step": 3,
+                "action": "patch_minimal_slice",
+                "tool": "apply_unified_diff",
+                "args": {"diff": "<minimal unified diff against selected target files>"},
+                "reason": "Prefer a reviewable diff over full-file overwrite.",
+            },
+            {
+                "step": 4,
+                "action": "validate_blocking_checks",
+                "tool": "build_validation_matrix",
+                "args": {"objective": objective_text, "changed_files": candidate_files, "path": workspace_relative(target)},
+                "reason": "Run the blocking checks from the returned matrix, not just the easiest check.",
+            },
+            {
+                "step": 5,
+                "action": "review_diff_and_readiness",
+                "tool": "score_execution_readiness",
+                "args": {"objective": objective_text, "changed_files": candidate_files},
+                "reason": "Confirm evidence and validation are sufficient before finalizing.",
+            },
+        ]
+        rollback_plan = [
+            "Use restore_checkpoint with preserve_agent_state=True if compile/tests fail after the patch.",
+            "If a tool call fails because the target was too broad, retry against one file or symbol at a time.",
+            "Report partial progress honestly if validation cannot be executed.",
+        ]
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "target_path": workspace_relative(target),
+            "task_profile": profile,
+            "candidate_files": candidate_files,
+            "candidate_symbols": trace.meta.get("candidate_symbols", [])[:max_files] if trace.ok else [],
+            "tool_chain": chain.meta if chain.ok else {"error": chain.content},
+            "validation_matrix": validation.meta if validation.ok else {"error": validation.content},
+            "patch_steps": patch_steps,
+            "rollback_plan": rollback_plan,
+            "edit_policy": {
+                "max_files": max_files,
+                "prefer_unified_diff": True,
+                "avoid_full_rewrite": True,
+                "requires_checkpoint": bool(profile.get("write_intent", True)),
+                "requires_validation": True,
+            },
+            "recommendations": [
+                "Patch only the first target unless evidence proves multiple files must change.",
+                "Name the acceptance criterion that each edit satisfies before applying the diff.",
+                "Do not claim success until the validation matrix blocking checks have passed or their limits are disclosed.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def score_execution_readiness(
+        self,
+        objective: str,
+        context: str = "",
+        candidate: str = "",
+        changed_files: list[str] | str | None = None,
+    ) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        profile = infer_task_profile(f"{objective_text}\n{context}")
+        if isinstance(changed_files, str):
+            changed = [item.strip() for item in re.split(r"[,\n]", changed_files) if item.strip()]
+        else:
+            changed = [str(item).strip() for item in (changed_files or []) if str(item).strip()]
+        context_text = str(context or "")
+        candidate_text = str(candidate or "")
+        tool_names_in_context = {name for name in self.tools if name in context_text or name in candidate_text}
+        validation_terms = {"validated", "validation", "compile", "py_compile", "pytest", "ruff", "smoke", "self-tests", "self tests", "passed"}
+        rollback_terms = {"checkpoint", "rollback", "restore", "reversible", "diff"}
+        target_terms = {"file", "path", "symbol", "function", "class", ".py", ".json"}
+
+        gates: list[dict[str, Any]] = []
+
+        def add_gate(name: str, passed: bool, weight: int, detail: str) -> None:
+            gates.append({"name": name, "passed": bool(passed), "weight": weight, "detail": detail})
+
+        add_gate("objective_present", bool(objective_text), 2, "A concrete objective is required.")
+        add_gate("tool_intent_routed", (not profile.get("tool_intent")) or bool(tool_names_in_context) or bool(changed), 1, "Complex/tool tasks should show evidence of tool routing or changed targets.")
+        add_gate("target_clarity", bool(changed) or any(term in context_text.lower() or term in candidate_text.lower() for term in target_terms), 2, "Implementation work needs named files, paths, or symbols.")
+        add_gate("rollback_readiness", (not profile.get("write_intent")) or any(term in context_text.lower() or term in candidate_text.lower() for term in rollback_terms), 2, "Write work should mention checkpoint/diff/rollback readiness.")
+        add_gate("validation_evidence", (not profile.get("write_intent")) or any(term in context_text.lower() or term in candidate_text.lower() for term in validation_terms), 3, "Write work should include validation evidence or an explicit limitation.")
+        add_gate("scope_control", len(changed) <= load_autonomy_policy().get("max_changed_files_per_cycle", 4), 2, "Changed-file count should stay inside policy budget.")
+        add_gate("final_candidate_present", bool(candidate_text) or bool(changed) or not profile.get("write_intent"), 1, "A final answer or concrete change evidence should exist before finalizing.")
+
+        possible = sum(int(gate["weight"]) for gate in gates)
+        earned = sum(int(gate["weight"]) for gate in gates if gate["passed"])
+        score = round(earned / max(1, possible), 3)
+        failed_gates = [gate for gate in gates if not gate["passed"]]
+        if score >= 0.85 and not failed_gates:
+            decision = "ready"
+        elif score >= 0.65:
+            decision = "proceed_with_caution"
+        else:
+            decision = "not_ready"
+        next_actions: list[str] = []
+        for gate in failed_gates:
+            if gate["name"] == "target_clarity":
+                next_actions.append("Run trace_goal_to_symbols or build_context_pack to identify concrete files/symbols.")
+            elif gate["name"] == "rollback_readiness":
+                next_actions.append("Create a checkpoint and prefer apply_unified_diff before editing.")
+            elif gate["name"] == "validation_evidence":
+                next_actions.append("Run the blocking checks from build_validation_matrix.")
+            elif gate["name"] == "tool_intent_routed":
+                next_actions.append("Run build_execution_dossier or recommend_tool_chain before acting.")
+            elif gate["name"] == "scope_control":
+                next_actions.append("Reduce changed files or update autonomy policy intentionally.")
+        if not next_actions:
+            next_actions.append("Proceed to quality_gate or final synthesis with explicit validation notes.")
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "task_profile": profile,
+            "changed_files": changed,
+            "score": score,
+            "decision": decision,
+            "gates": gates,
+            "failed_gates": failed_gates,
+            "observed_tool_names": sorted(tool_names_in_context),
+            "next_actions": next_actions,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+
+    def route_multi_model_task(
+        self,
+        objective: str,
+        path: str = ".",
+        prefer: str = "",
+        required_context_tokens: int = 0,
+        refresh: bool = False,
+    ) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        scope = workspace_relative(resolve_workspace_path(path))
+        profile = infer_task_profile(objective_text)
+        team = self.recommend_team(task=objective_text, context=f"scope={scope}\nprefer={prefer}")
+        roles = [role for role in team.meta.get("roles", []) if role in ROLE_CATALOG] if team.ok else []
+        if not roles:
+            roles = ["planner", "coder", "reviewer"]
+        chain = self.recommend_tool_chain(objective=objective_text, context=prefer, path=scope)
+        phases = chain.meta.get("phases", []) if chain.ok else []
+        required_context = safe_int(required_context_tokens, 0)
+        if required_context <= 0:
+            probe = self.recommend_model_route(prompt=objective_text + "\n" + prefer, role=roles[0])
+            required_context = safe_int(probe.meta.get("estimated_input_tokens"), 0) if probe.ok else 0
+
+        role_routes: dict[str, Any] = {}
+        for role in roles:
+            role_prefer_terms = " ".join([prefer, "coding" if role in {"coder", "refactorer", "tester", "reviewer"} else "reasoning"]).strip()
+            recommendation = self.recommend_model_selection(
+                objective=objective_text,
+                role=role,
+                required_context_tokens=required_context,
+                prefer=role_prefer_terms,
+                limit=5,
+                refresh=refresh,
+            )
+            role_routes[role] = recommendation.meta if recommendation.ok else {"error": recommendation.content}
+
+        phase_routes: list[dict[str, Any]] = []
+        for phase in phases:
+            phase_name = str(phase.get("phase", phase.get("name", "phase")))
+            phase_tools = [str(tool) for tool in phase.get("tools", [])]
+            phase_role = "planner"
+            if any(tool in phase_tools for tool in ["apply_unified_diff", "replace_in_file", "write_file"]):
+                phase_role = "coder"
+            elif any(tool in phase_tools for tool in ["run_self_improvement_validation", "build_validation_matrix", "quality_gate"]):
+                phase_role = "tester"
+            elif any(tool in phase_tools for tool in ["evaluate_autonomy_policy", "create_checkpoint", "restore_checkpoint"]):
+                phase_role = "safety"
+            elif any(tool in phase_tools for tool in ["semantic_search_workspace", "find_relevant_code_context", "trace_goal_to_symbols"]):
+                phase_role = "researcher"
+            if phase_role not in roles:
+                phase_role = roles[0]
+            chosen = role_routes.get(phase_role, {})
+            rec = chosen.get("recommendation", {}) if isinstance(chosen, dict) else {}
+            phase_routes.append(
+                {
+                    "phase": phase_name,
+                    "tools": phase_tools,
+                    "assigned_role": phase_role,
+                    "provider": rec.get("provider"),
+                    "model": rec.get("model"),
+                    "model_score": rec.get("score"),
+                    "why": rec.get("reasons", [])[:4] if isinstance(rec, dict) else [],
+                }
+            )
+
+        portfolio = self.build_model_portfolio(objective=objective_text, refresh=refresh)
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "task_profile": profile,
+            "recommended_team": team.meta if team.ok else {"error": team.content},
+            "required_context_tokens": required_context,
+            "role_routes": role_routes,
+            "phase_routes": phase_routes,
+            "portfolio": portfolio.meta.get("portfolio", {}) if portfolio.ok else {"error": portfolio.content},
+            "execution_policy": [
+                "Use the strongest reasoning model for planning, safety, and final synthesis.",
+                "Use coding-specialized models for patch generation and code review.",
+                "Use fast/cheap/local models for broad search, summaries, and low-risk drafting.",
+                "Keep provider/model selection explicit in the run log when a route changes.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_runtime_environment(self, include_packages: bool = True, include_env: bool = True) -> ToolResult:
+        import importlib.util
+        import platform
+
+        config = load_config()
+        provider_env: dict[str, Any] = {}
+        if include_env:
+            for provider, settings in config.get("llm_providers", {}).items():
+                if not isinstance(settings, dict):
+                    continue
+                env_name = str(settings.get("api_key_env", "")).strip()
+                inline_key = bool(str(settings.get("api_key", "")).strip())
+                provider_env[str(provider)] = {
+                    "api_key_env": env_name,
+                    "env_present": bool(env_name and os.environ.get(env_name)),
+                    "inline_key_present": inline_key,
+                    "base_url": settings.get("base_url", ""),
+                    "type": settings.get("type", ""),
+                    "model": settings.get("model", ""),
+                }
+
+        package_names = [
+            "openai",
+            "anthropic",
+            "pytest",
+            "ruff",
+            "requests",
+            "pydantic",
+            "numpy",
+            "tiktoken",
+            "rich",
+        ]
+        packages = {}
+        if include_packages:
+            for name in package_names:
+                spec = importlib.util.find_spec(name)
+                packages[name] = {
+                    "available": spec is not None,
+                    "origin": trim_text(str(getattr(spec, "origin", "") or ""), 200) if spec else "",
+                }
+
+        payload = {
+            "generated_at": utc_now(),
+            "python": {
+                "version": sys.version,
+                "executable": sys.executable,
+                "implementation": platform.python_implementation(),
+                "platform": platform.platform(),
+            },
+            "workspace": {
+                "root": str(WORKSPACE_ROOT),
+                "cwd": str(Path.cwd()),
+                "config_file_exists": CONFIG_FILE.exists(),
+                "memory_file_exists": MEMORY_FILE.exists(),
+                "model_catalog_file_exists": MODEL_CATALOG_FILE.exists(),
+                "git_dir_exists": (WORKSPACE_ROOT / ".git").exists(),
+            },
+            "providers": provider_env,
+            "packages": packages,
+            "recommendations": [
+                "Set provider API keys as environment variables rather than inline config values.",
+                "Install optional provider SDKs only for providers you actively route to.",
+                "Use discover_available_models after setting provider credentials to refresh the model catalog.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def audit_dependency_health(self, path: str = ".", recursive: bool = True, limit: int = 200) -> ToolResult:
+        import importlib.util
+
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(int(limit), 1000))
+        files = iter_python_source_files(target, recursive=bool(recursive), max_files=limit)
+        local_modules = {file.stem for file in iter_python_source_files(WORKSPACE_ROOT, recursive=True, max_files=1000)}
+        stdlib = set(getattr(sys, "stdlib_module_names", set()))
+        imports: dict[str, dict[str, Any]] = {}
+        parse_errors: list[dict[str, Any]] = []
+        for file in files:
+            text = read_text_sample(file, 400000)
+            try:
+                tree = ast.parse(text)
+            except SyntaxError as exc:
+                parse_errors.append({"path": workspace_relative(file), "line": exc.lineno, "error": str(exc)})
+                continue
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if node.level and node.level > 0:
+                        continue
+                    names = [node.module.split(".")[0]]
+                for name in names:
+                    if not name:
+                        continue
+                    entry = imports.setdefault(name, {"count": 0, "files": set()})
+                    entry["count"] += 1
+                    entry["files"].add(workspace_relative(file))
+
+        rows: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        for name, data in sorted(imports.items()):
+            is_local = name in local_modules
+            is_stdlib = name in stdlib or name in {"__future__"}
+            available = is_local or is_stdlib or importlib.util.find_spec(name) is not None
+            row = {
+                "module": name,
+                "count": data["count"],
+                "files": sorted(data["files"])[:20],
+                "classification": "local" if is_local else "stdlib" if is_stdlib else "third_party",
+                "available": available,
+            }
+            rows.append(row)
+            if not available:
+                missing.append(row)
+
+        dependency_files = []
+        for filename in ["requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock", "uv.lock", "environment.yml"]:
+            candidate = WORKSPACE_ROOT / filename
+            if candidate.exists():
+                dependency_files.append({"path": filename, "size": candidate.stat().st_size})
+        optional_missing = [name for name in ["openai", "anthropic", "pytest", "ruff", "tiktoken"] if importlib.util.find_spec(name) is None]
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "files_scanned": len(files),
+            "import_count": len(rows),
+            "imports": rows,
+            "missing_modules": missing,
+            "parse_errors": parse_errors,
+            "dependency_files": dependency_files,
+            "optional_missing": optional_missing,
+            "health": "needs_attention" if missing or parse_errors else "ok",
+            "recommendations": [
+                "If a missing module is intentional because it is optional, keep the guarded import and improve the error message.",
+                "For local-agent portability, prefer standard-library fallbacks for optional validation tools.",
+                "Keep dependency declarations aligned with imports used by default execution paths.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_prompt_surface(self, include_snippets: bool = False) -> ToolResult:
+        prompt_sources = {
+            "SYSTEM_PROMPT": SYSTEM_PROMPT,
+            "MANAGER_POLICY_PROMPT": MANAGER_POLICY_PROMPT,
+            "META_AGENT_PROMPT": META_AGENT_PROMPT,
+            "DISAGREEMENT_AGENT_PROMPT": DISAGREEMENT_AGENT_PROMPT,
+            "QUALITY_GATE_PROMPT": QUALITY_GATE_PROMPT,
+            "SELF_IMPROVEMENT_REVIEW_PROMPT": SELF_IMPROVEMENT_REVIEW_PROMPT,
+        }
+        for role in ROLE_CATALOG:
+            prompt_sources[f"ROLE_PROMPT::{role}"] = build_role_system_prompt(role)
+
+        tool_mentions: dict[str, list[str]] = {name: [] for name in self.tool_specs}
+        rows: list[dict[str, Any]] = []
+        issues: list[str] = []
+        for name, prompt in prompt_sources.items():
+            mentioned = [tool for tool in self.tool_specs if tool in prompt]
+            for tool in mentioned:
+                tool_mentions[tool].append(name)
+            tokens = estimate_token_count(prompt)
+            row = {
+                "prompt": name,
+                "chars": len(prompt),
+                "estimated_tokens": tokens,
+                "tool_mentions": mentioned[:40],
+                "json_only_mentions": prompt.lower().count("json"),
+                "workspace_mentions": prompt.lower().count("workspace"),
+            }
+            if include_snippets:
+                row["snippet"] = trim_text(prompt, 700)
+            rows.append(row)
+            if tokens > 6000:
+                issues.append(f"{name} is large ({tokens} estimated tokens); consider compacting or moving details into tools.")
+            if "json" not in prompt.lower() and name != "SELF_IMPROVEMENT_REVIEW_PROMPT":
+                issues.append(f"{name} may not clearly reinforce JSON tool-call format.")
+
+        unmentioned_tools = sorted(tool for tool, prompts in tool_mentions.items() if not prompts)
+        high_risk_unmentioned = [tool for tool in unmentioned_tools if self.tool_specs[tool].risk != TOOL_RISK_READ_ONLY]
+        payload = {
+            "generated_at": utc_now(),
+            "prompt_count": len(rows),
+            "prompts": rows,
+            "unmentioned_tools": unmentioned_tools,
+            "high_risk_unmentioned_tools": high_risk_unmentioned,
+            "issues": issues,
+            "recommendations": [
+                "Keep high-risk tool guidance explicit in manager/system prompts.",
+                "Mention new high-level planning tools in the system prompt so the manager discovers them before low-level writes.",
+                "When prompt size grows, move repeated policy text into deterministic tools and cite tool outputs instead.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_context_budget_plan(
+        self,
+        objective: str,
+        path: str = ".",
+        role: str = "planner",
+        provider: str = "",
+        model: str = "",
+        max_input_tokens: int = 0,
+    ) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        scope = workspace_relative(resolve_workspace_path(path))
+        role = str(role or "planner")
+        if role not in ROLE_CATALOG:
+            role = "planner"
+        context_pack = self.build_context_pack(objective=objective_text, path=scope, limit=6)
+        route_probe = self.recommend_model_route(
+            prompt=objective_text + "\n\n" + (context_pack.content if context_pack.ok else ""),
+            role=role,
+            provider=provider,
+            model=model,
+        )
+        estimated_tokens = safe_int(route_probe.meta.get("estimated_input_tokens"), 0) if route_probe.ok else estimate_token_count(objective_text)
+        budget = safe_int(max_input_tokens, 0) or safe_int(route_probe.meta.get("input_token_budget"), 0) if route_probe.ok else 0
+        if budget <= 0:
+            budget = 7600
+        reserve = max(512, int(budget * 0.15))
+        available_for_context = max(256, budget - reserve - estimate_token_count(objective_text))
+        sections = [
+            {"name": "system_and_tool_prompt", "priority": 1, "estimated_tokens": 1200, "strategy": "keep stable; do not duplicate tool specs inside user context"},
+            {"name": "objective_and_acceptance_criteria", "priority": 1, "estimated_tokens": estimate_token_count(objective_text) + 120, "strategy": "keep verbatim"},
+            {"name": "target_symbols_and_files", "priority": 2, "estimated_tokens": min(1200, max(300, available_for_context // 3)), "strategy": "use trace_goal_to_symbols snippets first"},
+            {"name": "workspace_context_pack", "priority": 3, "estimated_tokens": min(2400, max(500, available_for_context // 2)), "strategy": "compact middle; keep recommendations and top matches"},
+            {"name": "recent_history_and_state", "priority": 4, "estimated_tokens": min(1000, max(200, available_for_context // 6)), "strategy": "summarize rather than include raw logs"},
+            {"name": "validation_and_risk", "priority": 2, "estimated_tokens": min(1000, max(300, available_for_context // 5)), "strategy": "include only blocking checks and risk register top items"},
+        ]
+        section_total = sum(item["estimated_tokens"] for item in sections)
+        over_budget = section_total + reserve > budget
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "role": role,
+            "route_probe": route_probe.meta if route_probe.ok else {"error": route_probe.content},
+            "budget": {
+                "max_input_tokens": budget,
+                "estimated_full_prompt_tokens": estimated_tokens,
+                "reserved_output_and_margin_tokens": reserve,
+                "available_for_context_tokens": available_for_context,
+                "section_total_tokens": section_total,
+                "over_budget": over_budget,
+            },
+            "sections": sections,
+            "compaction_plan": [
+                "Keep objective, acceptance criteria, and selected file paths verbatim.",
+                "Use top-ranked snippets rather than full files unless the target is small.",
+                "Collapse run history, blackboard, and memory into bullet summaries.",
+                "If still over budget, run compact_messages_for_input_budget before model call.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def propose_test_plan_for_symbol(self, symbol: str, path: str = ".", objective: str = "", limit: int = 8) -> ToolResult:
+        symbol_text = str(symbol or "").strip()
+        if not symbol_text:
+            return ToolResult(False, "Symbol cannot be empty.")
+        limit = max(1, min(int(limit), 25))
+        scope = workspace_relative(resolve_workspace_path(path))
+        symbol_result = self.find_symbol(symbol_text)
+        impact = self.analyze_symbol_impact(symbol_text)
+        semantic = self.semantic_search_workspace(query=f"{symbol_text} {objective}", path=scope, limit=limit)
+        candidate_files = []
+        for item in symbol_result.meta.get("matches", []) if symbol_result.ok else []:
+            candidate_files.append(item.get("path"))
+        for item in semantic.meta.get("matches", []) if semantic.ok else []:
+            candidate_files.append(item.get("path"))
+        candidate_files = [file for file in dict.fromkeys(str(item) for item in candidate_files if item)][:limit]
+        test_cases = [
+            {"case": "happy_path", "purpose": f"Call {symbol_text} with representative valid input and assert the expected output shape."},
+            {"case": "empty_or_minimal_input", "purpose": f"Verify {symbol_text} handles empty strings, empty lists, None, or missing optional values as intended."},
+            {"case": "invalid_input", "purpose": f"Confirm {symbol_text} fails safely or returns a clear ToolResult error for invalid inputs."},
+            {"case": "regression_context", "purpose": "Use the objective-specific scenario as a regression fixture once the bug/feature is understood."},
+        ]
+        if impact.ok and impact.meta.get("risk_level") in {"medium", "high"}:
+            test_cases.append({"case": "call_graph_regression", "purpose": "Exercise at least one caller because impact analysis shows non-trivial fan-in/fan-out."})
+        commands = []
+        if candidate_files:
+            commands.append(f"python -m py_compile {shlex.quote(candidate_files[0])}")
+        commands.extend([
+            "python -m pytest -q  # if tests exist",
+            "python -m ruff check .  # optional style/static check when ruff is installed",
+            "python agent.py --self-test  # if this script exposes the internal test flag in your local copy",
+        ])
+        payload = {
+            "generated_at": utc_now(),
+            "symbol": symbol_text,
+            "objective": str(objective or ""),
+            "scope": scope,
+            "candidate_files": candidate_files,
+            "symbol_matches": symbol_result.meta.get("matches", []) if symbol_result.ok else [],
+            "impact": impact.meta if impact.ok else {"error": impact.content},
+            "test_cases": test_cases,
+            "validation_commands": commands,
+            "recommendations": [
+                "Start with a compile/smoke check before writing a full test harness.",
+                "Prefer regression tests around public tool methods and parser/control-plane helpers.",
+                "For agent tools, assert ToolResult.ok, important meta keys, and stable error behavior.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def simulate_tool_execution_plan(self, objective: str, path: str = ".", context: str = "") -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        scope = workspace_relative(resolve_workspace_path(path))
+        chain = self.recommend_tool_chain(objective=objective_text, context=context, path=scope)
+        phases = chain.meta.get("phases", []) if chain.ok else []
+        schema_health = self.inspect_tool_schema_health()
+        schema_issues_by_tool: dict[str, list[str]] = {}
+        for issue in schema_health.meta.get("issues", []) if schema_health.ok else []:
+            schema_issues_by_tool.setdefault(str(issue.get("tool", "")), []).append(str(issue.get("issue", "")))
+        simulated_steps: list[dict[str, Any]] = []
+        step = 0
+        for phase in phases:
+            for tool in phase.get("tools", []):
+                tool = str(tool)
+                spec = self.tool_specs.get(tool)
+                step += 1
+                simulated_steps.append(
+                    {
+                        "step": step,
+                        "phase": phase.get("phase", phase.get("name", "")),
+                        "tool": tool,
+                        "risk": spec.risk if spec else "unknown",
+                        "schema": spec.schema if spec else {},
+                        "preconditions": [
+                            "Tool is registered and schema is healthy." if not schema_issues_by_tool.get(tool) else f"Resolve schema issues: {schema_issues_by_tool[tool]}",
+                            "Use workspace-relative paths only." if spec and "path" in spec.schema else "No path precondition detected.",
+                            "Checkpoint exists before write/control action." if spec and spec.risk in {TOOL_RISK_WRITE_FILE, TOOL_RISK_CONTROL} else "Read-only or non-write step.",
+                        ],
+                        "expected_evidence": "Structured ToolResult with ok/content/meta; preserve important meta keys for the next step.",
+                        "fallback": "Retry with narrower args, inspect schema, or switch to read-only diagnostic tool if this fails.",
+                    }
+                )
+        risk_counts: dict[str, int] = {}
+        for item in simulated_steps:
+            risk_counts[item["risk"]] = risk_counts.get(item["risk"], 0) + 1
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "context_preview": trim_text(context, 800),
+            "source_chain": chain.meta if chain.ok else {"error": chain.content},
+            "risk_counts": risk_counts,
+            "simulated_steps": simulated_steps,
+            "stop_conditions": [
+                "Stop before write/control tools if checkpoint or target clarity is missing.",
+                "Stop after validation failure and either roll back or narrow the patch.",
+                "Stop if tool schema health reports severe issues for a planned tool.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_risk_register(
+        self,
+        objective: str,
+        path: str = ".",
+        context: str = "",
+        changed_files: list[str] | str | None = None,
+    ) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        scope = workspace_relative(resolve_workspace_path(path))
+        if isinstance(changed_files, str):
+            changed = [item.strip() for item in re.split(r"[,\n]", changed_files) if item.strip()]
+        else:
+            changed = [str(item).strip() for item in (changed_files or []) if str(item).strip()]
+        profile = infer_task_profile(f"{objective_text}\n{context}")
+        policy = self.evaluate_autonomy_policy({"risk_level": profile.get("risk_level", "low")}, changed or [scope])
+        validation = self.build_validation_matrix(objective=objective_text, changed_files=changed, path=scope, risk_level=str(profile.get("risk_level", "low")))
+        hotspots = self.rank_code_hotspots(path=scope, recursive=Path(scope).suffix == "")
+        risks: list[dict[str, Any]] = []
+
+        def add_risk(name: str, category: str, likelihood: str, impact: str, trigger: str, mitigation: str, owner: str, gate: str) -> None:
+            risks.append(
+                {
+                    "name": name,
+                    "category": category,
+                    "likelihood": likelihood,
+                    "impact": impact,
+                    "trigger": trigger,
+                    "mitigation": mitigation,
+                    "owner": owner,
+                    "validation_gate": gate,
+                }
+            )
+
+        if profile.get("write_intent"):
+            add_risk("Unreversible edit", "rollback", "medium", "high", "write intent detected", "Create checkpoint and prefer unified diff", "safety", "checkpoint exists before write")
+            add_risk("Behavior regression", "correctness", "medium", "high", "code modification", "Run compile/smoke/self-tests and inspect diff", "tester", "blocking validation matrix passes")
+        if profile.get("risk_level") != "low":
+            add_risk("Scope creep", "autonomy", "medium", "medium", f"task risk={profile.get('risk_level')}", "Limit changed files and ask policy gate to approve", "planner", "evaluate_autonomy_policy returns allow")
+        if changed and len(changed) > load_autonomy_policy().get("max_changed_files_per_cycle", 4):
+            add_risk("Changed-file budget exceeded", "policy", "high", "high", f"changed_files={len(changed)}", "Split into separate cycles", "maintainer", "changed file count within policy")
+        hotspot_items = hotspots.meta.get("hotspots", []) if hotspots.ok else []
+        if hotspot_items:
+            add_risk("High-blast-radius symbol", "code_hotspot", "medium", "medium", "hotspots detected in target scope", "Run analyze_symbol_impact before editing shared helpers", "architect", "call impact understood")
+        if not risks:
+            add_risk("Unknown unknowns", "general", "low", "medium", "no deterministic risk signals", "Use read-only probes and state residual uncertainty", "reviewer", "quality_gate records residual risk")
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "changed_files": changed,
+            "task_profile": profile,
+            "policy_decision": policy.meta if policy.ok else {"error": policy.content},
+            "validation_matrix": validation.meta if validation.ok else {"error": validation.content},
+            "hotspot_preview": hotspot_items[:5],
+            "risks": risks,
+            "top_mitigations": [
+                "Checkpoint before write/control actions.",
+                "Keep the patch to the smallest target file/symbol.",
+                "Run the validation matrix and report any unexecuted checks.",
+                "Use quality_gate before finalizing high-risk or autonomous work.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+
+    def map_repository_structure(self, path: str = ".", max_depth: int = 3, include_hidden: bool = False) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        max_depth = max(0, min(safe_int(max_depth, 3), 12))
+        root = target if target.is_dir() else target.parent
+        root_depth = len(root.relative_to(WORKSPACE_ROOT).parts) if root != WORKSPACE_ROOT else 0
+        extension_counts: dict[str, int] = {}
+        directory_counts: dict[str, int] = {}
+        important_files: list[dict[str, Any]] = []
+        tree: list[dict[str, Any]] = []
+        important_names = {
+            "pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg",
+            "package.json", "tsconfig.json", "dockerfile", "docker-compose.yml", "compose.yml",
+            "makefile", "readme.md", "license", ".env", ".env.example", ".gitignore",
+            "pytest.ini", "tox.ini", "ruff.toml", ".pre-commit-config.yaml", "agent.py",
+        }
+
+        def hidden_or_generated(item: Path) -> bool:
+            parts = item.relative_to(WORKSPACE_ROOT).parts if item.is_relative_to(WORKSPACE_ROOT) else item.parts
+            if any(part.startswith(".") for part in parts if part not in {"."}):
+                return True
+            return any(part in {"__pycache__", "node_modules", "dist", "build", ".venv", "venv", ".git"} for part in parts)
+
+        candidates = [target] if target.is_file() else list(target.rglob("*"))
+        for item in sorted(candidates, key=lambda value: workspace_relative(value)):
+            if should_skip_checkpoint_path(item):
+                continue
+            rel = workspace_relative(item)
+            if not include_hidden and hidden_or_generated(item):
+                continue
+            item_depth = max(0, len(item.relative_to(WORKSPACE_ROOT).parts) - root_depth - (0 if item.is_dir() else 1))
+            if item_depth > max_depth:
+                continue
+            if item.is_dir():
+                try:
+                    child_count = sum(1 for _ in item.iterdir())
+                except OSError:
+                    child_count = 0
+                directory_counts[rel] = child_count
+                tree.append({"path": rel, "type": "dir", "depth": item_depth, "children": child_count})
+            elif item.is_file():
+                suffix = item.suffix.lower() or "[no extension]"
+                extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
+                try:
+                    size = item.stat().st_size
+                except OSError:
+                    size = 0
+                row = {"path": rel, "type": "file", "depth": item_depth, "size": size, "extension": suffix}
+                tree.append(row)
+                lowered_name = item.name.lower()
+                if lowered_name in important_names or lowered_name.startswith(("readme", "license")):
+                    important_files.append(row)
+        architecture_hints: list[str] = []
+        top_dirs = sorted(directory_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+        if extension_counts.get(".py", 0):
+            architecture_hints.append("Python codebase detected; use extract_api_surface, inspect_project_entrypoints, and trace_data_flow before refactors.")
+        if any(item["path"].endswith("pyproject.toml") for item in important_files):
+            architecture_hints.append("pyproject.toml present; inspect_config_surface can reveal packaging, tooling, and script metadata.")
+        if any("test" in item["path"].lower() for item in tree):
+            architecture_hints.append("Test-like paths detected; use propose_test_plan_for_symbol and run_pytest for validation planning/execution.")
+        if not architecture_hints:
+            architecture_hints.append("No strong architecture signal found; start with read-only mapping and semantic search.")
+        payload = {
+            "generated_at": utc_now(),
+            "root": workspace_relative(root),
+            "max_depth": max_depth,
+            "include_hidden": bool(include_hidden),
+            "extension_counts": dict(sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "top_directories": [{"path": key, "children": value} for key, value in top_dirs],
+            "important_files": important_files[:40],
+            "tree": tree[:300],
+            "tree_truncated": len(tree) > 300,
+            "architecture_hints": architecture_hints,
+            "recommended_next_tools": ["inspect_project_entrypoints", "extract_api_surface", "inspect_config_surface", "build_context_pack"],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_project_entrypoints(self, path: str = ".", recursive: bool = True, limit: int = 120) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(safe_int(limit, 120), 500))
+        py_files = iter_python_source_files(target, recursive=bool(recursive), max_files=limit)
+        entrypoints: list[dict[str, Any]] = []
+        common_launch_files: list[dict[str, Any]] = []
+        for name in ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Makefile", "Dockerfile", "docker-compose.yml", "compose.yml", "package.json"]:
+            for candidate in (target.rglob(name) if target.is_dir() else [target] if target.name == name else []):
+                if candidate.is_file() and not should_skip_checkpoint_path(candidate):
+                    common_launch_files.append({"path": workspace_relative(candidate), "kind": name})
+        script_hints: list[str] = []
+        for config_file in common_launch_files[:20]:
+            file_path = resolve_workspace_path(config_file["path"])
+            sample = read_text_sample(file_path, max_chars=5000)
+            if file_path.name == "pyproject.toml":
+                for line in sample.splitlines():
+                    stripped = line.strip()
+                    if stripped and "=" in stripped and not stripped.startswith("#") and any(section in sample for section in ["[project.scripts]", "[tool.poetry.scripts]"]):
+                        if re.match(r"[A-Za-z0-9_.-]+\s*=", stripped):
+                            script_hints.append(f"{workspace_relative(file_path)}: {stripped}")
+            elif file_path.name in {"Makefile", "setup.py", "package.json"}:
+                for line in sample.splitlines()[:80]:
+                    if any(term in line.lower() for term in ["script", "entry", "console", "python", "pytest", "run"]):
+                        script_hints.append(f"{workspace_relative(file_path)}: {line.strip()}")
+        for file_path in py_files:
+            source = read_text_sample(file_path, max_chars=80000)
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as exc:
+                entrypoints.append({"path": workspace_relative(file_path), "kind": "syntax_error", "line": exc.lineno, "detail": exc.msg})
+                continue
+            lines = source.splitlines()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"main", "cli", "run", "app", "create_app"}:
+                    entrypoints.append({
+                        "path": workspace_relative(file_path),
+                        "kind": "function",
+                        "name": node.name,
+                        "line": getattr(node, "lineno", 0),
+                        "signature": f"{node.name}(...)" if not hasattr(ast, "unparse") else trim_text(f"{node.name}{ast.unparse(node.args)}", 200),
+                    })
+                if isinstance(node, ast.If):
+                    test_src = ""
+                    try:
+                        test_src = ast.unparse(node.test)
+                    except Exception:
+                        test_src = ""
+                    if "__name__" in test_src and "__main__" in test_src:
+                        calls = sorted({ast_call_name(child.func) for child in ast.walk(node) if isinstance(child, ast.Call) and ast_call_name(child.func)})
+                        snippet = trim_text("\n".join(lines[max(0, getattr(node, "lineno", 1)-1): min(len(lines), getattr(node, "lineno", 1)+8)]), 800)
+                        entrypoints.append({
+                            "path": workspace_relative(file_path),
+                            "kind": "main_guard",
+                            "line": getattr(node, "lineno", 0),
+                            "calls": calls[:20],
+                            "snippet": snippet,
+                        })
+        recommendations = [
+            "Use inspect_config_surface to verify script metadata before changing CLI behavior.",
+            "Use trace_data_flow on main/cli/run_agent before touching execution flow.",
+        ]
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "python_files_scanned": len(py_files),
+            "entrypoints": entrypoints[:limit],
+            "common_launch_files": common_launch_files[:80],
+            "script_hints": script_hints[:80],
+            "recommendations": recommendations,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def extract_api_surface(self, path: str = ".", recursive: bool = True, include_private: bool = False, limit: int = 120) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(safe_int(limit, 120), 1000))
+        files = iter_python_source_files(target, recursive=bool(recursive), max_files=limit)
+        modules: list[dict[str, Any]] = []
+        total_symbols = 0
+
+        def arg_signature(node: ast.arguments) -> str:
+            if not hasattr(ast, "unparse"):
+                return "(...)"
+            try:
+                return "(" + ", ".join(ast.unparse(arg) for arg in node.args) + (
+                    (", *" + node.vararg.arg) if node.vararg else ""
+                ) + (
+                    (", **" + node.kwarg.arg) if node.kwarg else ""
+                ) + ")"
+            except Exception:
+                return "(...)"
+
+        for file_path in files:
+            source = read_text_sample(file_path, max_chars=200000)
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as exc:
+                modules.append({"path": workspace_relative(file_path), "error": f"SyntaxError line {exc.lineno}: {exc.msg}", "symbols": []})
+                continue
+            symbols: list[dict[str, Any]] = []
+            imports: list[str] = []
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    imports.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    imports.extend(f"{module}.{alias.name}" if module else alias.name for alias in node.names)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not include_private and node.name.startswith("_"):
+                        continue
+                    symbols.append({
+                        "kind": "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
+                        "name": node.name,
+                        "line": getattr(node, "lineno", 0),
+                        "signature": f"{node.name}{arg_signature(node.args)}",
+                        "doc": trim_text((ast.get_docstring(node) or "").splitlines()[0] if ast.get_docstring(node) else "", 200),
+                        "decision_points": ast_decision_points(node),
+                        "public": not node.name.startswith("_"),
+                    })
+                elif isinstance(node, ast.ClassDef):
+                    if not include_private and node.name.startswith("_"):
+                        continue
+                    methods: list[dict[str, Any]] = []
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if not include_private and child.name.startswith("_") and child.name not in {"__init__", "__call__"}:
+                                continue
+                            methods.append({
+                                "name": child.name,
+                                "line": getattr(child, "lineno", 0),
+                                "signature": f"{child.name}{arg_signature(child.args)}",
+                                "doc": trim_text((ast.get_docstring(child) or "").splitlines()[0] if ast.get_docstring(child) else "", 160),
+                                "decision_points": ast_decision_points(child),
+                            })
+                    symbols.append({
+                        "kind": "class",
+                        "name": node.name,
+                        "line": getattr(node, "lineno", 0),
+                        "bases": [ast_call_name(base) if not hasattr(ast, "unparse") else ast.unparse(base) for base in node.bases],
+                        "doc": trim_text((ast.get_docstring(node) or "").splitlines()[0] if ast.get_docstring(node) else "", 200),
+                        "methods": methods,
+                        "method_count": len(methods),
+                        "public": not node.name.startswith("_"),
+                    })
+            total_symbols += len(symbols)
+            modules.append({
+                "path": workspace_relative(file_path),
+                "imports": sorted(set(imports))[:80],
+                "symbol_count": len(symbols),
+                "symbols": symbols[:80],
+            })
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "files_scanned": len(files),
+            "symbol_count": total_symbols,
+            "include_private": bool(include_private),
+            "modules": modules[:limit],
+            "recommended_next_tools": ["find_symbol", "analyze_symbol_impact", "trace_data_flow", "propose_test_plan_for_symbol"],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def trace_data_flow(self, objective: str, symbol: str = "", path: str = ".", limit: int = 8) -> ToolResult:
+        objective_text = str(objective or "").strip()
+        symbol_text = str(symbol or "").strip()
+        if not objective_text and not symbol_text:
+            return ToolResult(False, "Objective or symbol is required.")
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(safe_int(limit, 8), 50))
+        terms = set(search_terms(" ".join([objective_text, symbol_text])))
+        files = iter_python_source_files(target, recursive=target.is_dir(), max_files=250)
+        flows: list[dict[str, Any]] = []
+        for file_path in files:
+            source = read_text_sample(file_path, max_chars=220000)
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            imports: list[str] = []
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    imports.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imports.extend(f"{node.module or ''}.{alias.name}".strip(".") for alias in node.names)
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                name = getattr(node, "name", "")
+                haystack = f"{name} {workspace_relative(file_path)} {ast.get_docstring(node) or ''}".lower()
+                if symbol_text and name != symbol_text and symbol_text.lower() not in haystack:
+                    continue
+                if not symbol_text and terms and not any(term in haystack for term in terms):
+                    continue
+                args: list[str] = []
+                assignments: list[str] = []
+                returns: list[str] = []
+                calls: list[str] = []
+                raises: list[str] = []
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    args = [arg.arg for arg in node.args.args]
+                for child in ast.walk(node):
+                    if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        targets = []
+                        raw_targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                        for target_node in raw_targets:
+                            if isinstance(target_node, ast.Name):
+                                targets.append(target_node.id)
+                            elif isinstance(target_node, ast.Attribute):
+                                targets.append(ast_call_name(target_node))
+                        assignments.extend(targets)
+                    elif isinstance(child, ast.Return):
+                        try:
+                            returns.append(trim_text(ast.unparse(child.value), 160) if child.value is not None and hasattr(ast, "unparse") else "return")
+                        except Exception:
+                            returns.append("return")
+                    elif isinstance(child, ast.Call):
+                        call_name = ast_call_name(child.func)
+                        if call_name:
+                            calls.append(call_name)
+                    elif isinstance(child, ast.Raise):
+                        try:
+                            raises.append(trim_text(ast.unparse(child.exc), 160) if child.exc is not None and hasattr(ast, "unparse") else "raise")
+                        except Exception:
+                            raises.append("raise")
+                flows.append({
+                    "path": workspace_relative(file_path),
+                    "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                    "name": name,
+                    "line": getattr(node, "lineno", 0),
+                    "inputs": args[:20],
+                    "assignments": sorted(set(assignments))[:40],
+                    "returns": returns[:20],
+                    "calls": sorted(set(calls))[:80],
+                    "raises": raises[:20],
+                    "imports": sorted(set(imports))[:40],
+                    "decision_points": ast_decision_points(node),
+                })
+                if len(flows) >= limit:
+                    break
+            if len(flows) >= limit:
+                break
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "symbol": symbol_text,
+            "scope": workspace_relative(target),
+            "flows": flows,
+            "recommendations": [
+                "Use analyze_symbol_impact for call-graph blast radius before editing a shared function.",
+                "Use propose_test_plan_for_symbol to turn observed inputs/returns/raises into regression cases.",
+                "Treat this as an approximate static trace; dynamic behavior still needs tests or smoke runs.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_error_log(self, path: str = "", text: str = "", limit: int = 40) -> ToolResult:
+        source_label = "inline_text"
+        body = str(text or "")
+        if path:
+            target = resolve_workspace_path(path)
+            if not target.is_file():
+                return ToolResult(False, f"File not found: {path}")
+            body = target.read_text(encoding="utf-8", errors="replace")
+            source_label = workspace_relative(target)
+        if not body.strip():
+            return ToolResult(False, "Provide either path or text containing a traceback/log.")
+        limit = max(1, min(safe_int(limit, 40), 200))
+        lines = body.splitlines()
+        exception_matches = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Interrupt|Exit)):\s*(.*)$", body)
+        frames: list[dict[str, Any]] = []
+        frame_re = re.compile(r'^\s*File "([^"]+)", line (\d+), in ([^\s]+)')
+        for index, line in enumerate(lines):
+            match = frame_re.search(line)
+            if match:
+                snippet = lines[index + 1].strip() if index + 1 < len(lines) else ""
+                frames.append({"file": match.group(1), "line": int(match.group(2)), "function": match.group(3), "snippet": snippet})
+        missing_modules = sorted(set(re.findall(r"No module named ['\"]([^'\"]+)['\"]", body)))
+        file_not_found = sorted(set(re.findall(r"No such file or directory: ['\"]([^'\"]+)['\"]", body)))
+        permission_denied = "Permission denied" in body or "Access is denied" in body
+        recommendations: list[str] = []
+        if missing_modules:
+            recommendations.append("Install or route around missing modules, then rerun audit_dependency_health.")
+        if frames:
+            recommendations.append("Use trace_data_flow or propose_test_plan_for_symbol on the deepest project frame.")
+        if file_not_found:
+            recommendations.append("Inspect path assumptions with inspect_path and list_files.")
+        if permission_denied:
+            recommendations.append("Avoid privilege escalation; choose a workspace-safe path or narrower command.")
+        if not recommendations:
+            recommendations.append("Search the log terms with semantic_search_workspace and reproduce with a smoke test.")
+        payload = {
+            "generated_at": utc_now(),
+            "source": source_label,
+            "line_count": len(lines),
+            "exceptions": [{"type": kind, "message": message} for kind, message in exception_matches[-limit:]],
+            "frames": frames[-limit:],
+            "deepest_frame": frames[-1] if frames else None,
+            "missing_modules": missing_modules,
+            "missing_files": file_not_found,
+            "permission_denied": permission_denied,
+            "recommendations": recommendations,
+            "preview_tail": "\n".join(lines[-min(len(lines), 30):]),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_config_surface(self, path: str = ".", include_preview: bool = True, preview_lines: int = 8) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        preview_lines = max(0, min(safe_int(preview_lines, 8), 40))
+        config_names = {
+            ".env", ".env.example", ".env.local", ".gitignore", ".pre-commit-config.yaml",
+            "pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg",
+            "tox.ini", "pytest.ini", "ruff.toml", "mypy.ini", "package.json", "tsconfig.json",
+            "Dockerfile", "docker-compose.yml", "compose.yml", "Makefile", "README.md",
+        }
+        config_suffixes = {".toml", ".ini", ".cfg", ".yaml", ".yml", ".json", ".env"}
+        secret_re = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|bearer|private[_-]?key)\s*([:=])\s*([^\s#]+)")
+        files = [target] if target.is_file() else list(target.rglob("*"))
+        rows: list[dict[str, Any]] = []
+        for item in sorted(files, key=lambda value: workspace_relative(value)):
+            if not item.is_file() or should_skip_checkpoint_path(item):
+                continue
+            name = item.name
+            suffix = item.suffix.lower()
+            if name not in config_names and suffix not in config_suffixes:
+                continue
+            sample = read_text_sample(item, max_chars=12000)
+            redacted = secret_re.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", sample)
+            row = {
+                "path": workspace_relative(item),
+                "size": item.stat().st_size if item.exists() else 0,
+                "kind": name if name in config_names else suffix,
+                "line_count": len(sample.splitlines()),
+                "secret_like_values_redacted": sample != redacted,
+            }
+            if include_preview:
+                row["preview"] = "\n".join(redacted.splitlines()[:preview_lines])
+            rows.append(row)
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "config_file_count": len(rows),
+            "files": rows[:160],
+            "truncated": len(rows) > 160,
+            "recommendations": [
+                "Use this before changing provider, model, package, or test configuration.",
+                "Secret-like values are redacted in previews, but avoid pasting full config into model prompts when unnecessary.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def _url_is_allowed_for_fetch(self, url: str, allow_local: bool = False) -> tuple[bool, str, urllib.parse.ParseResult | None]:
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception as exc:
+            return False, f"Invalid URL: {exc}", None
+        if parsed.scheme not in {"http", "https"}:
+            return False, "Only http and https URLs are allowed.", parsed
+        host = parsed.hostname or ""
+        if not host:
+            return False, "URL must include a host.", parsed
+        if allow_local:
+            return True, "allowed", parsed
+        lowered = host.lower()
+        if lowered in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or lowered.endswith(".local"):
+            return False, "Local/private hosts are denied unless allow_local=true.", parsed
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                address = info[4][0]
+                ip = ipaddress.ip_address(address)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                    return False, "Local/private network addresses are denied unless allow_local=true.", parsed
+        except Exception:
+            # DNS failures will be reported by the actual request; do not leak resolver detail here.
+            pass
+        return True, "allowed", parsed
+
+    def fetch_url_text(self, url: str, max_chars: int = 6000, timeout: int = 10, allow_local: bool = False) -> ToolResult:
+        url_text = str(url or "").strip()
+        allowed, reason, parsed = self._url_is_allowed_for_fetch(url_text, allow_local=bool(allow_local))
+        if not allowed:
+            return ToolResult(False, reason)
+        max_chars = max(200, min(safe_int(max_chars, 6000), 50000))
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        headers = {"User-Agent": "Cerebro-Agent/1.0 (+bounded-text-fetch)", "Accept": "text/*, application/json, application/xml;q=0.8, */*;q=0.2"}
+        try:
+            request = urllib.request.Request(url_text, headers=headers, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content_type = response.headers.get("content-type", "")
+                raw = response.read(max_chars + 1)
+                status = getattr(response, "status", None)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(min(max_chars, 2000)).decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+            return ToolResult(False, f"HTTP {exc.code}: {trim_text(detail, 1000)}")
+        except Exception as exc:
+            return ToolResult(False, f"URL fetch failed: {trim_text(str(exc), 600)}")
+        truncated = len(raw) > max_chars
+        raw = raw[:max_chars]
+        text = raw.decode("utf-8", errors="replace")
+        payload = {
+            "generated_at": utc_now(),
+            "url": url_text,
+            "host": parsed.hostname if parsed else "",
+            "status": status,
+            "content_type": content_type,
+            "chars_returned": len(text),
+            "truncated": truncated,
+            "text": text,
+            "recommendations": ["Summarize or cite only the relevant portions; do not paste large pages into follow-up prompts unnecessarily."],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_http_endpoint(self, url: str, timeout: int = 10, allow_local: bool = False) -> ToolResult:
+        url_text = str(url or "").strip()
+        allowed, reason, parsed = self._url_is_allowed_for_fetch(url_text, allow_local=bool(allow_local))
+        if not allowed:
+            return ToolResult(False, reason)
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        headers = {"User-Agent": "Cerebro-Agent/1.0 (+endpoint-inspection)", "Accept": "*/*"}
+        try:
+            request = urllib.request.Request(url_text, headers=headers, method="HEAD")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = {
+                    "generated_at": utc_now(),
+                    "url": url_text,
+                    "host": parsed.hostname if parsed else "",
+                    "status": getattr(response, "status", None),
+                    "reason": getattr(response, "reason", ""),
+                    "headers": {key.lower(): value for key, value in response.headers.items()},
+                    "method": "HEAD",
+                }
+        except urllib.error.HTTPError as exc:
+            payload = {
+                "generated_at": utc_now(),
+                "url": url_text,
+                "host": parsed.hostname if parsed else "",
+                "status": exc.code,
+                "reason": str(exc.reason),
+                "headers": {key.lower(): value for key, value in exc.headers.items()} if exc.headers else {},
+                "method": "HEAD",
+                "error": trim_text(str(exc), 600),
+            }
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        except Exception as exc:
+            return ToolResult(False, f"Endpoint inspection failed: {trim_text(str(exc), 600)}")
+        payload["recommendations"] = ["Use fetch_url_text only when body content is needed and keep max_chars bounded."]
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+
+    def fetch_json_api(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: dict[str, Any] | None = None,
+        body: Any = None,
+        max_chars: int = 20000,
+        timeout: int = 10,
+        allow_local: bool = False,
+    ) -> ToolResult:
+        url_text = str(url or "").strip()
+        allowed, reason, parsed = self._url_is_allowed_for_fetch(url_text, allow_local=bool(allow_local))
+        if not allowed:
+            return ToolResult(False, reason)
+
+        method_text = str(method or "GET").upper().strip()
+        if method_text not in {"GET", "POST"}:
+            return ToolResult(False, "Only GET and POST JSON API calls are supported.")
+        max_chars = max(200, min(safe_int(max_chars, 20000), 250000))
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+
+        request_headers = {
+            "User-Agent": "Cerebro-Agent/1.0 (+bounded-json-api)",
+            "Accept": "application/json, text/json;q=0.9, */*;q=0.2",
+        }
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                if key_text.lower() in {"authorization", "proxy-authorization", "cookie", "set-cookie"}:
+                    request_headers[key_text] = "<redacted>"
+                else:
+                    request_headers[key_text] = str(value)
+
+        data: bytes | None = None
+        body_preview: Any = None
+        if method_text == "POST":
+            request_headers.setdefault("Content-Type", "application/json")
+            body_value = {} if body is None else body
+            try:
+                data = json.dumps(body_value).encode("utf-8")
+                body_preview = body_value if len(data) <= 2000 else "<body too large to preview>"
+            except TypeError as exc:
+                return ToolResult(False, f"Body is not JSON-serializable: {exc}")
+
+        send_headers = {
+            key: (str(value) if value != "<redacted>" else "")
+            for key, value in request_headers.items()
+        }
+        try:
+            request = urllib.request.Request(url_text, data=data, headers=send_headers, method=method_text)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content_type = response.headers.get("content-type", "")
+                raw = response.read(max_chars + 1)
+                status = getattr(response, "status", None)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(min(max_chars + 1, 50000)) if hasattr(exc, "read") else b""
+            text = raw[:max_chars].decode("utf-8", errors="replace")
+            payload = {
+                "generated_at": utc_now(),
+                "url": url_text,
+                "host": parsed.hostname if parsed else "",
+                "method": method_text,
+                "status": exc.code,
+                "reason": str(exc.reason),
+                "headers": {key.lower(): value for key, value in exc.headers.items()} if exc.headers else {},
+                "text_preview": trim_text(text, 4000),
+                "truncated": len(raw) > max_chars,
+            }
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        except Exception as exc:
+            return ToolResult(False, f"JSON API request failed: {trim_text(str(exc), 600)}")
+
+        truncated = len(raw) > max_chars
+        text = raw[:max_chars].decode("utf-8", errors="replace")
+        parsed_json: Any = None
+        parse_error = ""
+        try:
+            parsed_json = json.loads(text)
+        except json.JSONDecodeError as exc:
+            parse_error = f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+
+        payload = {
+            "generated_at": utc_now(),
+            "url": url_text,
+            "host": parsed.hostname if parsed else "",
+            "method": method_text,
+            "status": status,
+            "content_type": content_type,
+            "request_headers": request_headers,
+            "body_preview": body_preview,
+            "chars_returned": len(text),
+            "truncated": truncated,
+            "json": parsed_json,
+            "json_parse_error": parse_error,
+            "text_preview": "" if parsed_json is not None else trim_text(text, 8000),
+            "recommendations": [
+                "Use this for small documentation, status, metadata, and OSINT APIs.",
+                "Do not send secrets in headers or body; authorization-like headers are redacted from logs.",
+            ],
+        }
+        return ToolResult(parsed_json is not None, json.dumps(payload, indent=2), meta=payload)
+
+
+    def extract_html_metadata(
+        self,
+        url: str,
+        max_chars: int = 100000,
+        timeout: int = 10,
+        allow_local: bool = False,
+        link_limit: int = 100,
+    ) -> ToolResult:
+        url_text = str(url or "").strip()
+        allowed, reason, parsed = self._url_is_allowed_for_fetch(url_text, allow_local=bool(allow_local))
+        if not allowed:
+            return ToolResult(False, reason)
+        max_chars = max(1000, min(safe_int(max_chars, 100000), 500000))
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        link_limit = max(0, min(safe_int(link_limit, 100), 1000))
+
+        headers = {
+            "User-Agent": "Cerebro-Agent/1.0 (+bounded-html-metadata)",
+            "Accept": "text/html, application/xhtml+xml;q=0.9, */*;q=0.1",
+        }
+        try:
+            request = urllib.request.Request(url_text, headers=headers, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content_type = response.headers.get("content-type", "")
+                status = getattr(response, "status", None)
+                final_url = response.geturl()
+                raw = response.read(max_chars + 1)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(min(max_chars, 4000)).decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+            return ToolResult(False, f"HTTP {exc.code}: {trim_text(detail, 1000)}")
+        except Exception as exc:
+            return ToolResult(False, f"HTML metadata fetch failed: {trim_text(str(exc), 600)}")
+
+        truncated = len(raw) > max_chars
+        text = raw[:max_chars].decode("utf-8", errors="replace")
+
+        class MetadataParser(html.parser.HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=True)
+                self.title_parts: list[str] = []
+                self.in_title = False
+                self.links: list[dict[str, str]] = []
+                self.metas: list[dict[str, str]] = []
+                self.headings: list[dict[str, str]] = []
+                self.canonical = ""
+                self._heading_tag = ""
+                self._heading_parts: list[str] = []
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                tag = tag.lower()
+                attr = {str(k).lower(): str(v or "") for k, v in attrs}
+                if tag == "title":
+                    self.in_title = True
+                elif tag == "meta":
+                    key = attr.get("name") or attr.get("property") or attr.get("http-equiv")
+                    content = attr.get("content", "")
+                    if key and content:
+                        self.metas.append({"key": key, "content": trim_text(content, 500)})
+                elif tag == "link" and attr.get("rel", "").lower() == "canonical" and attr.get("href"):
+                    self.canonical = attr.get("href", "")
+                elif tag == "a" and attr.get("href"):
+                    self.links.append({"href": attr.get("href", ""), "text": ""})
+                elif tag in {"h1", "h2", "h3"}:
+                    self._heading_tag = tag
+                    self._heading_parts = []
+
+            def handle_endtag(self, tag: str) -> None:
+                tag = tag.lower()
+                if tag == "title":
+                    self.in_title = False
+                if self._heading_tag and tag == self._heading_tag:
+                    text_value = re.sub(r"\s+", " ", " ".join(self._heading_parts)).strip()
+                    if text_value:
+                        self.headings.append({"level": self._heading_tag, "text": trim_text(text_value, 300)})
+                    self._heading_tag = ""
+                    self._heading_parts = []
+
+            def handle_data(self, data: str) -> None:
+                if self.in_title:
+                    self.title_parts.append(data)
+                if self._heading_tag:
+                    self._heading_parts.append(data)
+                if self.links and not self.links[-1].get("text"):
+                    cleaned = re.sub(r"\s+", " ", data).strip()
+                    if cleaned:
+                        self.links[-1]["text"] = trim_text(cleaned, 200)
+
+        parser_obj = MetadataParser()
+        try:
+            parser_obj.feed(text)
+        except Exception:
+            # HTML in the wild is often malformed; keep partial parse results.
+            pass
+
+        base_url = final_url or url_text
+        host = urllib.parse.urlparse(base_url).hostname or (parsed.hostname if parsed else "")
+        normalized_links: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for link in parser_obj.links:
+            href = str(link.get("href") or "").strip()
+            if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
+                continue
+            absolute = urllib.parse.urljoin(base_url, href)
+            parsed_link = urllib.parse.urlparse(absolute)
+            if parsed_link.scheme not in {"http", "https"} or not parsed_link.netloc:
+                continue
+            normalized = urllib.parse.urlunparse((parsed_link.scheme, parsed_link.netloc, parsed_link.path or "/", "", parsed_link.query, ""))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_links.append(
+                {
+                    "url": normalized,
+                    "host": parsed_link.hostname or "",
+                    "same_host": (parsed_link.hostname or "").lower() == str(host or "").lower(),
+                    "text": link.get("text", ""),
+                }
+            )
+            if len(normalized_links) >= link_limit:
+                break
+
+        title = re.sub(r"\s+", " ", " ".join(parser_obj.title_parts)).strip()
+        payload = {
+            "generated_at": utc_now(),
+            "url": url_text,
+            "final_url": base_url,
+            "host": host,
+            "status": status,
+            "content_type": content_type,
+            "chars_scanned": len(text),
+            "truncated": truncated,
+            "title": trim_text(title, 500),
+            "canonical": urllib.parse.urljoin(base_url, parser_obj.canonical) if parser_obj.canonical else "",
+            "meta_tags": parser_obj.metas[:100],
+            "headings": parser_obj.headings[:80],
+            "link_count_returned": len(normalized_links),
+            "links": normalized_links,
+            "recommendations": [
+                "Use crawl_url_map for a bounded same-host crawl when a page's link graph matters.",
+                "Use check_http_security_headers for a security-header-focused view of the same endpoint.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def check_http_security_headers(self, url: str, timeout: int = 10, allow_local: bool = False) -> ToolResult:
+        endpoint = self.inspect_http_endpoint(url=url, timeout=timeout, allow_local=allow_local)
+        if endpoint.meta:
+            payload = dict(endpoint.meta)
+        else:
+            try:
+                payload = json.loads(endpoint.content)
+            except (json.JSONDecodeError, TypeError):
+                return endpoint
+        headers = {str(k).lower(): str(v) for k, v in (payload.get("headers") or {}).items()}
+        parsed = urllib.parse.urlparse(str(url or ""))
+        checks: list[dict[str, Any]] = []
+
+        def add_check(name: str, header: str, ok: bool, severity: str, detail: str) -> None:
+            checks.append(
+                {
+                    "name": name,
+                    "header": header,
+                    "ok": bool(ok),
+                    "severity": severity if not ok else "info",
+                    "detail": detail,
+                    "value": headers.get(header, ""),
+                }
+            )
+
+        add_check(
+            "Strict Transport Security",
+            "strict-transport-security",
+            parsed.scheme == "http" or "strict-transport-security" in headers,
+            "medium",
+            "Missing HSTS on HTTPS can allow downgrade or cookie exposure on repeat visits.",
+        )
+        csp = headers.get("content-security-policy", "")
+        add_check(
+            "Content Security Policy",
+            "content-security-policy",
+            bool(csp),
+            "medium",
+            "Missing CSP weakens browser-side mitigation for XSS and content injection.",
+        )
+        add_check(
+            "X-Content-Type-Options",
+            "x-content-type-options",
+            headers.get("x-content-type-options", "").lower() == "nosniff",
+            "low",
+            "Expected x-content-type-options: nosniff.",
+        )
+        xfo = headers.get("x-frame-options", "").lower()
+        has_frame_ancestors = "frame-ancestors" in csp.lower()
+        add_check(
+            "Clickjacking Protection",
+            "x-frame-options/content-security-policy",
+            xfo in {"deny", "sameorigin"} or has_frame_ancestors,
+            "medium",
+            "Expected X-Frame-Options DENY/SAMEORIGIN or CSP frame-ancestors.",
+        )
+        add_check(
+            "Referrer Policy",
+            "referrer-policy",
+            bool(headers.get("referrer-policy")),
+            "low",
+            "Missing Referrer-Policy can leak URL data through outbound requests.",
+        )
+        add_check(
+            "Permissions Policy",
+            "permissions-policy",
+            bool(headers.get("permissions-policy")),
+            "low",
+            "Missing Permissions-Policy leaves browser feature access less explicit.",
+        )
+        add_check(
+            "Cross-Origin Opener Policy",
+            "cross-origin-opener-policy",
+            bool(headers.get("cross-origin-opener-policy")),
+            "low",
+            "Missing COOP can weaken cross-origin isolation for some applications.",
+        )
+        cookie_headers = [value for key, value in headers.items() if key == "set-cookie"]
+        if cookie_headers:
+            joined = "\n".join(cookie_headers).lower()
+            add_check(
+                "Cookie Secure Flag",
+                "set-cookie",
+                "secure" in joined,
+                "medium",
+                "Cookies should generally use Secure on HTTPS.",
+            )
+            add_check(
+                "Cookie HttpOnly Flag",
+                "set-cookie",
+                "httponly" in joined,
+                "medium",
+                "Sensitive cookies should generally use HttpOnly.",
+            )
+
+        missing_or_weak = [check for check in checks if not check["ok"]]
+        severity_score = sum({"info": 0, "low": 1, "medium": 2, "high": 3}.get(str(item.get("severity")), 1) for item in missing_or_weak)
+        grade = "A" if severity_score == 0 else "B" if severity_score <= 2 else "C" if severity_score <= 5 else "D"
+        result_payload = {
+            "generated_at": utc_now(),
+            "url": url,
+            "status": payload.get("status"),
+            "grade": grade,
+            "missing_or_weak_count": len(missing_or_weak),
+            "checks": checks,
+            "recommendations": [
+                "Treat this as a heuristic header review, not a full web-application security assessment.",
+                "Confirm intentional omissions with the application architecture before changing production headers.",
+            ],
+        }
+        return ToolResult(endpoint.ok or bool(checks), json.dumps(result_payload, indent=2), meta=result_payload)
+
+    def crawl_url_map(
+        self,
+        start_url: str,
+        max_pages: int = 10,
+        max_depth: int = 1,
+        timeout: int = 10,
+        allow_local: bool = False,
+        same_host_only: bool = True,
+    ) -> ToolResult:
+        start = str(start_url or "").strip()
+        allowed, reason, parsed = self._url_is_allowed_for_fetch(start, allow_local=bool(allow_local))
+        if not allowed:
+            return ToolResult(False, reason)
+        max_pages = max(1, min(safe_int(max_pages, 10), 50))
+        max_depth = max(0, min(safe_int(max_depth, 1), 3))
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        start_host = (parsed.hostname if parsed else "") or ""
+        queue: collections.deque[tuple[str, int]] = collections.deque([(start, 0)])
+        visited: set[str] = set()
+        pages: list[dict[str, Any]] = []
+        edges: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = []
+
+        while queue and len(visited) < max_pages:
+            current, depth = queue.popleft()
+            current_norm = urllib.parse.urlunparse(urllib.parse.urlparse(current)._replace(fragment=""))
+            if current_norm in visited:
+                continue
+            current_host = urllib.parse.urlparse(current_norm).hostname or ""
+            if same_host_only and current_host.lower() != start_host.lower():
+                continue
+            visited.add(current_norm)
+            meta_result = self.extract_html_metadata(current_norm, max_chars=120000, timeout=timeout, allow_local=allow_local, link_limit=200)
+            if not meta_result.ok:
+                errors.append({"url": current_norm, "error": trim_text(meta_result.content, 500)})
+                pages.append({"url": current_norm, "depth": depth, "ok": False, "error": trim_text(meta_result.content, 500)})
+                continue
+            meta = meta_result.meta
+            page_links = meta.get("links", []) if isinstance(meta.get("links"), list) else []
+            pages.append(
+                {
+                    "url": current_norm,
+                    "depth": depth,
+                    "ok": True,
+                    "status": meta.get("status"),
+                    "title": meta.get("title", ""),
+                    "canonical": meta.get("canonical", ""),
+                    "link_count": len(page_links),
+                }
+            )
+            for link in page_links:
+                target_url = str(link.get("url") or "")
+                if not target_url:
+                    continue
+                target_host = urllib.parse.urlparse(target_url).hostname or ""
+                if same_host_only and target_host.lower() != start_host.lower():
+                    continue
+                edges.append({"source": current_norm, "target": target_url, "text": trim_text(str(link.get("text") or ""), 100)})
+                if depth < max_depth and target_url not in visited and len(visited) + len(queue) < max_pages:
+                    queue.append((target_url, depth + 1))
+
+        payload = {
+            "generated_at": utc_now(),
+            "start_url": start,
+            "same_host_only": bool(same_host_only),
+            "max_pages": max_pages,
+            "max_depth": max_depth,
+            "visited_count": len(visited),
+            "page_count": len(pages),
+            "edge_count": len(edges),
+            "pages": pages,
+            "edges": edges[:1000],
+            "errors": errors[:50],
+            "recommendations": [
+                "Keep max_depth low for reconnaissance; this crawler is designed for maps, not mirroring sites.",
+                "Use extract_html_metadata on a specific page when you need richer headings/meta/link details.",
+            ],
+        }
+        return ToolResult(bool(pages), json.dumps(payload, indent=2), meta=payload)
+
+    def infer_json_schema(
+        self,
+        path: str = "",
+        json_text: str = "",
+        max_items: int = 1000,
+        max_depth: int = 6,
+    ) -> ToolResult:
+        max_items = max(1, min(safe_int(max_items, 1000), 20000))
+        max_depth = max(1, min(safe_int(max_depth, 6), 12))
+        source = ""
+        samples: list[Any] = []
+        parse_errors: list[str] = []
+
+        if str(json_text or "").strip():
+            source = "json_text"
+            try:
+                samples = [json.loads(str(json_text))]
+            except json.JSONDecodeError as exc:
+                return ToolResult(False, f"Invalid json_text: line {exc.lineno}, column {exc.colno}: {exc.msg}")
+        else:
+            target = resolve_workspace_path(path or "")
+            if not target.is_file():
+                return ToolResult(False, f"JSON/JSONL file not found: {path}")
+            source = workspace_relative(target)
+            suffix = target.suffix.lower()
+            try:
+                if suffix == ".jsonl" or suffix == ".ndjson":
+                    with target.open("r", encoding="utf-8", errors="replace") as handle:
+                        for line_number, line in enumerate(handle, start=1):
+                            if len(samples) >= max_items:
+                                break
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                samples.append(json.loads(line))
+                            except json.JSONDecodeError as exc:
+                                parse_errors.append(f"line {line_number}: {exc.msg}")
+                else:
+                    parsed_value = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+                    if isinstance(parsed_value, list):
+                        samples = parsed_value[:max_items]
+                    else:
+                        samples = [parsed_value]
+            except json.JSONDecodeError as exc:
+                return ToolResult(False, f"Invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}")
+            except OSError as exc:
+                return ToolResult(False, f"Could not read {path}: {exc}")
+
+        def merge_schema(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+            if not left:
+                return right
+            types = sorted(set(left.get("types", [])) | set(right.get("types", [])))
+            merged: dict[str, Any] = {"types": types, "count": int(left.get("count", 0)) + int(right.get("count", 0))}
+            if "properties" in left or "properties" in right:
+                props: dict[str, Any] = {}
+                all_keys = set((left.get("properties") or {}).keys()) | set((right.get("properties") or {}).keys())
+                for key in sorted(all_keys):
+                    props[key] = merge_schema((left.get("properties") or {}).get(key, {}), (right.get("properties") or {}).get(key, {}))
+                merged["properties"] = props
+            if "items" in left or "items" in right:
+                merged["items"] = merge_schema(left.get("items", {}), right.get("items", {}))
+            examples = []
+            for value in list(left.get("examples", [])) + list(right.get("examples", [])):
+                if value not in examples and len(examples) < 5:
+                    examples.append(value)
+            if examples:
+                merged["examples"] = examples
+            return merged
+
+        def schema_for(value: Any, depth: int = 0) -> dict[str, Any]:
+            if value is None:
+                return {"types": ["null"], "count": 1, "examples": [None]}
+            if isinstance(value, bool):
+                return {"types": ["boolean"], "count": 1, "examples": [value]}
+            if isinstance(value, int) and not isinstance(value, bool):
+                return {"types": ["integer"], "count": 1, "examples": [value]}
+            if isinstance(value, float):
+                return {"types": ["number"], "count": 1, "examples": [value]}
+            if isinstance(value, str):
+                return {"types": ["string"], "count": 1, "examples": [trim_text(value, 120)]}
+            if isinstance(value, list):
+                item_schema: dict[str, Any] = {}
+                if depth < max_depth:
+                    for item in value[: min(len(value), 100)]:
+                        item_schema = merge_schema(item_schema, schema_for(item, depth + 1))
+                return {"types": ["array"], "count": 1, "length_min": len(value), "length_max": len(value), "items": item_schema}
+            if isinstance(value, dict):
+                props: dict[str, Any] = {}
+                if depth < max_depth:
+                    for key, item in list(value.items())[:500]:
+                        props[str(key)] = schema_for(item, depth + 1)
+                return {"types": ["object"], "count": 1, "properties": props}
+            return {"types": [type(value).__name__], "count": 1, "examples": [trim_text(repr(value), 120)]}
+
+        schema: dict[str, Any] = {}
+        for sample in samples[:max_items]:
+            sample_schema = schema_for(sample, 0)
+            if isinstance(sample, list) and "length_min" in sample_schema and "length_max" in sample_schema:
+                pass
+            schema = merge_schema(schema, sample_schema)
+
+        # Add object key presence counts for common tabular JSON/JSONL records.
+        key_presence: dict[str, int] = collections.Counter()
+        object_samples = [item for item in samples if isinstance(item, dict)]
+        for item in object_samples:
+            for key in item:
+                key_presence[str(key)] += 1
+        required_keys = sorted(key for key, count in key_presence.items() if object_samples and count == len(object_samples))
+        payload = {
+            "generated_at": utc_now(),
+            "source": source,
+            "sample_count": len(samples),
+            "parse_errors": parse_errors[:50],
+            "schema": schema,
+            "object_key_presence": dict(sorted(key_presence.items())),
+            "required_keys_in_sample": required_keys,
+            "recommendations": [
+                "Schema is inferred from bounded samples, not a formal contract.",
+                "Use query_sqlite_database/profile_csv_file for tabular stores, and inspect_jsonl_file for log-specific key frequencies.",
+            ],
+        }
+        return ToolResult(bool(samples) and not (parse_errors and not samples), json.dumps(payload, indent=2), meta=payload)
+
+    def extract_text_entities(
+        self,
+        path: str = ".",
+        recursive: bool = True,
+        entity_types: list[str] | None = None,
+        limit: int = 200,
+        max_file_chars: int = 200000,
+    ) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        limit = max(1, min(safe_int(limit, 200), 2000))
+        max_file_chars = max(1000, min(safe_int(max_file_chars, 200000), 2000000))
+        requested = {str(item).lower().strip() for item in (entity_types or []) if str(item).strip()}
+        patterns: dict[str, re.Pattern[str]] = {
+            "url": re.compile(r"https?://[^\s\"'<>]+", re.I),
+            "email": re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I),
+            "ipv4": re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
+            "cve": re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I),
+            "md5": re.compile(r"\b[a-fA-F0-9]{32}\b"),
+            "sha1": re.compile(r"\b[a-fA-F0-9]{40}\b"),
+            "sha256": re.compile(r"\b[a-fA-F0-9]{64}\b"),
+            "aws_access_key": re.compile(r"\bA(?:KIA|SIA)[A-Z0-9]{16}\b"),
+            "secret_assignment": re.compile(r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|private[_-]?key)\b\s*[:=]\s*[\"']?([^\s\"']{8,})"),
+        }
+        selected_patterns = {name: pattern for name, pattern in patterns.items() if not requested or name in requested}
+        if requested and not selected_patterns:
+            return ToolResult(False, f"No supported entity types selected. Supported: {', '.join(sorted(patterns))}")
+        candidates = [target] if target.is_file() else list(target.rglob("*") if recursive else target.iterdir())
+        findings: list[dict[str, Any]] = []
+        files_scanned = 0
+        skipped_binary = 0
+
+        def redact(value: str, entity_type: str) -> str:
+            if entity_type in {"aws_access_key", "secret_assignment"}:
+                cleaned = str(value)
+                if len(cleaned) <= 8:
+                    return "<redacted>"
+                return f"{cleaned[:4]}…{cleaned[-4:]}"
+            return value
+
+        for candidate in candidates:
+            if len(findings) >= limit:
+                break
+            if not candidate.is_file() or should_skip_checkpoint_path(candidate):
+                continue
+            if not looks_like_text_path(candidate):
+                continue
+            text = read_text_sample(candidate, max_file_chars)
+            if not text:
+                skipped_binary += 1
+                continue
+            files_scanned += 1
+            line_starts = [0]
+            for match in re.finditer(r"\n", text):
+                line_starts.append(match.end())
+            for entity_type, pattern in selected_patterns.items():
+                for match in pattern.finditer(text):
+                    value = match.group(1) if entity_type == "secret_assignment" and match.groups() else match.group(0)
+                    line_no = 1 + sum(1 for start in line_starts if start <= match.start()) - 1
+                    line = text.splitlines()[max(0, line_no - 1)] if text.splitlines() and line_no - 1 < len(text.splitlines()) else ""
+                    findings.append(
+                        {
+                            "path": workspace_relative(candidate),
+                            "line": line_no,
+                            "entity_type": entity_type,
+                            "value": redact(str(value), entity_type),
+                            "preview": trim_text(line.replace(str(value), redact(str(value), entity_type)), 300),
+                        }
+                    )
+                    if len(findings) >= limit:
+                        break
+                if len(findings) >= limit:
+                    break
+
+        counts = collections.Counter(str(item.get("entity_type")) for item in findings)
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "recursive": bool(recursive),
+            "files_scanned": files_scanned,
+            "skipped_binary_or_empty": skipped_binary,
+            "entity_types": sorted(selected_patterns),
+            "finding_count": len(findings),
+            "counts_by_type": dict(sorted(counts.items())),
+            "findings": findings,
+            "recommendations": [
+                "Secret-like values are redacted in output; inspect the referenced file directly before rotating anything.",
+                "Use hash_workspace_file or lookup_malware_hash for hash enrichment after extracting suspicious hashes.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def generate_file_manifest(
+        self,
+        path: str = ".",
+        recursive: bool = True,
+        include_hashes: bool = True,
+        max_files: int = 500,
+        max_bytes_per_hash: int = 10485760,
+    ) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}")
+        max_files = max(1, min(safe_int(max_files, 500), 5000))
+        max_bytes_per_hash = max(0, min(safe_int(max_bytes_per_hash, 10485760), 100 * 1024 * 1024))
+        candidates = [target] if target.is_file() else list(target.rglob("*") if recursive else target.iterdir())
+        files: list[dict[str, Any]] = []
+        extension_counts: collections.Counter[str] = collections.Counter()
+        total_bytes = 0
+        skipped = 0
+        for candidate in sorted(candidates, key=lambda item: workspace_relative(item) if WORKSPACE_ROOT in item.resolve().parents or item.resolve() == WORKSPACE_ROOT else str(item)):
+            if len(files) >= max_files:
+                skipped += 1
+                continue
+            if not candidate.is_file() or should_skip_checkpoint_path(candidate):
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            suffix = candidate.suffix.lower() or "(none)"
+            extension_counts[suffix] += 1
+            total_bytes += stat.st_size
+            row = {
+                "path": workspace_relative(candidate),
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "extension": suffix,
+                "mime_guess": mimetypes.guess_type(str(candidate))[0] or "",
+            }
+            if include_hashes:
+                if stat.st_size <= max_bytes_per_hash:
+                    try:
+                        row["sha256"] = _file_hashes(candidate)["sha256"]
+                    except OSError as exc:
+                        row["hash_error"] = str(exc)
+                else:
+                    row["sha256"] = "<skipped: file exceeds max_bytes_per_hash>"
+            files.append(row)
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "recursive": bool(recursive),
+            "file_count_returned": len(files),
+            "skipped_after_limit": skipped,
+            "total_bytes_returned": total_bytes,
+            "extension_counts": dict(sorted(extension_counts.items())),
+            "files": files,
+            "recommendations": [
+                "Use compare_workspace_files for content-level comparison between two manifest entries.",
+                "Use include_hashes=false for very large trees when speed matters more than integrity fingerprints.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def compare_workspace_files(self, left_path: str, right_path: str, max_chars: int = 20000) -> ToolResult:
+        left = resolve_workspace_path(left_path)
+        right = resolve_workspace_path(right_path)
+        if not left.is_file():
+            return ToolResult(False, f"Left file not found: {left_path}")
+        if not right.is_file():
+            return ToolResult(False, f"Right file not found: {right_path}")
+        max_chars = max(1000, min(safe_int(max_chars, 20000), 200000))
+        try:
+            left_stat = left.stat()
+            right_stat = right.stat()
+            left_hashes = _file_hashes(left)
+            right_hashes = _file_hashes(right)
+        except OSError as exc:
+            return ToolResult(False, f"Could not inspect files: {exc}")
+        left_text = read_text_sample(left, max_chars)
+        right_text = read_text_sample(right, max_chars)
+        diff_text = ""
+        binary_or_empty = not left_text or not right_text
+        if not binary_or_empty:
+            diff_lines = difflib.unified_diff(
+                left_text.splitlines(),
+                right_text.splitlines(),
+                fromfile=workspace_relative(left),
+                tofile=workspace_relative(right),
+                lineterm="",
+            )
+            diff_text = trim_text("\n".join(diff_lines), max_chars)
+        payload = {
+            "generated_at": utc_now(),
+            "left": {"path": workspace_relative(left), "size": left_stat.st_size, "sha256": left_hashes["sha256"]},
+            "right": {"path": workspace_relative(right), "size": right_stat.st_size, "sha256": right_hashes["sha256"]},
+            "same_sha256": left_hashes["sha256"] == right_hashes["sha256"],
+            "text_diff_available": not binary_or_empty,
+            "diff_truncated_to_chars": max_chars,
+            "unified_diff": diff_text,
+            "recommendations": [
+                "If same_sha256 is true, the files are byte-identical.",
+                "For code changes, prefer git_diff when the comparison is against repository state.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_python_environment(
+        self,
+        include_packages: bool = True,
+        include_env: bool = False,
+        package_limit: int = 200,
+    ) -> ToolResult:
+        package_limit = max(0, min(safe_int(package_limit, 200), 2000))
+        packages: list[dict[str, str]] = []
+        if include_packages:
+            try:
+                import importlib.metadata as importlib_metadata
+                for dist in sorted(importlib_metadata.distributions(), key=lambda item: (item.metadata.get("Name") or "").lower()):
+                    name = dist.metadata.get("Name") or ""
+                    if not name:
+                        continue
+                    packages.append({"name": name, "version": dist.version})
+                    if len(packages) >= package_limit:
+                        break
+            except Exception as exc:
+                packages.append({"name": "<package inspection failed>", "version": trim_text(str(exc), 200)})
+        safe_env: dict[str, str] = {}
+        if include_env:
+            for key, value in sorted(os.environ.items()):
+                lowered = key.lower()
+                if any(secret_word in lowered for secret_word in ["key", "token", "secret", "password", "passwd", "credential"]):
+                    safe_env[key] = "<redacted>"
+                elif key.upper() in {"PATH", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "HOME", "USERPROFILE", "USERNAME", "USER"}:
+                    safe_env[key] = trim_text(value, 1000)
+        payload = {
+            "generated_at": utc_now(),
+            "python_executable": sys.executable,
+            "python_version": sys.version,
+            "platform": sys.platform,
+            "cwd": str(WORKSPACE_ROOT),
+            "prefix": sys.prefix,
+            "base_prefix": getattr(sys, "base_prefix", ""),
+            "in_virtualenv": sys.prefix != getattr(sys, "base_prefix", sys.prefix) or bool(os.environ.get("VIRTUAL_ENV")),
+            "path_entries": sys.path[:20],
+            "include_packages": bool(include_packages),
+            "package_count_returned": len(packages),
+            "packages": packages,
+            "environment": safe_env,
+            "recommendations": [
+                "Use audit_dependency_health for project-level import/dependency concerns.",
+                "Environment variables that look secret-bearing are redacted.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_process_table(self, filter: str = "", limit: int = 100, include_command: bool = False) -> ToolResult:
+        limit = max(1, min(safe_int(limit, 100), 500))
+        filter_text = str(filter or "").lower().strip()
+        try:
+            if sys.platform.startswith("win"):
+                command = ["tasklist", "/FO", "CSV", "/V"]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=10, cwd=WORKSPACE_ROOT)
+                if result.returncode != 0:
+                    return ToolResult(False, trim_text(result.stderr or result.stdout or "tasklist failed", 2000))
+                rows = list(csv.DictReader(result.stdout.splitlines()))
+                processes = []
+                for row in rows:
+                    name = row.get("Image Name", "")
+                    pid = row.get("PID", "")
+                    window_title = row.get("Window Title", "")
+                    searchable = f"{name} {pid} {window_title}".lower()
+                    if filter_text and filter_text not in searchable:
+                        continue
+                    processes.append(
+                        {
+                            "pid": pid,
+                            "name": name,
+                            "session": row.get("Session Name", ""),
+                            "memory": row.get("Mem Usage", ""),
+                            "status": row.get("Status", ""),
+                            "user": row.get("User Name", ""),
+                            "command": trim_text(window_title, 500) if include_command else "<hidden>",
+                        }
+                    )
+                    if len(processes) >= limit:
+                        break
+            else:
+                command = ["ps", "-eo", "pid=,ppid=,user=,comm=,args="]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=10, cwd=WORKSPACE_ROOT)
+                if result.returncode != 0:
+                    return ToolResult(False, trim_text(result.stderr or result.stdout or "ps failed", 2000))
+                processes = []
+                for line in result.stdout.splitlines():
+                    parts = line.strip().split(None, 4)
+                    if len(parts) < 4:
+                        continue
+                    pid, ppid, user, comm = parts[:4]
+                    args = parts[4] if len(parts) > 4 else ""
+                    searchable = f"{pid} {ppid} {user} {comm} {args}".lower()
+                    if filter_text and filter_text not in searchable:
+                        continue
+                    redacted_args = re.sub(r"(?i)(--?(?:api[_-]?key|token|secret|password)\s+)(\S+)", r"\1<redacted>", args)
+                    redacted_args = re.sub(r"(?i)((?:api[_-]?key|token|secret|password)=)(\S+)", r"\1<redacted>", redacted_args)
+                    processes.append(
+                        {
+                            "pid": pid,
+                            "ppid": ppid,
+                            "user": user,
+                            "name": comm,
+                            "command": trim_text(redacted_args, 1000) if include_command else "<hidden>",
+                        }
+                    )
+                    if len(processes) >= limit:
+                        break
+        except FileNotFoundError as exc:
+            return ToolResult(False, f"Process inspection command unavailable: {exc}")
+        except subprocess.TimeoutExpired:
+            return ToolResult(False, "Process inspection timed out after 10 seconds.")
+        payload = {
+            "generated_at": utc_now(),
+            "platform": sys.platform,
+            "filter": filter,
+            "limit": limit,
+            "include_command": bool(include_command),
+            "process_count_returned": len(processes),
+            "processes": processes,
+            "recommendations": [
+                "Command lines are hidden by default; set include_command=true only when needed.",
+                "Secret-looking command-line arguments are redacted when command lines are shown.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def profile_csv_file(self, path: str, delimiter: str = "", sample_rows: int = 5, max_rows: int = 10000) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"CSV file not found: {path}")
+        sample_rows = max(0, min(safe_int(sample_rows, 5), 25))
+        max_rows = max(1, min(safe_int(max_rows, 10000), 250000))
+        try:
+            preview = target.read_text(encoding="utf-8-sig", errors="replace")[:8192]
+            if delimiter:
+                dialect = csv.excel()
+                dialect.delimiter = str(delimiter)[:1]
+            else:
+                try:
+                    dialect = csv.Sniffer().sniff(preview, delimiters=",\t;|")
+                except csv.Error:
+                    dialect = csv.excel()
+            with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+                reader = csv.DictReader(handle, dialect=dialect)
+                columns = [str(column or "").strip() for column in (reader.fieldnames or [])]
+                if not columns:
+                    return ToolResult(False, "CSV appears to have no header row or columns.")
+                missing_counts: dict[str, int] = {column: 0 for column in columns}
+                nonempty_counts: dict[str, int] = {column: 0 for column in columns}
+                unique_values: dict[str, set[str]] = {column: set() for column in columns}
+                numeric_values: dict[str, list[float]] = {column: [] for column in columns}
+                value_types: dict[str, dict[str, int]] = {column: {"number": 0, "string": 0, "empty": 0} for column in columns}
+                samples: list[dict[str, Any]] = []
+                row_count = 0
+                for row in reader:
+                    row_count += 1
+                    if len(samples) < sample_rows:
+                        samples.append({column: row.get(column, "") for column in columns})
+                    for column in columns:
+                        value = str(row.get(column, "") or "").strip()
+                        if not value:
+                            missing_counts[column] += 1
+                            value_types[column]["empty"] += 1
+                            continue
+                        nonempty_counts[column] += 1
+                        if len(unique_values[column]) < 100:
+                            unique_values[column].add(value)
+                        try:
+                            numeric = float(value.replace(",", ""))
+                            numeric_values[column].append(numeric)
+                            value_types[column]["number"] += 1
+                        except ValueError:
+                            value_types[column]["string"] += 1
+                    if row_count >= max_rows:
+                        break
+        except Exception as exc:
+            return ToolResult(False, f"CSV profiling failed: {trim_text(str(exc), 600)}")
+
+        numeric_profile: dict[str, dict[str, Any]] = {}
+        for column, values in numeric_values.items():
+            if not values:
+                continue
+            numeric_profile[column] = {
+                "count": len(values),
+                "min": min(values),
+                "max": max(values),
+                "mean": round(sum(values) / max(1, len(values)), 6),
+            }
+        column_profile = []
+        for column in columns:
+            column_profile.append(
+                {
+                    "name": column,
+                    "missing": missing_counts[column],
+                    "nonempty": nonempty_counts[column],
+                    "unique_sample_count": len(unique_values[column]),
+                    "value_types": value_types[column],
+                    "sample_values": sorted(unique_values[column])[:10],
+                    "numeric": numeric_profile.get(column),
+                }
+            )
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "size_bytes": target.stat().st_size,
+            "delimiter": getattr(dialect, "delimiter", ","),
+            "columns": columns,
+            "column_count": len(columns),
+            "rows_scanned": row_count,
+            "row_limit_hit": row_count >= max_rows,
+            "column_profile": column_profile,
+            "sample_rows": samples,
+            "recommendations": [
+                "Use query_sqlite_database after importing larger CSVs into SQLite for deeper filtering.",
+                "Check columns with high missing counts before using them in automation decisions.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_jsonl_file(self, path: str, limit: int = 5000, sample_rows: int = 5) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"JSONL file not found: {path}")
+        limit = max(1, min(safe_int(limit, 5000), 250000))
+        sample_rows = max(0, min(safe_int(sample_rows, 5), 25))
+        key_counts: collections.Counter[str] = collections.Counter()
+        type_counts: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+        samples: list[Any] = []
+        errors: list[dict[str, Any]] = []
+        parsed_count = 0
+        total_lines = 0
+        try:
+            with target.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    total_lines += 1
+                    if line_number > limit:
+                        break
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        value = json.loads(stripped)
+                    except json.JSONDecodeError as exc:
+                        if len(errors) < 20:
+                            errors.append({"line": line_number, "error": f"column {exc.colno}: {exc.msg}", "preview": trim_text(stripped, 240)})
+                        continue
+                    parsed_count += 1
+                    if len(samples) < sample_rows:
+                        samples.append(value)
+                    if isinstance(value, dict):
+                        for key, item in value.items():
+                            key_text = str(key)
+                            key_counts[key_text] += 1
+                            type_counts[key_text][type(item).__name__] += 1
+                    else:
+                        key_counts["<root>"] += 1
+                        type_counts["<root>"][type(value).__name__] += 1
+        except Exception as exc:
+            return ToolResult(False, f"JSONL inspection failed: {trim_text(str(exc), 600)}")
+
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "size_bytes": target.stat().st_size,
+            "lines_scanned": min(total_lines, limit),
+            "line_limit_hit": total_lines > limit,
+            "parsed_records": parsed_count,
+            "parse_error_count": len(errors),
+            "parse_errors": errors,
+            "top_keys": [{"key": key, "count": count, "types": dict(type_counts[key])} for key, count in key_counts.most_common(80)],
+            "sample_records": samples,
+        }
+        return ToolResult(len(errors) == 0 or parsed_count > 0, json.dumps(payload, indent=2), meta=payload)
+
+    def query_sqlite_database(self, path: str, query: str = "", limit: int = 100, timeout: int = 5) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"SQLite database not found: {path}")
+        limit = max(1, min(safe_int(limit, 100), 5000))
+        timeout = max(1, min(safe_int(timeout, 5), 30))
+        query_text = str(query or "").strip()
+        if not query_text:
+            query_text = "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table','view','index') ORDER BY type, name"
+        lowered = re.sub(r"\s+", " ", query_text.lower()).strip()
+        if ";" in query_text.rstrip(";"):
+            return ToolResult(False, "Only one SQLite statement is allowed.")
+        if not lowered.startswith(("select ", "with ", "pragma ")):
+            return ToolResult(False, "Only read-only SELECT, WITH, or PRAGMA queries are allowed.")
+        if re.search(r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|vacuum|reindex|load_extension)\b", lowered):
+            return ToolResult(False, "Blocked: query contains a write/admin SQLite keyword.")
+        query_text = query_text.rstrip().rstrip(";")
+
+        rows: list[dict[str, Any]] = []
+        columns: list[str] = []
+        start = time.monotonic()
+        try:
+            uri = f"file:{urllib.parse.quote(str(target))}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=timeout)
+            connection.row_factory = sqlite3.Row
+            connection.set_progress_handler(lambda: 1 if time.monotonic() - start > timeout else 0, 10000)
+            cursor = connection.execute(query_text)
+            columns = [item[0] for item in (cursor.description or [])]
+            fetched = cursor.fetchmany(limit + 1)
+            rows = [{column: row[column] for column in columns} for row in fetched[:limit]]
+            truncated = len(fetched) > limit
+            connection.close()
+        except sqlite3.Error as exc:
+            return ToolResult(False, f"SQLite query failed: {trim_text(str(exc), 600)}")
+        except Exception as exc:
+            return ToolResult(False, f"SQLite inspection failed: {trim_text(str(exc), 600)}")
+
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "query": query_text,
+            "columns": columns,
+            "row_count": len(rows),
+            "limit": limit,
+            "truncated": truncated,
+            "elapsed_seconds": round(time.monotonic() - start, 4),
+            "rows": rows,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2, default=str), meta=payload)
+
+    def inspect_archive_file(self, path: str, limit: int = 200) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"Archive file not found: {path}")
+        limit = max(1, min(safe_int(limit, 200), 2000))
+        suffixes = [suffix.lower() for suffix in target.suffixes]
+        entries: list[dict[str, Any]] = []
+        archive_type = "unknown"
+        total_uncompressed = 0
+        dangerous_paths: list[str] = []
+        try:
+            if zipfile.is_zipfile(target):
+                archive_type = "zip"
+                with zipfile.ZipFile(target) as archive:
+                    infos = archive.infolist()
+                    for info in infos[:limit]:
+                        name = info.filename
+                        total_uncompressed += max(0, int(info.file_size))
+                        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+                            dangerous_paths.append(name)
+                        entries.append(
+                            {
+                                "name": name,
+                                "size": info.file_size,
+                                "compressed_size": info.compress_size,
+                                "is_dir": name.endswith("/"),
+                                "modified": datetime(*info.date_time).isoformat() if info.date_time else "",
+                            }
+                        )
+                    entry_count = len(infos)
+            elif tarfile.is_tarfile(target):
+                archive_type = "tar"
+                with tarfile.open(target) as archive:
+                    members = archive.getmembers()
+                    for member in members[:limit]:
+                        name = member.name
+                        total_uncompressed += max(0, int(member.size))
+                        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+                            dangerous_paths.append(name)
+                        entries.append(
+                            {
+                                "name": name,
+                                "size": member.size,
+                                "is_dir": member.isdir(),
+                                "is_file": member.isfile(),
+                                "type": member.type.decode("utf-8", errors="replace") if isinstance(member.type, bytes) else str(member.type),
+                                "modified": datetime.fromtimestamp(member.mtime).isoformat() if member.mtime else "",
+                            }
+                        )
+                    entry_count = len(members)
+            else:
+                return ToolResult(False, f"Unsupported or invalid archive: {path}")
+        except Exception as exc:
+            return ToolResult(False, f"Archive inspection failed: {trim_text(str(exc), 600)}")
+
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "archive_type": archive_type,
+            "suffixes": suffixes,
+            "size_bytes": target.stat().st_size,
+            "entry_count": entry_count,
+            "entries_returned": len(entries),
+            "truncated": entry_count > limit,
+            "estimated_uncompressed_bytes_in_returned_entries": total_uncompressed,
+            "dangerous_paths": dangerous_paths[:50],
+            "path_traversal_risk": bool(dangerous_paths),
+            "entries": entries,
+            "recommendations": [
+                "This tool only inventories archives; it intentionally does not extract files.",
+                "Do not extract archives with absolute paths or '..' components without sanitizing names first.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def extract_pdf_text(self, path: str, max_pages: int = 10, max_chars: int = 20000) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"PDF file not found: {path}")
+        if target.suffix.lower() != ".pdf":
+            return ToolResult(False, "extract_pdf_text only accepts .pdf files.")
+        max_pages = max(1, min(safe_int(max_pages, 10), 100))
+        max_chars = max(500, min(safe_int(max_chars, 20000), 200000))
+        reader_factory = None
+        backend = ""
+        try:
+            from pypdf import PdfReader  # type: ignore
+            reader_factory = PdfReader
+            backend = "pypdf"
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader  # type: ignore
+                reader_factory = PdfReader
+                backend = "PyPDF2"
+            except Exception:
+                return ToolResult(False, "PDF text extraction requires pypdf or PyPDF2. Install one of them to enable this tool.")
+        try:
+            reader = reader_factory(str(target))
+            total_pages = len(reader.pages)
+            page_texts: list[dict[str, Any]] = []
+            collected = ""
+            for index, page in enumerate(reader.pages[:max_pages], start=1):
+                text = page.extract_text() or ""
+                remaining = max_chars - len(collected)
+                if remaining <= 0:
+                    break
+                clipped = text[:remaining]
+                collected += clipped
+                page_texts.append({"page": index, "chars": len(clipped), "text": clipped})
+                if len(collected) >= max_chars:
+                    break
+        except Exception as exc:
+            return ToolResult(False, f"PDF text extraction failed: {trim_text(str(exc), 600)}")
+        payload = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "backend": backend,
+            "size_bytes": target.stat().st_size,
+            "total_pages": total_pages,
+            "pages_returned": len(page_texts),
+            "max_pages": max_pages,
+            "chars_returned": len(collected),
+            "truncated": total_pages > len(page_texts) or len(collected) >= max_chars,
+            "pages": page_texts,
+            "recommendations": ["This is text extraction only. Scanned PDFs require OCR outside this built-in tool."],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_image_metadata(self, path: str, include_exif: bool = False) -> ToolResult:
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"Image file not found: {path}")
+        mime, _ = mimetypes.guess_type(str(target))
+        payload: dict[str, Any] = {
+            "generated_at": utc_now(),
+            "path": workspace_relative(target),
+            "size_bytes": target.stat().st_size,
+            "mime_guess": mime or "",
+            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "pillow_available": False,
+        }
+        try:
+            from PIL import ExifTags, Image  # type: ignore
+            payload["pillow_available"] = True
+            with Image.open(target) as image:
+                payload.update(
+                    {
+                        "format": image.format,
+                        "mode": image.mode,
+                        "width": image.width,
+                        "height": image.height,
+                        "frames": getattr(image, "n_frames", 1),
+                        "animated": bool(getattr(image, "is_animated", False)),
+                    }
+                )
+                if include_exif:
+                    exif_payload: dict[str, Any] = {}
+                    raw_exif = image.getexif()
+                    for key, value in raw_exif.items():
+                        name = ExifTags.TAGS.get(key, str(key))
+                        if isinstance(value, bytes):
+                            rendered = f"<bytes:{len(value)}>"
+                        else:
+                            rendered = trim_text(str(value), 500)
+                        exif_payload[str(name)] = rendered
+                    payload["exif"] = exif_payload
+                    payload["exif_tag_count"] = len(exif_payload)
+        except Exception as exc:
+            payload["pillow_error"] = trim_text(str(exc), 600)
+            header = target.read_bytes()[:32]
+            payload["magic_hex"] = header.hex()
+            payload["recommendations"] = ["Install Pillow for dimensions, frame count, format verification, and EXIF parsing."]
+            return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        payload["recommendations"] = ["Use include_exif=true only when metadata is needed; EXIF can include sensitive location/device details."]
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def _load_external_tool_manifest(self, manifest_path: str = ".agent_external_tools.json") -> tuple[dict[str, Any], str]:
+        target = resolve_workspace_path(manifest_path or ".agent_external_tools.json")
+        if not target.exists():
+            template = {
+                "schema_version": 1,
+                "tools": [
+                    {
+                        "name": "bandit_scan",
+                        "description": "Run Bandit against a Python path when bandit is installed.",
+                        "command": [sys.executable, "-m", "bandit", "-r", "{path}"],
+                        "args_schema": {"path": "."},
+                        "risk": "read_only",
+                        "requires_authorization": False,
+                        "max_timeout": 60,
+                    },
+                    {
+                        "name": "semgrep_scan",
+                        "description": "Run Semgrep with auto config when semgrep is installed.",
+                        "command": ["semgrep", "--config", "auto", "{path}"],
+                        "args_schema": {"path": "."},
+                        "risk": "read_only",
+                        "requires_authorization": False,
+                        "max_timeout": 120,
+                    },
+                ],
+            }
+            return template, f"Manifest not found at {workspace_relative(target)}; returning a starter template. Save it to enable external tools."
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return {}, f"Invalid external tool manifest JSON: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        except OSError as exc:
+            return {}, f"Could not read manifest: {exc}"
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("tools"), list):
+            return {}, "External tool manifest must be an object with a list field named 'tools'."
+        return parsed, ""
+
+    def list_external_tools(self, manifest_path: str = ".agent_external_tools.json") -> ToolResult:
+        manifest, warning = self._load_external_tool_manifest(manifest_path)
+        tools: list[dict[str, Any]] = []
+        for raw in manifest.get("tools", []) if isinstance(manifest, dict) else []:
+            if not isinstance(raw, dict):
+                continue
+            command = raw.get("command", [])
+            exe = str(command[0]) if isinstance(command, list) and command else ""
+            available = bool(exe) and (Path(exe).exists() or shutil.which(exe) is not None or exe == sys.executable)
+            tools.append(
+                {
+                    "name": str(raw.get("name", "")),
+                    "description": str(raw.get("description", "")),
+                    "risk": str(raw.get("risk", "read_only")),
+                    "requires_authorization": bool(raw.get("requires_authorization", False)),
+                    "args_schema": raw.get("args_schema", {}),
+                    "command_preview": [str(part) for part in command] if isinstance(command, list) else command,
+                    "executable_available": available,
+                    "max_timeout": safe_int(raw.get("max_timeout"), 30) or 30,
+                }
+            )
+        payload = {
+            "generated_at": utc_now(),
+            "manifest_path": manifest_path or ".agent_external_tools.json",
+            "warning": warning,
+            "tool_count": len(tools),
+            "tools": tools,
+            "starter_template": manifest if warning and manifest else None,
+            "recommendations": [
+                "Keep external commands read-only by default and use placeholders like {path} for bounded arguments.",
+                "Commands are executed without a shell, but destructive executables are still denied.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def run_external_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        manifest_path: str = ".agent_external_tools.json",
+        authorized: bool = False,
+        timeout: int = 30,
+    ) -> ToolResult:
+        name = str(tool_name or "").strip()
+        if not name:
+            return ToolResult(False, "tool_name cannot be empty.")
+        manifest, warning = self._load_external_tool_manifest(manifest_path)
+        if warning or not manifest:
+            return ToolResult(False, warning or "External tool manifest could not be loaded.")
+        entries = [item for item in manifest.get("tools", []) if isinstance(item, dict) and str(item.get("name", "")).strip() == name]
+        if not entries:
+            return ToolResult(False, f"External tool not found in manifest: {name}")
+        entry = entries[0]
+        risk = str(entry.get("risk", "read_only")).lower()
+        if (risk not in {"read_only", "low"} or bool(entry.get("requires_authorization", False))) and not authorized:
+            payload = {
+                "authorization_required": True,
+                "tool_name": name,
+                "risk": risk,
+                "reason": "This manifest tool requires authorized=true before execution.",
+            }
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        command_template = entry.get("command")
+        if not isinstance(command_template, list) or not command_template:
+            return ToolResult(False, "Manifest entry command must be a non-empty list.")
+        provided_args = args if isinstance(args, dict) else {}
+        defaults = entry.get("args_schema", {}) if isinstance(entry.get("args_schema"), dict) else {}
+        merged_args = dict(defaults) | provided_args
+
+        rendered_command: list[str] = []
+        try:
+            for part in command_template:
+                part_text = str(part)
+                for key, value in merged_args.items():
+                    placeholder = "{" + str(key) + "}"
+                    if placeholder not in part_text:
+                        continue
+                    rendered_value = str(value)
+                    if "path" in str(key).lower() or str(key).lower() in {"file", "dir", "directory"}:
+                        rendered_value = str(resolve_workspace_path(rendered_value))
+                    part_text = part_text.replace(placeholder, rendered_value)
+                rendered_command.append(part_text)
+        except Exception as exc:
+            return ToolResult(False, f"External tool argument rendering failed: {trim_text(str(exc), 600)}")
+
+        executable = Path(rendered_command[0]).name.lower()
+        denied_executables = {"rm", "del", "erase", "rmdir", "format", "shutdown", "reboot", "powershell", "pwsh"}
+        if executable in denied_executables:
+            return ToolResult(False, f"Blocked external tool executable: {executable}")
+        denied_tokens = {"--delete", "--remove", "--force", "/f", "mkfs", "diskpart"}
+        if any(str(part).lower() in denied_tokens for part in rendered_command[1:]):
+            return ToolResult(False, "Blocked external tool arguments that look destructive.")
+        if not (Path(rendered_command[0]).exists() or shutil.which(rendered_command[0]) is not None or rendered_command[0] == sys.executable):
+            return ToolResult(False, f"Command not found: {rendered_command[0]}")
+
+        max_timeout = max(1, min(safe_int(entry.get("max_timeout"), 30) or 30, 300))
+        timeout = max(1, min(safe_int(timeout, max_timeout), max_timeout))
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                rendered_command,
+                cwd=WORKSPACE_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(False, f"External tool timed out after {timeout} seconds.")
+        except Exception as exc:
+            return ToolResult(False, f"External tool execution failed: {trim_text(str(exc), 600)}")
+        output = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
+        payload = {
+            "generated_at": utc_now(),
+            "tool_name": name,
+            "description": str(entry.get("description", "")),
+            "risk": risk,
+            "command": rendered_command,
+            "returncode": result.returncode,
+            "elapsed_seconds": round(time.monotonic() - started, 4),
+            "output": trim_text(output, 20000),
+        }
+        return ToolResult(result.returncode == 0, json.dumps(payload, indent=2), meta=payload)
+
+    def _extract_network_host(self, target: str) -> tuple[str, str, dict[str, Any]]:
+        raw = str(target or "").strip()
+        meta: dict[str, Any] = {"raw_target": raw, "kind": "unknown"}
+        if not raw:
+            return "", "Target cannot be empty.", meta
+        candidate = raw
+        if "://" in raw:
+            try:
+                parsed = urllib.parse.urlparse(raw)
+            except Exception as exc:
+                return "", f"Invalid URL: {exc}", meta
+            if parsed.scheme not in {"http", "https"}:
+                return "", "Only http/https URLs are accepted when a URL is supplied.", meta
+            candidate = parsed.hostname or ""
+            meta.update({"kind": "url", "scheme": parsed.scheme, "port": parsed.port, "path_present": bool(parsed.path and parsed.path != "/")})
+        else:
+            # Allow host:port without treating IPv6 colons as port separators.
+            bracket_match = re.match(r"^\[([^\]]+)\](?::(\d+))?$", raw)
+            if bracket_match:
+                candidate = bracket_match.group(1)
+                if bracket_match.group(2):
+                    meta["port"] = safe_int(bracket_match.group(2), 0)
+            elif raw.count(":") == 1 and not re.search(r"/[0-9]+$", raw):
+                host_part, port_part = raw.rsplit(":", 1)
+                if port_part.isdigit():
+                    candidate = host_part
+                    meta["port"] = safe_int(port_part, 0)
+        candidate = candidate.strip().strip(".")
+        if not candidate:
+            return "", "Target did not contain a hostname or IP address.", meta
+        if len(candidate) > 253:
+            return "", "Hostname/IP target is too long.", meta
+        return candidate, "ok", meta
+
+    def _ip_classification(self, ip_text: str) -> dict[str, Any]:
+        ip_obj = ipaddress.ip_address(ip_text)
+        return {
+            "ip": str(ip_obj),
+            "version": ip_obj.version,
+            "is_global": ip_obj.is_global,
+            "is_private": ip_obj.is_private,
+            "is_loopback": ip_obj.is_loopback,
+            "is_link_local": ip_obj.is_link_local,
+            "is_multicast": ip_obj.is_multicast,
+            "is_reserved": ip_obj.is_reserved,
+            "is_unspecified": ip_obj.is_unspecified,
+            "is_publicly_routable": ip_obj.is_global and not any([ip_obj.is_loopback, ip_obj.is_private, ip_obj.is_link_local, ip_obj.is_multicast, ip_obj.is_reserved, ip_obj.is_unspecified]),
+        }
+
+    def _resolve_host_ips(self, host: str, *, timeout: int = 5) -> tuple[list[dict[str, Any]], list[str]]:
+        # socket.getaddrinfo has no per-call timeout, but default resolver behavior is
+        # acceptable for this local diagnostic helper. The timeout argument is preserved
+        # in tool schemas for symmetry with network calls and future adapters.
+        warnings: list[str] = []
+        rows: list[dict[str, Any]] = []
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except Exception as exc:
+            return [], [f"DNS resolution failed: {trim_text(str(exc), 400)}"]
+        seen: set[str] = set()
+        for family, _socktype, proto, canonname, sockaddr in infos:
+            address = str(sockaddr[0])
+            if address in seen:
+                continue
+            seen.add(address)
+            try:
+                classification = self._ip_classification(address)
+            except ValueError:
+                classification = {"ip": address, "is_publicly_routable": False}
+            rows.append({
+                "address": address,
+                "family": "IPv6" if family == socket.AF_INET6 else "IPv4" if family == socket.AF_INET else str(family),
+                "canonical_name": canonname,
+                "protocol": proto,
+                **classification,
+            })
+        return rows, warnings
+
+    def _public_ip_from_target(self, target: str, *, allow_resolve: bool = True) -> tuple[str, dict[str, Any], str]:
+        host, reason, meta = self._extract_network_host(target)
+        if not host:
+            return "", meta, reason
+        try:
+            network = ipaddress.ip_network(host, strict=False)
+            if network.num_addresses != 1:
+                meta.update({"kind": "cidr", "network": str(network), "prefixlen": network.prefixlen})
+                return "", meta, "CIDR ranges are not accepted for this lookup; provide one IP address."
+            ip_obj = network.network_address
+            classification = self._ip_classification(str(ip_obj))
+            meta.update({"kind": "ip", "host": str(ip_obj), "classification": classification})
+            if not classification.get("is_publicly_routable"):
+                return "", meta, "Target is not a public routable IP; external RDAP/GeoIP lookup is skipped."
+            return str(ip_obj), meta, "ok"
+        except ValueError:
+            pass
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            classification = self._ip_classification(str(ip_obj))
+            meta.update({"kind": "ip", "host": str(ip_obj), "classification": classification})
+            if not classification.get("is_publicly_routable"):
+                return "", meta, "Target is not a public routable IP; external RDAP/GeoIP lookup is skipped."
+            return str(ip_obj), meta, "ok"
+        except ValueError:
+            meta.update({"kind": meta.get("kind") if meta.get("kind") != "unknown" else "hostname", "host": host})
+        if not allow_resolve:
+            return "", meta, "Target is a hostname; resolution disabled."
+        records, warnings = self._resolve_host_ips(host)
+        meta["resolved_addresses"] = records
+        meta["resolution_warnings"] = warnings
+        for record in records:
+            if record.get("is_publicly_routable"):
+                return str(record.get("address")), meta, "ok"
+        return "", meta, "No public routable address found for target."
+
+    def ingest_network_traffic_file(self, path: str, input_format: str = "auto", limit: int = 5000) -> ToolResult:
+        """Ingest network traffic logs/captures into metadata-only normalized flow records."""
+        try:
+            flows, meta = _ids_read_traffic_records(path, input_format=input_format, limit=limit)
+        except Exception as exc:
+            return ToolResult(False, f"Failed to ingest network traffic source: {exc}", {"error": str(exc), "path": path})
+        analysis = _ids_analyze_flows(flows, sensitivity="medium")
+        sample = flows[:10]
+        payload = {
+            **meta,
+            "flow_count": len(flows),
+            "sample_flows": sample,
+            "top_sources": analysis.get("top_sources", []),
+            "top_destinations": analysis.get("top_destinations", []),
+            "top_destination_ports": analysis.get("top_destination_ports", []),
+            "protocols": analysis.get("protocols", []),
+            "external_destination_count": analysis.get("external_destination_count", 0),
+        }
+        lines = [
+            f"Ingested {len(flows)} metadata-only network flow/packet record(s) from {meta.get('path')}.",
+            f"Detected format: {meta.get('format')}.",
+        ]
+        if meta.get("warnings"):
+            lines.append("Warnings: " + "; ".join(str(item) for item in meta.get("warnings", [])[:4]))
+        if analysis.get("top_destination_ports"):
+            lines.append("Top destination ports: " + ", ".join(f"{port}/{count}" for port, count in analysis.get("top_destination_ports", [])[:10]))
+        return ToolResult(True, "\n".join(lines), payload)
+
+    def analyze_network_traffic_file(
+        self,
+        path: str,
+        input_format: str = "auto",
+        limit: int = 5000,
+        baseline_path: str = "",
+        sensitivity: str = "medium",
+        record_alerts: bool = True,
+    ) -> ToolResult:
+        """Run IDS-style heuristics over a traffic source inside the workspace."""
+        try:
+            flows, meta = _ids_read_traffic_records(path, input_format=input_format, limit=limit)
+        except Exception as exc:
+            return ToolResult(False, f"Failed to analyze network traffic source: {exc}", {"error": str(exc), "path": path})
+        baseline: dict[str, Any] = {}
+        if baseline_path:
+            try:
+                baseline_target = resolve_workspace_path(baseline_path)
+                if baseline_target.exists():
+                    baseline = json.loads(baseline_target.read_text(encoding="utf-8"))
+            except Exception as exc:
+                meta.setdefault("warnings", []).append(f"Could not load baseline {baseline_path}: {exc}")
+        analysis = _ids_analyze_flows(flows, baseline=baseline, sensitivity=sensitivity)
+        alerts_recorded = _ids_append_alerts(analysis.get("alerts", []), source_path=meta.get("path", "")) if record_alerts else 0
+        payload = {**meta, **analysis, "sensitivity": sensitivity, "baseline_used": bool(baseline), "alerts_recorded": alerts_recorded}
+        lines = [
+            f"Analyzed {len(flows)} network metadata record(s) from {meta.get('path')}.",
+            f"IDS-style alerts generated: {analysis.get('alert_count', 0)}.",
+        ]
+        if analysis.get("severity_counts"):
+            lines.append("Severity counts: " + ", ".join(f"{k}={v}" for k, v in analysis.get("severity_counts", {}).items()))
+        for alert in analysis.get("alerts", [])[:8]:
+            lines.append(f"- {str(alert.get('severity', 'info')).upper()}: {alert.get('title')} [{alert.get('category')}]")
+        if alerts_recorded:
+            lines.append(f"Recorded {alerts_recorded} alert(s) to {workspace_relative(IDS_ALERTS_FILE)}.")
+        return ToolResult(True, "\n".join(lines), payload)
+
+    def build_ids_baseline(
+        self,
+        path: str,
+        input_format: str = "auto",
+        label: str = "baseline",
+        limit: int = 10000,
+        baseline_path: str = ".agent_ids_baseline.json",
+    ) -> ToolResult:
+        """Create a simple known-good network baseline from traffic metadata."""
+        try:
+            flows, meta = _ids_read_traffic_records(path, input_format=input_format, limit=limit)
+            baseline = _ids_baseline_from_flows(flows, label=label)
+            target = resolve_workspace_path(baseline_path or workspace_relative(IDS_BASELINE_FILE))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(baseline, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:
+            return ToolResult(False, f"Failed to build IDS baseline: {exc}", {"error": str(exc), "path": path})
+        payload = {**baseline, "source_path": meta.get("path"), "baseline_path": workspace_relative(target), "warnings": meta.get("warnings", [])}
+        content = (
+            f"Built IDS baseline `{label}` from {len(flows)} flow(s).\n"
+            f"Saved to {workspace_relative(target)}.\n"
+            f"Known destination ports: {', '.join(str(item) for item in baseline.get('dst_ports', [])[:30]) or 'none'}."
+        )
+        return ToolResult(True, content, payload)
+
+    def compare_network_baseline(
+        self,
+        path: str,
+        input_format: str = "auto",
+        baseline_path: str = ".agent_ids_baseline.json",
+        limit: int = 10000,
+        sensitivity: str = "medium",
+        record_alerts: bool = True,
+    ) -> ToolResult:
+        """Compare current traffic metadata against a saved baseline."""
+        try:
+            baseline_target = resolve_workspace_path(baseline_path or workspace_relative(IDS_BASELINE_FILE))
+            if not baseline_target.exists():
+                return ToolResult(False, f"Baseline file not found: {baseline_path}", {"baseline_path": baseline_path})
+            baseline = json.loads(baseline_target.read_text(encoding="utf-8"))
+            flows, meta = _ids_read_traffic_records(path, input_format=input_format, limit=limit)
+            analysis = _ids_analyze_flows(flows, baseline=baseline, sensitivity=sensitivity)
+        except Exception as exc:
+            return ToolResult(False, f"Failed to compare traffic to baseline: {exc}", {"error": str(exc), "path": path, "baseline_path": baseline_path})
+        alerts_recorded = _ids_append_alerts(analysis.get("alerts", []), source_path=meta.get("path", "")) if record_alerts else 0
+        payload = {**meta, **analysis, "baseline_path": workspace_relative(baseline_target), "baseline_label": baseline.get("label"), "alerts_recorded": alerts_recorded}
+        content = (
+            f"Compared {len(flows)} flow(s) from {meta.get('path')} against baseline `{baseline.get('label', baseline_path)}`.\n"
+            f"Alerts/deviations: {analysis.get('alert_count', 0)}."
+        )
+        return ToolResult(True, content, payload)
+
+    def capture_network_metadata_sample(
+        self,
+        interface: str = "",
+        duration_seconds: int = 15,
+        max_packets: int = 200,
+        output_path: str = ".agent_ids_captures/sample.jsonl",
+        authorized: bool = False,
+    ) -> ToolResult:
+        """Capture a short metadata-only traffic sample using tshark, if installed and explicitly authorized."""
+        if not authorized:
+            return ToolResult(
+                False,
+                "Live capture requires authorized=true because packet capture may require admin rights and must only be used on networks you own or are allowed to monitor.",
+                {"authorization_required": True, "authorized": False},
+            )
+        duration_seconds = max(1, min(int(duration_seconds), 60))
+        max_packets = max(1, min(int(max_packets), 1000))
+        tshark = shutil.which("tshark")
+        if not tshark:
+            return ToolResult(
+                False,
+                "tshark was not found. Install Wireshark/tshark or ingest an existing PCAP/Suricata/Zeek/CSV/JSONL traffic file instead.",
+                {"missing_dependency": "tshark", "authorized": True},
+            )
+        target = resolve_workspace_path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "frame.time_epoch", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst", "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport", "_ws.col.Protocol", "dns.qry.name", "tls.handshake.extensions_server_name", "http.host",
+        ]
+        command = [tshark, "-l", "-a", f"duration:{duration_seconds}", "-c", str(max_packets), "-T", "fields"]
+        if interface:
+            command.extend(["-i", interface])
+        for field in fields:
+            command.extend(["-e", field])
+        command.extend(["-E", "separator=\t", "-E", "occurrence=f"])
+        try:
+            proc = subprocess.run(command, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=duration_seconds + 10)
+        except Exception as exc:
+            return ToolResult(False, f"Live metadata capture failed: {exc}", {"error": str(exc), "command": " ".join(shlex.quote(part) for part in command)})
+        records: list[dict[str, Any]] = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            parts += [""] * (len(fields) - len(parts))
+            row = dict(zip(fields, parts))
+            src_ip = row.get("ip.src") or row.get("ipv6.src")
+            dst_ip = row.get("ip.dst") or row.get("ipv6.dst")
+            src_port = row.get("tcp.srcport") or row.get("udp.srcport")
+            dst_port = row.get("tcp.dstport") or row.get("udp.dstport")
+            records.append(_ids_normalize_flow({
+                "ts": row.get("frame.time_epoch"),
+                "src_ip": src_ip,
+                "dest_ip": dst_ip,
+                "src_port": src_port,
+                "dest_port": dst_port,
+                "proto": row.get("_ws.col.Protocol"),
+                "dns_query": row.get("dns.qry.name"),
+                "tls_sni": row.get("tls.handshake.extensions_server_name"),
+                "http_host": row.get("http.host"),
+                "event_type": "live_capture_metadata",
+            }, source=workspace_relative(target)))
+        with target.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        warnings: list[str] = []
+        if proc.returncode not in {0, 1}:
+            warnings.append(trim_text(proc.stderr, 600))
+        payload = {
+            "output_path": workspace_relative(target),
+            "packet_count": len(records),
+            "duration_seconds": duration_seconds,
+            "max_packets": max_packets,
+            "interface": interface,
+            "command": " ".join(shlex.quote(part) for part in command),
+            "warnings": warnings,
+            "stderr_preview": trim_text(proc.stderr, 800),
+        }
+        return ToolResult(True, f"Captured {len(records)} metadata-only traffic row(s) to {workspace_relative(target)}.", payload)
+
+    def build_ids_mode_plan(
+        self,
+        mode: str = "offline",
+        source_path: str = "",
+        duration_seconds: int = 30,
+        interface: str = "",
+        authorized: bool = False,
+    ) -> ToolResult:
+        """Build a defensive IDS-mode plan without silently starting live capture."""
+        mode = str(mode or "offline").lower()
+        duration_seconds = max(1, min(int(duration_seconds or 30), 60))
+        sequence: list[dict[str, Any]] = []
+        if source_path:
+            sequence.append({"tool": "ingest_network_traffic_file", "purpose": "Normalize the supplied traffic source into metadata-only flow records.", "args": {"path": source_path, "input_format": "auto", "limit": 5000}})
+            sequence.append({"tool": "analyze_network_traffic_file", "purpose": "Generate IDS-style alerts and traffic summary from the normalized source.", "args": {"path": source_path, "input_format": "auto", "sensitivity": "medium", "record_alerts": True}})
+        elif mode == "live":
+            sequence.append({"tool": "capture_network_metadata_sample", "purpose": "Collect a short metadata-only traffic sample after explicit authorization.", "args": {"interface": interface, "duration_seconds": duration_seconds, "max_packets": 200, "authorized": bool(authorized)}})
+            sequence.append({"tool": "analyze_network_traffic_file", "purpose": "Analyze the saved live metadata sample for IDS-style alerts.", "args": {"path": ".agent_ids_captures/sample.jsonl", "input_format": "jsonl", "sensitivity": "medium", "record_alerts": True}})
+        else:
+            sequence.append({"tool": "ingest_network_traffic_file", "purpose": "Start with a PCAP, Suricata EVE JSONL, Zeek conn.log, CSV, or JSONL traffic file inside the workspace.", "args": {"path": "traffic.pcap", "input_format": "auto", "limit": 5000}})
+            sequence.append({"tool": "build_ids_baseline", "purpose": "Optional: build a known-good baseline from clean traffic before monitoring deviations.", "args": {"path": "known_good.pcap", "input_format": "auto", "label": "known-good"}})
+            sequence.append({"tool": "compare_network_baseline", "purpose": "Optional: compare current traffic against the saved baseline.", "args": {"path": "current.pcap", "baseline_path": ".agent_ids_baseline.json"}})
+        payload = {
+            "mode": mode,
+            "source_path": source_path,
+            "duration_seconds": duration_seconds,
+            "interface": interface,
+            "authorized": bool(authorized),
+            "recommended_sequence": sequence,
+            "safety_rules": [
+                "Only monitor networks and devices you own or are explicitly authorized to defend.",
+                "Prefer offline PCAP/Zeek/Suricata ingestion for repeatable analysis.",
+                "Live capture is capped, metadata-only, and requires authorized=true.",
+                "Do not retain packet payloads or secrets in agent state.",
+                "Correlate alerts with endpoint/router/firewall logs before concluding compromise.",
+            ],
+            "supported_inputs": ["classic .pcap", "Suricata eve.json/eve.jsonl", "Zeek conn.log", "CSV flow exports", "generic IP-to-IP text logs"],
+        }
+        return ToolResult(True, "Built defensive IDS-mode plan.", payload)
+
+    def show_ids_alerts(self, limit: int = 20, min_severity: str = "info") -> ToolResult:
+        """Show recent IDS alerts recorded by the analysis tools."""
+        severity_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+        min_rank = severity_rank.get(str(min_severity or "info").lower(), 0)
+        limit = max(1, min(int(limit), 200))
+        alerts: list[dict[str, Any]] = []
+        if IDS_ALERTS_FILE.exists():
+            for line in IDS_ALERTS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict) and severity_rank.get(str(parsed.get("severity", "info")), 0) >= min_rank:
+                    alerts.append(parsed)
+        selected = alerts[-limit:]
+        payload = {"alerts": selected, "total_alerts": len(alerts), "limit": limit, "min_severity": min_severity, "path": workspace_relative(IDS_ALERTS_FILE)}
+        content = f"Showing {len(selected)} IDS alert(s) from {workspace_relative(IDS_ALERTS_FILE)}."
+        return ToolResult(True, content, payload)
+
+    def lookup_cve(self, cve_id: str, include_kev: bool = True, timeout: int = 15) -> ToolResult:
+        """Look up a single CVE using NVD and optionally CISA KEV."""
+        cve_id = _normalize_cve_id(cve_id)
+        if not _is_cve_id(cve_id):
+            return ToolResult(False, f"Invalid CVE id: {cve_id or '<empty>'}", {"cve_id": cve_id, "valid": False})
+        kev_entry: dict[str, Any] | None = None
+        warnings: list[str] = []
+        if include_kev:
+            catalog, kev_warnings = _load_cisa_kev_catalog(refresh=False, timeout=timeout)
+            warnings.extend(kev_warnings)
+            kev_entry = _kev_index(catalog).get(cve_id)
+        try:
+            payload = _nvd_get({"cveIds": cve_id}, timeout=timeout)
+        except Exception as exc:
+            return ToolResult(False, f"NVD lookup failed for {cve_id}: {trim_text(str(exc), 800)}", {"cve_id": cve_id, "error": str(exc), "warnings": warnings})
+        vulnerabilities = payload.get("vulnerabilities") if isinstance(payload.get("vulnerabilities"), list) else []
+        if not vulnerabilities:
+            return ToolResult(False, f"No NVD record returned for {cve_id}.", {"cve_id": cve_id, "nvd": payload, "warnings": warnings})
+        normalized = _normalize_nvd_vulnerability(vulnerabilities[0], kev=kev_entry)
+        result_payload = {
+            "cve_id": cve_id,
+            "cve": normalized,
+            "nvd_total_results": payload.get("totalResults"),
+            "include_kev": bool(include_kev),
+            "warnings": warnings,
+            "sources": {"nvd": NVD_CVE_API_URL, "cisa_kev": CISA_KEV_URLS[0]},
+        }
+        cvss = normalized.get("cvss") if isinstance(normalized.get("cvss"), dict) else {}
+        content = f"{cve_id}: {cvss.get('base_severity', 'unknown')} {cvss.get('base_score', '')}; KEV={'yes' if normalized.get('is_known_exploited') else 'no'}"
+        return ToolResult(True, content, result_payload)
+
+    def search_cves(
+        self,
+        keyword: str = "",
+        cpe_name: str = "",
+        cvss_severity: str = "",
+        published_days: int = 0,
+        modified_days: int = 0,
+        limit: int = 20,
+        include_kev: bool = True,
+        timeout: int = 15,
+    ) -> ToolResult:
+        """Search CVEs through NVD with bounded result count and optional KEV enrichment."""
+        limit = max(1, min(int(limit or 20), 100))
+        params: dict[str, Any] = {"resultsPerPage": limit, "startIndex": 0}
+        if keyword:
+            params["keywordSearch"] = str(keyword).strip()
+        if cpe_name:
+            params["cpeName"] = str(cpe_name).strip()
+        severity = str(cvss_severity or "").strip().upper()
+        if severity in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+            params["cvssV3Severity"] = severity
+        now = datetime.now(timezone.utc)
+        if int(published_days or 0) > 0:
+            days = max(1, min(int(published_days), 120))
+            start = now - __import__("datetime").timedelta(days=days)
+            params["pubStartDate"] = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            params["pubEndDate"] = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if int(modified_days or 0) > 0:
+            days = max(1, min(int(modified_days), 120))
+            start = now - __import__("datetime").timedelta(days=days)
+            params["lastModStartDate"] = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            params["lastModEndDate"] = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if not any(params.get(key) for key in ("keywordSearch", "cpeName", "cvssV3Severity", "pubStartDate", "lastModStartDate")):
+            return ToolResult(False, "Provide keyword, cpe_name, cvss_severity, published_days, or modified_days for a bounded CVE search.", {"params": params})
+        warnings: list[str] = []
+        kev_by_cve: dict[str, dict[str, Any]] = {}
+        if include_kev:
+            catalog, kev_warnings = _load_cisa_kev_catalog(refresh=False, timeout=timeout)
+            warnings.extend(kev_warnings)
+            kev_by_cve = _kev_index(catalog)
+        try:
+            payload = _nvd_get(params, timeout=timeout)
+        except Exception as exc:
+            return ToolResult(False, f"NVD CVE search failed: {trim_text(str(exc), 800)}", {"error": str(exc), "params": params, "warnings": warnings})
+        vulnerabilities = payload.get("vulnerabilities") if isinstance(payload.get("vulnerabilities"), list) else []
+        results = []
+        for item in vulnerabilities[:limit]:
+            cve_obj = item.get("cve") if isinstance(item, dict) and isinstance(item.get("cve"), dict) else {}
+            cve_id = _normalize_cve_id(str(cve_obj.get("id") or ""))
+            results.append(_normalize_nvd_vulnerability(item, kev=kev_by_cve.get(cve_id)))
+        result_payload = {
+            "query": {"keyword": keyword, "cpe_name": cpe_name, "cvss_severity": cvss_severity, "published_days": published_days, "modified_days": modified_days},
+            "params": params,
+            "total_results": payload.get("totalResults", len(results)),
+            "results": results,
+            "warnings": warnings,
+            "sources": {"nvd": NVD_CVE_API_URL, "cisa_kev": CISA_KEV_URLS[0]},
+        }
+        return ToolResult(True, f"Found {len(results)} CVE result(s) shown from NVD search.", result_payload)
+
+    def check_cisa_kev(
+        self,
+        cve_id: str = "",
+        vendor: str = "",
+        product: str = "",
+        keyword: str = "",
+        limit: int = 50,
+        refresh: bool = False,
+        timeout: int = 12,
+    ) -> ToolResult:
+        """Search CISA KEV by CVE/vendor/product/keyword."""
+        limit = max(1, min(int(limit or 50), 500))
+        catalog, warnings = _load_cisa_kev_catalog(refresh=refresh, timeout=timeout)
+        rows = catalog.get("vulnerabilities") if isinstance(catalog.get("vulnerabilities"), list) else []
+        norm_cve = _normalize_cve_id(cve_id) if cve_id else ""
+        vendor_l = str(vendor or "").lower().strip()
+        product_l = str(product or "").lower().strip()
+        keyword_l = str(keyword or "").lower().strip()
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            searchable = " ".join(str(row.get(key, "")) for key in row)
+            if norm_cve and _normalize_cve_id(str(row.get("cveID") or "")) != norm_cve:
+                continue
+            if vendor_l and vendor_l not in str(row.get("vendorProject", "")).lower():
+                continue
+            if product_l and product_l not in str(row.get("product", "")).lower():
+                continue
+            if keyword_l and keyword_l not in searchable.lower():
+                continue
+            matches.append(row)
+        if not any([norm_cve, vendor_l, product_l, keyword_l]):
+            matches = list(reversed(rows[-limit:]))
+        selected = matches[:limit]
+        result_payload = {
+            "catalog_title": catalog.get("title"),
+            "catalog_version": catalog.get("catalogVersion") or catalog.get("catalog_version"),
+            "catalog_date_released": catalog.get("dateReleased"),
+            "source_url": catalog.get("source_url", CISA_KEV_URLS[0]),
+            "fetched_at": catalog.get("fetched_at", ""),
+            "query": {"cve_id": norm_cve, "vendor": vendor, "product": product, "keyword": keyword},
+            "catalog_count": len(rows),
+            "match_count": len(matches),
+            "matches": selected,
+            "warnings": warnings,
+        }
+        return ToolResult(True, f"CISA KEV query returned {len(selected)} shown of {len(matches)} matching item(s).", result_payload)
+
+    def lookup_malware_hash(self, file_hash: str, timeout: int = 15) -> ToolResult:
+        """Query MalwareBazaar for a hash; never download samples."""
+        candidate = str(file_hash or "").strip().lower()
+        if not _is_hash_indicator(candidate):
+            return ToolResult(False, "Provide a valid MD5, SHA1, or SHA256 hash.", {"hash": candidate, "valid": False})
+        headers = {"User-Agent": "Cerebro-Agent/1.0"}
+        auth_key = os.environ.get("MALWAREBAZAAR_API_KEY", "").strip()
+        if auth_key:
+            headers["Auth-Key"] = auth_key
+        try:
+            payload = http_post_form_json(MALWAREBAZAAR_API_URL, {"query": "get_info", "hash": candidate}, headers=headers, timeout=timeout)
+        except Exception as exc:
+            return ToolResult(False, f"MalwareBazaar lookup failed: {trim_text(str(exc), 800)}", {"hash": candidate, "error": str(exc)})
+        if not isinstance(payload, dict):
+            return ToolResult(False, "MalwareBazaar returned an unexpected payload shape.", {"hash": candidate, "raw": payload})
+        data = payload.get("data") if isinstance(payload.get("data"), list) else []
+        summarized_rows: list[dict[str, Any]] = []
+        for row in data[:10]:
+            if not isinstance(row, dict):
+                continue
+            summarized_rows.append({
+                "sha256_hash": row.get("sha256_hash"),
+                "sha1_hash": row.get("sha1_hash"),
+                "md5_hash": row.get("md5_hash"),
+                "file_name": row.get("file_name"),
+                "file_type": row.get("file_type"),
+                "file_size": row.get("file_size"),
+                "signature": row.get("signature"),
+                "tags": row.get("tags") if isinstance(row.get("tags"), list) else [],
+                "first_seen": row.get("first_seen"),
+                "last_seen": row.get("last_seen"),
+                "reporter": row.get("reporter"),
+            })
+        result_payload = {
+            "hash": candidate,
+            "hash_algorithm": _hash_algorithm_for_value(candidate),
+            "query_status": payload.get("query_status"),
+            "data": summarized_rows,
+            "result_count": len(summarized_rows),
+            "source": MALWAREBAZAAR_API_URL,
+            "sample_downloaded": False,
+        }
+        status = str(payload.get("query_status", "unknown"))
+        return ToolResult(True, f"MalwareBazaar status for {candidate}: {status}.", result_payload)
+
+    def hash_workspace_file(self, path: str, lookup_malware_bazaar: bool = False, timeout: int = 15) -> ToolResult:
+        """Hash one workspace file and optionally enrich SHA256 with MalwareBazaar metadata."""
+        target = resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return ToolResult(False, f"File not found: {path}", {"path": path})
+        try:
+            hashes = _file_hashes(target)
+        except OSError as exc:
+            return ToolResult(False, f"Could not hash file: {exc}", {"path": workspace_relative(target), "error": str(exc)})
+        lookup_payload = None
+        if lookup_malware_bazaar:
+            lookup = self.lookup_malware_hash(hashes["sha256"], timeout=timeout)
+            lookup_payload = lookup.meta | {"ok": lookup.ok, "content": lookup.content}
+        payload = {
+            "path": workspace_relative(target),
+            "size": target.stat().st_size,
+            "hashes": hashes,
+            "malware_lookup": lookup_payload,
+        }
+        return ToolResult(True, f"Calculated hashes for {workspace_relative(target)}.", payload)
+
+    def list_crypto_algorithms(self) -> ToolResult:
+        """List local cryptographic algorithm availability and supported envelope formats."""
+        payload = _crypto_availability()
+        lines = ["Cryptography tools available:"]
+        for name, spec in payload["algorithms"].items():
+            status = "available" if spec.get("available") else "unavailable"
+            recommended = "recommended" if spec.get("recommended") else "fallback"
+            lines.append(f"- {name}: {spec.get('display')} ({status}, {recommended})")
+        if not payload.get("cryptography_available"):
+            lines.append("Install `cryptography` to enable AES-GCM, ChaCha20-Poly1305, and Fernet.")
+        return ToolResult(True, "\n".join(lines), payload)
+
+    def encrypt_text(
+        self,
+        data: str,
+        algorithm: str = "aesgcm",
+        passphrase: str = "",
+        key_b64: str = "",
+        input_format: str = "text",
+        associated_data: str = "",
+        iterations: int = CRYPTO_DEFAULT_PBKDF2_ITERATIONS,
+    ) -> ToolResult:
+        """Encrypt text/base64/hex input into a portable authenticated envelope."""
+        try:
+            plaintext = _crypto_bytes_from_input(data, input_format=input_format)
+            token, envelope = _crypto_encrypt_bytes(
+                plaintext,
+                algorithm=algorithm,
+                passphrase=passphrase,
+                key_b64=key_b64,
+                associated_data=associated_data,
+                iterations=iterations,
+            )
+        except Exception as exc:
+            return ToolResult(False, f"Encryption failed: {exc}", {"error": str(exc), "algorithm": str(algorithm or "")})
+        payload = {
+            "algorithm": envelope.get("algorithm"),
+            "kdf": envelope.get("kdf"),
+            "plaintext_length": envelope.get("plaintext_length"),
+            "associated_data_used": bool(associated_data),
+            "encrypted_text": token,
+            "warnings": [
+                "Store the passphrase or raw key separately; it is not embedded in the envelope.",
+                "For serious protection, prefer aesgcm or chacha20poly1305 when available.",
+            ],
+        }
+        return ToolResult(True, token, payload)
+
+    def decrypt_text(
+        self,
+        encrypted_text: str,
+        passphrase: str = "",
+        key_b64: str = "",
+        output_format: str = "text",
+        associated_data: str = "",
+    ) -> ToolResult:
+        """Decrypt a crypto envelope and return text, base64, or hex."""
+        try:
+            plaintext, meta = _crypto_decrypt_bytes(
+                encrypted_text,
+                passphrase=passphrase,
+                key_b64=key_b64,
+                associated_data=associated_data,
+            )
+            output, actual_format = _crypto_bytes_to_output(plaintext, output_format=output_format)
+        except Exception as exc:
+            return ToolResult(False, f"Decryption failed: {exc}", {"error": str(exc)})
+        payload = meta | {
+            "output_format": actual_format,
+            "output_length": len(output),
+            "note": "Tool-history preview redacts decrypt_text output, but the plaintext is returned to the current model turn.",
+        }
+        if actual_format != str(output_format or "text").lower().strip():
+            payload["format_warning"] = "Plaintext was not valid UTF-8; returned base64 instead."
+        return ToolResult(True, output, payload)
+
+    def encrypt_file(
+        self,
+        input_path: str,
+        output_path: str = "",
+        algorithm: str = "aesgcm",
+        passphrase: str = "",
+        key_b64: str = "",
+        associated_data: str = "",
+        iterations: int = CRYPTO_DEFAULT_PBKDF2_ITERATIONS,
+        overwrite: bool = False,
+        max_bytes: int = CRYPTO_MAX_FILE_BYTES_DEFAULT,
+    ) -> ToolResult:
+        """Encrypt a workspace file into a text envelope file."""
+        source = resolve_workspace_path(input_path)
+        if not source.exists() or not source.is_file():
+            return ToolResult(False, f"File not found: {input_path}", {"input_path": input_path})
+        max_bytes = max(1, min(int(max_bytes or CRYPTO_MAX_FILE_BYTES_DEFAULT), 512 * 1024 * 1024))
+        size = source.stat().st_size
+        if size > max_bytes:
+            return ToolResult(False, f"Refusing to encrypt {size} bytes because max_bytes={max_bytes}.", {"size": size, "max_bytes": max_bytes})
+        target = resolve_workspace_path(output_path) if output_path else _default_encrypted_output_path(source)
+        if target.exists() and not overwrite:
+            return ToolResult(False, f"Output file already exists: {workspace_relative(target)}. Set overwrite=true to replace it.", {"output_path": workspace_relative(target)})
+        try:
+            plaintext = source.read_bytes()
+            token, envelope = _crypto_encrypt_bytes(
+                plaintext,
+                algorithm=algorithm,
+                passphrase=passphrase,
+                key_b64=key_b64,
+                associated_data=associated_data,
+                iterations=iterations,
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(token + "\n", encoding="utf-8")
+        except Exception as exc:
+            return ToolResult(False, f"File encryption failed: {exc}", {"input_path": workspace_relative(source), "error": str(exc)})
+        payload = {
+            "input_path": workspace_relative(source),
+            "output_path": workspace_relative(target),
+            "input_bytes": size,
+            "output_bytes": target.stat().st_size,
+            "algorithm": envelope.get("algorithm"),
+            "kdf": envelope.get("kdf"),
+            "associated_data_used": bool(associated_data),
+            "sha256_plaintext": hashlib.sha256(plaintext).hexdigest(),
+            "warnings": ["Store the passphrase or raw key separately; it is not embedded in the envelope."],
+        }
+        return ToolResult(True, f"Encrypted {workspace_relative(source)} -> {workspace_relative(target)}", payload)
+
+    def decrypt_file(
+        self,
+        input_path: str,
+        output_path: str = "",
+        passphrase: str = "",
+        key_b64: str = "",
+        associated_data: str = "",
+        overwrite: bool = False,
+        max_bytes: int = CRYPTO_MAX_FILE_BYTES_DEFAULT,
+    ) -> ToolResult:
+        """Decrypt a workspace crypto envelope file back to raw bytes."""
+        source = resolve_workspace_path(input_path)
+        if not source.exists() or not source.is_file():
+            return ToolResult(False, f"File not found: {input_path}", {"input_path": input_path})
+        max_bytes = max(1, min(int(max_bytes or CRYPTO_MAX_FILE_BYTES_DEFAULT), 512 * 1024 * 1024))
+        size = source.stat().st_size
+        if size > max_bytes * 2 + 4096:
+            return ToolResult(False, f"Refusing to decrypt {size} bytes because max_bytes={max_bytes}.", {"size": size, "max_bytes": max_bytes})
+        target = resolve_workspace_path(output_path) if output_path else _default_decrypted_output_path(source)
+        if target.exists() and not overwrite:
+            return ToolResult(False, f"Output file already exists: {workspace_relative(target)}. Set overwrite=true to replace it.", {"output_path": workspace_relative(target)})
+        try:
+            token = source.read_text(encoding="utf-8", errors="strict").strip()
+            plaintext, meta = _crypto_decrypt_bytes(
+                token,
+                passphrase=passphrase,
+                key_b64=key_b64,
+                associated_data=associated_data,
+            )
+            if len(plaintext) > max_bytes:
+                return ToolResult(False, f"Refusing to write decrypted payload of {len(plaintext)} bytes because max_bytes={max_bytes}.", {"plaintext_bytes": len(plaintext), "max_bytes": max_bytes})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(plaintext)
+        except Exception as exc:
+            return ToolResult(False, f"File decryption failed: {exc}", {"input_path": workspace_relative(source), "error": str(exc)})
+        payload = meta | {
+            "input_path": workspace_relative(source),
+            "output_path": workspace_relative(target),
+            "input_bytes": size,
+            "output_bytes": target.stat().st_size,
+            "sha256_plaintext": hashlib.sha256(plaintext).hexdigest(),
+        }
+        return ToolResult(True, f"Decrypted {workspace_relative(source)} -> {workspace_relative(target)}", payload)
+
+    def add_malware_signature(
+        self,
+        name: str,
+        pattern: str,
+        signature_type: str = "string",
+        severity: str = "medium",
+        tags: list[str] | str | None = None,
+        description: str = "",
+        source: str = "local",
+        overwrite: bool = False,
+        signature_path: str = "",
+    ) -> ToolResult:
+        """Add a local defensive malware signature."""
+        cleaned_name = str(name or "").strip()
+        cleaned_pattern = str(pattern or "")
+        sig_type = str(signature_type or "string").lower().strip()
+        if not cleaned_name:
+            return ToolResult(False, "Signature name cannot be empty.", {})
+        if not cleaned_pattern:
+            return ToolResult(False, "Signature pattern cannot be empty.", {})
+        if sig_type not in {"string", "regex", "hex", "hash", "md5", "sha1", "sha256", "yara"}:
+            return ToolResult(False, "signature_type must be one of string, regex, hex, hash, md5, sha1, sha256, yara.", {"signature_type": sig_type})
+        if sig_type == "regex":
+            try:
+                re.compile(cleaned_pattern)
+            except re.error as exc:
+                return ToolResult(False, f"Invalid regex signature: {exc}", {"error": str(exc)})
+        if sig_type in {"hash", "md5", "sha1", "sha256"} and not _is_hash_indicator(cleaned_pattern):
+            return ToolResult(False, "Hash signatures must use an MD5, SHA1, or SHA256 hex value.", {"pattern": cleaned_pattern})
+        tag_list = [item.strip() for item in tags.split(",")] if isinstance(tags, str) else [str(item).strip() for item in (tags or [])]
+        tag_list = [item for item in tag_list if item]
+        catalog, warnings = _load_malware_signatures(signature_path)
+        signatures = catalog.setdefault("signatures", [])
+        existing_index = next((i for i, item in enumerate(signatures) if isinstance(item, dict) and str(item.get("name", "")).lower() == cleaned_name.lower()), None)
+        if existing_index is not None and not overwrite:
+            return ToolResult(False, f"Signature `{cleaned_name}` already exists. Re-run with overwrite=true to replace it.", {"name": cleaned_name, "warnings": warnings})
+        record = {
+            "name": cleaned_name,
+            "signature_type": sig_type,
+            "pattern": cleaned_pattern,
+            "severity": str(severity or "medium").lower(),
+            "tags": tag_list,
+            "description": str(description or ""),
+            "source": str(source or "local"),
+            "created_at": utc_now(),
+        }
+        if existing_index is None:
+            signatures.append(record)
+        else:
+            previous = signatures[existing_index] if isinstance(signatures[existing_index], dict) else {}
+            record["created_at"] = previous.get("created_at", record["created_at"])
+            record["updated_at"] = utc_now()
+            signatures[existing_index] = record
+        target = _save_malware_signatures(catalog, signature_path)
+        payload = {"name": cleaned_name, "signature_path": workspace_relative(target), "signature_count": len(signatures), "warnings": warnings}
+        return ToolResult(True, f"Saved signature `{cleaned_name}`.", payload)
+
+    def scan_workspace_file_signatures(
+        self,
+        path: str,
+        signature_path: str = "",
+        recursive: bool = False,
+        max_files: int = 50,
+        max_bytes_per_file: int = 5_242_880,
+        use_yara: bool = True,
+    ) -> ToolResult:
+        """Scan workspace files with local signatures without executing them."""
+        target = resolve_workspace_path(path)
+        if not target.exists():
+            return ToolResult(False, f"Path does not exist: {path}", {"path": path})
+        max_files = max(1, min(int(max_files or 50), 500))
+        max_bytes_per_file = max(1024, min(int(max_bytes_per_file or 5_242_880), 100 * 1024 * 1024))
+        catalog, warnings = _load_malware_signatures(signature_path)
+        signatures = [item for item in catalog.get("signatures", []) if isinstance(item, dict)]
+        if not use_yara:
+            signatures = [item for item in signatures if str(item.get("signature_type", item.get("type", ""))).lower() != "yara"]
+        candidates = [target] if target.is_file() else list(target.rglob("*") if recursive else target.iterdir())
+        files = [item for item in candidates if item.is_file() and not should_skip_checkpoint_path(item)][:max_files]
+        matches: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        yara_warnings: list[str] = []
+        for candidate in files:
+            try:
+                stat = candidate.stat()
+            except OSError as exc:
+                skipped.append({"path": workspace_relative(candidate), "reason": str(exc)})
+                continue
+            if stat.st_size > max_bytes_per_file:
+                skipped.append({"path": workspace_relative(candidate), "reason": f"larger than max_bytes_per_file ({max_bytes_per_file})"})
+                continue
+            try:
+                data = candidate.read_bytes()
+            except OSError as exc:
+                skipped.append({"path": workspace_relative(candidate), "reason": str(exc)})
+                continue
+            text = data.decode("latin-1", errors="ignore")
+            hashes = _file_hashes(candidate)
+            for signature in signatures:
+                result = _scan_signature_against_bytes(signature, data, text, hashes)
+                if not result:
+                    continue
+                if result.get("warning"):
+                    yara_warnings.append(f"{signature.get('name')}: {result.get('warning')}")
+                    continue
+                if not result.get("matched"):
+                    continue
+                evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+                matches.append({
+                    "path": workspace_relative(candidate),
+                    "signature": result.get("name"),
+                    "signature_type": evidence.get("signature_type") or signature.get("signature_type") or signature.get("type"),
+                    "severity": result.get("severity"),
+                    "tags": result.get("tags"),
+                    "description": result.get("description"),
+                    "source": result.get("source"),
+                    "evidence": evidence,
+                    "hashes": hashes,
+                })
+        warnings.extend(sorted(set(yara_warnings))[:20])
+        severity_counts = dict(collections.Counter(str(match.get("severity", "info")).lower() for match in matches))
+        payload = {
+            "path": workspace_relative(target),
+            "signature_path": signature_path or workspace_relative(MALWARE_SIGNATURES_FILE),
+            "signature_count": len(signatures),
+            "file_count": len(files),
+            "match_count": len(matches),
+            "severity_counts": severity_counts,
+            "matches": matches[:200],
+            "skipped": skipped[:50],
+            "warnings": warnings,
+        }
+        return ToolResult(True, f"Scanned {len(files)} file(s) and found {len(matches)} signature match(es).", payload)
+
+    def build_threat_intel_brief(self, indicator: str, include_cve: bool = True, include_malware: bool = True) -> ToolResult:
+        """Build a defensive threat-intel brief and next-tool sequence for an indicator."""
+        raw = str(indicator or "").strip()
+        findings: list[dict[str, Any]] = []
+        sequence: list[dict[str, Any]] = []
+        if not raw:
+            return ToolResult(False, "Indicator cannot be empty.", {})
+        cve_match = re.search(r"CVE-\d{4}-\d{4,}", raw, re.I)
+        hash_match = re.search(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b", raw)
+        if cve_match and include_cve:
+            cve_id = _normalize_cve_id(cve_match.group(0))
+            findings.append({"type": "cve", "summary": f"Looks like a CVE identifier: {cve_id}."})
+            sequence.append({"tool": "lookup_cve", "purpose": "Fetch NVD details and CISA KEV status.", "args": {"cve_id": cve_id, "include_kev": True}})
+            sequence.append({"tool": "check_cisa_kev", "purpose": "Confirm known-exploited catalog details.", "args": {"cve_id": cve_id}})
+        elif hash_match and include_malware:
+            file_hash = hash_match.group(0).lower()
+            findings.append({"type": "file_hash", "summary": f"Looks like a {_hash_algorithm_for_value(file_hash).upper()} file hash."})
+            sequence.append({"tool": "lookup_malware_hash", "purpose": "Query MalwareBazaar metadata without downloading samples.", "args": {"file_hash": file_hash}})
+        else:
+            if include_cve:
+                findings.append({"type": "cve_search", "summary": "No exact CVE id found; use keyword/CPE search for vulnerability discovery."})
+                sequence.append({"tool": "search_cves", "purpose": "Search NVD by product, vendor, keyword, CPE, severity, or recent publication window.", "args": {"keyword": raw, "limit": 20, "include_kev": True}})
+            if include_malware:
+                findings.append({"type": "signature_workflow", "summary": "For malware signatures, add local string/regex/hex/hash/YARA signatures, then scan workspace files."})
+                sequence.append({"tool": "add_malware_signature", "purpose": "Store a local defensive signature.", "args": {"name": "descriptive name", "pattern": "pattern", "signature_type": "string"}})
+                sequence.append({"tool": "scan_workspace_file_signatures", "purpose": "Scan files with local signatures without executing them.", "args": {"path": "sample.bin", "recursive": False}})
+        payload = {
+            "indicator": raw,
+            "findings": findings,
+            "recommended_sequence": sequence,
+            "safety_rules": [
+                "Use these tools for defensive triage, patch prioritization, and local file assessment only.",
+                "Do not download malware samples inside the agent.",
+                "Do not execute suspect files; hash and scan them as inert bytes.",
+                "Treat signature hits as indicators requiring corroboration, not standalone proof of compromise.",
+            ],
+            "supported_sources": ["NVD CVE API 2.0", "CISA KEV catalog", "MalwareBazaar hash metadata", "local JSON/YARA signatures"],
+        }
+        return ToolResult(True, "Built defensive threat-intelligence brief.", payload)
+
+    def normalize_network_target(self, target: str, resolve: bool = False, allow_private: bool = False) -> ToolResult:
+        host, reason, meta = self._extract_network_host(target)
+        if not host:
+            return ToolResult(False, reason, meta=meta)
+        payload: dict[str, Any] = {
+            "generated_at": utc_now(),
+            "target": str(target or "").strip(),
+            "host": host,
+            "input": meta,
+            "is_ip": False,
+            "is_cidr": False,
+            "addresses": [],
+            "allowed_for_passive_lookup": True,
+            "allowed_for_default_port_scan": True,
+            "warnings": [],
+        }
+        try:
+            network = ipaddress.ip_network(host, strict=False)
+            payload["is_cidr"] = "/" in host
+            payload["is_ip"] = network.num_addresses == 1
+            payload["network"] = str(network)
+            payload["prefixlen"] = network.prefixlen
+            if network.num_addresses == 1:
+                classification = self._ip_classification(str(network.network_address))
+                payload["addresses"].append(classification)
+                if not allow_private and not classification.get("is_publicly_routable"):
+                    payload["allowed_for_passive_lookup"] = False
+                    payload["warnings"].append("Private/local/special-use IP detected; external enrichment is skipped unless explicitly allowed by the caller.")
+            else:
+                payload["allowed_for_default_port_scan"] = False
+                payload["warnings"].append("CIDR input is recognized but active scanning tools require a single host.")
+        except ValueError:
+            try:
+                ip_obj = ipaddress.ip_address(host)
+                classification = self._ip_classification(str(ip_obj))
+                payload["is_ip"] = True
+                payload["addresses"].append(classification)
+            except ValueError:
+                payload["kind"] = "hostname"
+                if resolve:
+                    records, warnings = self._resolve_host_ips(host)
+                    payload["addresses"] = records
+                    payload["warnings"].extend(warnings)
+                    if not allow_private and any(not row.get("is_publicly_routable") for row in records):
+                        payload["warnings"].append("Hostname resolves to at least one private/local/special-use address.")
+        if payload["addresses"]:
+            payload["public_addresses"] = [row for row in payload["addresses"] if row.get("is_publicly_routable")]
+            payload["private_or_special_addresses"] = [row for row in payload["addresses"] if not row.get("is_publicly_routable")]
+        payload["recommendations"] = [
+            "Use resolve_dns_records before active checks when the target is a hostname.",
+            "Use lookup_ip_rdap and lookup_ip_geolocation only for public routable IPs.",
+            "Use scan_tcp_ports only for assets you own or are explicitly authorized to test; public scans require allow_public=true.",
+        ]
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def resolve_dns_records(self, target: str, record_type: str = "A", allow_private: bool = False, timeout: int = 5) -> ToolResult:
+        host, reason, meta = self._extract_network_host(target)
+        if not host:
+            return ToolResult(False, reason, meta=meta)
+        record_type = str(record_type or "A").upper().strip()
+        timeout = max(1, min(safe_int(timeout, 5), 20))
+        records, warnings = self._resolve_host_ips(host, timeout=timeout)
+        if record_type in {"A", "IPV4"}:
+            records = [row for row in records if row.get("family") == "IPv4"]
+        elif record_type in {"AAAA", "IPV6"}:
+            records = [row for row in records if row.get("family") == "IPv6"]
+        elif record_type in {"ANY", "ADDR", "ADDRESS"}:
+            pass
+        else:
+            warnings.append("Only A/AAAA/ANY-style address lookups are supported without optional DNS libraries.")
+        if not allow_private:
+            private_hits = [row for row in records if not row.get("is_publicly_routable")]
+            if private_hits:
+                warnings.append("Some resolved addresses are private/local/special-use; they are included for diagnostics but should not be externally enriched.")
+        payload = {
+            "generated_at": utc_now(),
+            "target": str(target or "").strip(),
+            "host": host,
+            "record_type": record_type,
+            "records": records,
+            "record_count": len(records),
+            "warnings": warnings,
+            "recommendations": ["Use reverse_dns_lookup for PTR context and lookup_ip_rdap for public ownership/ASN context."],
+        }
+        return ToolResult(bool(records) or bool(warnings), json.dumps(payload, indent=2), meta=payload)
+
+    def reverse_dns_lookup(self, ip: str, allow_private: bool = False) -> ToolResult:
+        ip_text = str(ip or "").strip()
+        try:
+            ip_obj = ipaddress.ip_address(ip_text)
+        except ValueError as exc:
+            return ToolResult(False, f"Invalid IP address: {exc}")
+        classification = self._ip_classification(str(ip_obj))
+        if not allow_private and not classification.get("is_publicly_routable"):
+            payload = {
+                "generated_at": utc_now(),
+                "ip": str(ip_obj),
+                "classification": classification,
+                "ptr_records": [],
+                "skipped": True,
+                "reason": "Private/local/special-use IP reverse lookup skipped unless allow_private=true.",
+            }
+            return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        ptr_records: list[str] = []
+        error = ""
+        try:
+            host, aliases, _addresses = socket.gethostbyaddr(str(ip_obj))
+            ptr_records = [host] + list(aliases)
+        except Exception as exc:
+            error = trim_text(str(exc), 400)
+        payload = {
+            "generated_at": utc_now(),
+            "ip": str(ip_obj),
+            "classification": classification,
+            "ptr_records": sorted(set(ptr_records)),
+            "error": error,
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def lookup_ip_rdap(self, target: str, timeout: int = 10) -> ToolResult:
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        public_ip, target_meta, reason = self._public_ip_from_target(target)
+        if not public_ip:
+            payload = {
+                "generated_at": utc_now(),
+                "target": str(target or "").strip(),
+                "target_meta": target_meta,
+                "skipped": True,
+                "reason": reason,
+            }
+            return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        url = f"https://rdap.org/ip/{urllib.parse.quote(public_ip)}"
+        try:
+            payload_raw = http_get_json(url, {"accept": "application/rdap+json, application/json"}, timeout=timeout)
+        except Exception as exc:
+            return ToolResult(False, f"RDAP lookup failed for {public_ip}: {trim_text(str(exc), 600)}", meta={"ip": public_ip, "target_meta": target_meta})
+        events = payload_raw.get("events", []) if isinstance(payload_raw, dict) else []
+        entities = payload_raw.get("entities", []) if isinstance(payload_raw, dict) else []
+        notices = payload_raw.get("notices", []) if isinstance(payload_raw, dict) else []
+        payload = {
+            "generated_at": utc_now(),
+            "target": str(target or "").strip(),
+            "ip": public_ip,
+            "target_meta": target_meta,
+            "rdap_url": url,
+            "handle": payload_raw.get("handle") if isinstance(payload_raw, dict) else None,
+            "name": payload_raw.get("name") if isinstance(payload_raw, dict) else None,
+            "type": payload_raw.get("type") if isinstance(payload_raw, dict) else None,
+            "country": payload_raw.get("country") if isinstance(payload_raw, dict) else None,
+            "start_address": payload_raw.get("startAddress") if isinstance(payload_raw, dict) else None,
+            "end_address": payload_raw.get("endAddress") if isinstance(payload_raw, dict) else None,
+            "ip_version": payload_raw.get("ipVersion") if isinstance(payload_raw, dict) else None,
+            "events": events[:8] if isinstance(events, list) else [],
+            "entity_handles": [entity.get("handle") for entity in entities[:8] if isinstance(entity, dict)],
+            "notices": [notice.get("title") for notice in notices[:6] if isinstance(notice, dict)],
+            "raw_keys": sorted(payload_raw.keys()) if isinstance(payload_raw, dict) else [],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def lookup_ip_geolocation(self, target: str, timeout: int = 10) -> ToolResult:
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        public_ip, target_meta, reason = self._public_ip_from_target(target)
+        if not public_ip:
+            payload = {
+                "generated_at": utc_now(),
+                "target": str(target or "").strip(),
+                "target_meta": target_meta,
+                "skipped": True,
+                "reason": reason,
+            }
+            return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        sources = [
+            ("ipinfo", f"https://ipinfo.io/{urllib.parse.quote(public_ip)}/json"),
+            ("ipapi", f"https://ipapi.co/{urllib.parse.quote(public_ip)}/json/"),
+        ]
+        errors: list[str] = []
+        for source, url in sources:
+            try:
+                raw = http_get_json(url, {"accept": "application/json", "user-agent": "Cerebro-Agent/1.0 (+ip-enrichment)"}, timeout=timeout)
+            except Exception as exc:
+                errors.append(f"{source}: {trim_text(str(exc), 240)}")
+                continue
+            if not isinstance(raw, dict):
+                errors.append(f"{source}: unexpected payload")
+                continue
+            payload = {
+                "generated_at": utc_now(),
+                "target": str(target or "").strip(),
+                "ip": public_ip,
+                "source": source,
+                "target_meta": target_meta,
+                "city": raw.get("city"),
+                "region": raw.get("region") or raw.get("region_code"),
+                "country": raw.get("country") or raw.get("country_name"),
+                "loc": raw.get("loc") or raw.get("latitude"),
+                "timezone": raw.get("timezone") or raw.get("utc_offset"),
+                "org": raw.get("org") or raw.get("asn") or raw.get("network"),
+                "asn": raw.get("asn"),
+                "isp": raw.get("org") or raw.get("isp"),
+                "postal": raw.get("postal"),
+                "raw_keys": sorted(raw.keys()),
+                "confidence_note": "GeoIP/ISP data is approximate and can be stale, proxied, or VPN/NAT affected.",
+            }
+            return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        payload = {"generated_at": utc_now(), "target": str(target or "").strip(), "ip": public_ip, "target_meta": target_meta, "errors": errors}
+        return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+
+    def get_public_ip_info(self, enrich: bool = True, timeout: int = 10) -> ToolResult:
+        timeout = max(1, min(safe_int(timeout, 10), 30))
+        sources = [
+            ("ipify", "https://api.ipify.org?format=json", "ip"),
+            ("ifconfig.me", "https://ifconfig.me/ip", "text"),
+        ]
+        errors: list[str] = []
+        public_ip = ""
+        source_used = ""
+        for source, url, mode in sources:
+            try:
+                if mode == "json":
+                    raw = http_get_json(url, {"accept": "application/json", "user-agent": "Cerebro-Agent/1.0 (+public-ip)"}, timeout=timeout)
+                    candidate = str(raw.get("ip", "")).strip() if isinstance(raw, dict) else ""
+                else:
+                    request = urllib.request.Request(url, headers={"user-agent": "Cerebro-Agent/1.0 (+public-ip)", "accept": "text/plain"}, method="GET")
+                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                        candidate = response.read(80).decode("utf-8", errors="replace").strip()
+                ipaddress.ip_address(candidate)
+                public_ip = candidate
+                source_used = source
+                break
+            except Exception as exc:
+                errors.append(f"{source}: {trim_text(str(exc), 240)}")
+        if not public_ip:
+            payload = {"generated_at": utc_now(), "public_ip": "", "errors": errors}
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        payload: dict[str, Any] = {
+            "generated_at": utc_now(),
+            "public_ip": public_ip,
+            "source": source_used,
+            "classification": self._ip_classification(public_ip),
+            "errors": errors,
+        }
+        if enrich:
+            enrichment = self.lookup_ip_geolocation(public_ip, timeout=timeout)
+            payload["geolocation"] = enrichment.meta if enrichment.ok else {"ok": False, "error": enrichment.content}
+            rdap = self.lookup_ip_rdap(public_ip, timeout=timeout)
+            payload["rdap"] = rdap.meta if rdap.ok else {"ok": False, "error": rdap.content}
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def _parse_port_spec(self, ports: Any, *, max_ports: int = 32) -> tuple[list[int], list[str]]:
+        warnings: list[str] = []
+        if ports is None or ports == "":
+            values: list[Any] = [22, 53, 80, 443, 445, 3389, 8000, 8080, 8443]
+        elif isinstance(ports, int):
+            values = [ports]
+        elif isinstance(ports, list):
+            values = ports
+        else:
+            values = []
+            text = str(ports)
+            for part in re.split(r"[\s,]+", text):
+                if not part:
+                    continue
+                if "-" in part:
+                    start_text, end_text = part.split("-", 1)
+                    if start_text.strip().isdigit() and end_text.strip().isdigit():
+                        start, end = int(start_text), int(end_text)
+                        if start > end:
+                            start, end = end, start
+                        if end - start > 256:
+                            warnings.append(f"Range {part} capped to first 256 ports before max_ports truncation.")
+                            end = start + 256
+                        values.extend(range(start, end + 1))
+                    else:
+                        warnings.append(f"Ignored invalid port range: {part}")
+                elif part.isdigit():
+                    values.append(int(part))
+                else:
+                    warnings.append(f"Ignored invalid port value: {part}")
+        cleaned: list[int] = []
+        for value in values:
+            port = safe_int(value, -1)
+            if 1 <= port <= 65535 and port not in cleaned:
+                cleaned.append(port)
+        max_ports = max(1, min(safe_int(max_ports, 32), 64))
+        if len(cleaned) > max_ports:
+            warnings.append(f"Port list truncated from {len(cleaned)} to {max_ports}.")
+            cleaned = cleaned[:max_ports]
+        return cleaned, warnings
+
+    def scan_tcp_ports(self, target: str, ports: Any = "22,80,443", timeout: float = 0.5, allow_public: bool = False, max_ports: int = 32) -> ToolResult:
+        host, reason, meta = self._extract_network_host(target)
+        if not host:
+            return ToolResult(False, reason, meta=meta)
+        try:
+            network = ipaddress.ip_network(host, strict=False)
+            if network.num_addresses != 1:
+                return ToolResult(False, "CIDR/range port scanning is not supported; provide one authorized host.")
+        except ValueError:
+            pass
+        timeout_value = max(0.1, min(float(timeout), 3.0))
+        port_list, warnings = self._parse_port_spec(ports, max_ports=max_ports)
+        if not port_list:
+            return ToolResult(False, "No valid ports to scan.")
+        resolved, resolve_warnings = self._resolve_host_ips(host)
+        warnings.extend(resolve_warnings)
+        public_addresses = [row for row in resolved if row.get("is_publicly_routable")]
+        if public_addresses and not allow_public:
+            payload = {
+                "generated_at": utc_now(),
+                "target": str(target or "").strip(),
+                "host": host,
+                "resolved_addresses": resolved,
+                "requested_ports": port_list,
+                "blocked": True,
+                "reason": "Public target scanning is blocked unless allow_public=true and you are authorized to test the asset.",
+                "warnings": warnings,
+            }
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        results: list[dict[str, Any]] = []
+        started = time.time()
+        for port in port_list:
+            item: dict[str, Any] = {"port": port, "state": "unknown", "latency_ms": None, "error": ""}
+            before = time.time()
+            sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout_value)
+            try:
+                code = sock.connect_ex((host, port))
+                item["latency_ms"] = round((time.time() - before) * 1000, 2)
+                item["state"] = "open" if code == 0 else "closed_or_filtered"
+                if code != 0:
+                    item["error_code"] = code
+            except Exception as exc:
+                item["latency_ms"] = round((time.time() - before) * 1000, 2)
+                item["state"] = "error"
+                item["error"] = trim_text(str(exc), 200)
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            results.append(item)
+        payload = {
+            "generated_at": utc_now(),
+            "target": str(target or "").strip(),
+            "host": host,
+            "resolved_addresses": resolved,
+            "ports_scanned": len(port_list),
+            "open_ports": [row for row in results if row.get("state") == "open"],
+            "results": results,
+            "elapsed_ms": round((time.time() - started) * 1000, 2),
+            "warnings": warnings,
+            "safety_note": "TCP connect scan only. Use only on systems you own or are explicitly authorized to assess.",
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def _parse_listening_socket_output(self, output: str, *, include_udp: bool = True, limit: int = 100) -> tuple[list[dict[str, Any]], list[str]]:
+        entries: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        limit = max(1, min(safe_int(limit, 100), 500))
+
+        def split_host_port(value: str) -> tuple[str, int | None]:
+            token = value.strip().strip('[]')
+            if not token:
+                return "", None
+            if token.startswith("[") and "]:" in token:
+                host_part, port_part = token.rsplit(":", 1)
+                return host_part.strip("[]"), safe_int(port_part, -1) if port_part.isdigit() else None
+            if token.count(":") > 1 and not token.rsplit(":", 1)[-1].isdigit():
+                return token, None
+            if ":" in token:
+                host_part, port_part = token.rsplit(":", 1)
+                if port_part.isdigit() or port_part == "*":
+                    return host_part or "*", safe_int(port_part, -1) if port_part.isdigit() else None
+            if "." in token:
+                host_part, port_part = token.rsplit(".", 1)
+                if port_part.isdigit():
+                    return host_part or "*", safe_int(port_part, -1)
+            return token, None
+
+        def exposure_for(address: str) -> str:
+            lowered = str(address or "").lower()
+            if lowered in {"127.0.0.1", "::1", "localhost"} or lowered.startswith("127."):
+                return "loopback_only"
+            if lowered in {"0.0.0.0", "::", "*", "[::]"}:
+                return "all_interfaces"
+            return "specific_interface"
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line or line.lower().startswith(("proto", "active", "netid", "state")):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            proto = parts[0].upper()
+            if not proto.startswith(("TCP", "UDP")):
+                continue
+            if proto.startswith("UDP") and not include_udp:
+                continue
+
+            state = ""
+            local_token = ""
+            pid = ""
+            process = ""
+            lowered_parts = [part.lower() for part in parts]
+
+            if sys.platform.startswith("win"):
+                # Windows netstat: Proto Local Address Foreign Address State PID
+                if proto.startswith("TCP"):
+                    if len(parts) < 4 or parts[3].upper() != "LISTENING":
+                        continue
+                    local_token = parts[1]
+                    state = parts[3]
+                    pid = parts[4] if len(parts) > 4 and parts[4].isdigit() else ""
+                else:
+                    if len(parts) < 2:
+                        continue
+                    local_token = parts[1]
+                    state = "LISTENING"
+                    pid = parts[3] if len(parts) > 3 and parts[3].isdigit() else ""
+            elif parts[0].lower().startswith(("tcp", "udp")) and len(parts) >= 4:
+                # ss -H -tuln[p]: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port [Process]
+                if proto.startswith("TCP") and "listen" not in lowered_parts[:3]:
+                    continue
+                state = next((part for part in parts[1:4] if part.lower().startswith("listen")), "UNCONN" if proto.startswith("UDP") else "LISTEN")
+                local_token = parts[4] if len(parts) >= 5 else parts[3]
+                process_blob = " ".join(parts[5:])
+                pid_match = re.search(r"pid=(\d+)", process_blob)
+                if pid_match:
+                    pid = pid_match.group(1)
+                proc_match = re.search(r'users:\(\("([^"\\]+)"', process_blob)
+                if proc_match:
+                    process = proc_match.group(1)
+            else:
+                continue
+
+            address, port = split_host_port(local_token)
+            if port is None or port < 1:
+                continue
+            entries.append({
+                "protocol": proto,
+                "local_address": address or "*",
+                "port": port,
+                "state": state or "LISTENING",
+                "pid": pid,
+                "process": process,
+                "exposure": exposure_for(address),
+                "raw_line": trim_text(raw_line, 300),
+            })
+            if len(entries) >= limit:
+                warnings.append(f"Listening socket list truncated to {limit} entries.")
+                break
+
+        entries.sort(key=lambda row: (str(row.get("protocol", "")), int(row.get("port") or 0), str(row.get("local_address", ""))))
+        return entries, warnings
+
+    def inspect_local_listening_ports(self, include_udp: bool = True, include_process_names: bool = True, limit: int = 100) -> ToolResult:
+        """Inspect ports listening on the local machine without scanning the LAN."""
+        limit = max(1, min(safe_int(limit, 100), 500))
+        include_udp = bool(include_udp)
+        include_process_names = bool(include_process_names)
+        command: list[str]
+        fallback_commands: list[list[str]] = []
+        if sys.platform.startswith("win"):
+            command = ["netstat", "-ano"]
+        else:
+            command = ["ss", "-H", "-tulnp" if include_process_names else "-tuln"]
+            fallback_commands = [["netstat", "-tuln"]]
+
+        raw_output = ""
+        errors: list[str] = []
+        used_command: list[str] = command
+        for candidate in [command, *fallback_commands]:
+            try:
+                completed = subprocess.run(candidate, capture_output=True, text=True, timeout=5, check=False)
+                raw_output = (completed.stdout or "") + (completed.stderr or "")
+                used_command = candidate
+                if raw_output.strip():
+                    break
+                errors.append(f"{' '.join(candidate)} returned no output")
+            except FileNotFoundError:
+                errors.append(f"command not found: {candidate[0]}")
+            except Exception as exc:
+                errors.append(f"{' '.join(candidate)} failed: {trim_text(str(exc), 300)}")
+
+        entries, warnings = self._parse_listening_socket_output(raw_output, include_udp=include_udp, limit=limit)
+        warnings.extend(errors[:4])
+        payload = {
+            "generated_at": utc_now(),
+            "scope": "local_machine",
+            "command": used_command,
+            "include_udp": include_udp,
+            "include_process_names": include_process_names,
+            "entry_count": len(entries),
+            "entries": entries,
+            "warnings": warnings,
+            "raw_output_preview": trim_text(raw_output, 3000),
+            "safety_note": "This inspects local listening sockets only. It does not scan every host on the LAN.",
+            "recommendations": [
+                "Use scan_tcp_ports for one specific authorized host when you want an active TCP check.",
+                "Do not infer whole-network exposure from local listening sockets; router/firewall/NAT rules can change what is reachable.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_tls_certificate(self, target: str, port: int = 443, server_name: str = "", timeout: int = 5, allow_private: bool = False) -> ToolResult:
+        host, reason, meta = self._extract_network_host(target)
+        if not host:
+            return ToolResult(False, reason, meta=meta)
+        port = max(1, min(safe_int(port, 443), 65535))
+        timeout = max(1, min(safe_int(timeout, 5), 20))
+        resolved, warnings = self._resolve_host_ips(host)
+        if not allow_private and any(not row.get("is_publicly_routable") for row in resolved):
+            payload = {
+                "generated_at": utc_now(),
+                "target": str(target or "").strip(),
+                "host": host,
+                "port": port,
+                "resolved_addresses": resolved,
+                "blocked": True,
+                "reason": "Private/local/special-use TLS targets are blocked unless allow_private=true.",
+                "warnings": warnings,
+            }
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+        sni = str(server_name or host).strip()
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((host, port), timeout=timeout) as raw_socket:
+                with context.wrap_socket(raw_socket, server_hostname=sni) as tls_socket:
+                    cert = tls_socket.getpeercert() or {}
+                    der = tls_socket.getpeercert(binary_form=True) or b""
+                    payload = {
+                        "generated_at": utc_now(),
+                        "target": str(target or "").strip(),
+                        "host": host,
+                        "port": port,
+                        "server_name": sni,
+                        "resolved_addresses": resolved,
+                        "tls_version": tls_socket.version(),
+                        "cipher": tls_socket.cipher(),
+                        "subject": cert.get("subject"),
+                        "issuer": cert.get("issuer"),
+                        "not_before": cert.get("notBefore"),
+                        "not_after": cert.get("notAfter"),
+                        "subject_alt_names": cert.get("subjectAltName", [])[:40],
+                        "serial_number": cert.get("serialNumber"),
+                        "sha256_fingerprint": hashlib.sha256(der).hexdigest() if der else "",
+                        "warnings": warnings,
+                    }
+                    return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+        except Exception as exc:
+            payload = {"generated_at": utc_now(), "target": str(target or "").strip(), "host": host, "port": port, "error": trim_text(str(exc), 600), "warnings": warnings}
+            return ToolResult(False, json.dumps(payload, indent=2), meta=payload)
+
+    def inspect_local_network(self, include_command_output: bool = False) -> ToolResult:
+        hostname = socket.gethostname()
+        fqdn = socket.getfqdn()
+        addresses: list[dict[str, Any]] = []
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            seen: set[str] = set()
+            for family, _socktype, proto, canonname, sockaddr in infos:
+                address = str(sockaddr[0])
+                if address in seen:
+                    continue
+                seen.add(address)
+                try:
+                    classification = self._ip_classification(address)
+                except ValueError:
+                    classification = {"ip": address, "is_publicly_routable": False}
+                addresses.append({"address": address, "family": "IPv6" if family == socket.AF_INET6 else "IPv4" if family == socket.AF_INET else str(family), "canonical_name": canonname, "protocol": proto, **classification})
+        except Exception as exc:
+            addresses.append({"error": trim_text(str(exc), 400)})
+        resolver_hints = {
+            "default_timeout": getattr(socket, "getdefaulttimeout", lambda: None)(),
+            "has_ipv6": socket.has_ipv6,
+        }
+        command_output = ""
+        command = []
+        if include_command_output:
+            if sys.platform.startswith("win"):
+                command = ["ipconfig", "/all"]
+            else:
+                command = ["sh", "-lc", "(ip addr 2>/dev/null || ifconfig 2>/dev/null); echo '--- routes ---'; (ip route 2>/dev/null || netstat -rn 2>/dev/null)"]
+            try:
+                completed = subprocess.run(command, capture_output=True, text=True, timeout=4, check=False)
+                command_output = trim_text((completed.stdout or "") + (completed.stderr or ""), 12000)
+            except Exception as exc:
+                command_output = f"command failed: {trim_text(str(exc), 400)}"
+        payload = {
+            "generated_at": utc_now(),
+            "hostname": hostname,
+            "fqdn": fqdn,
+            "addresses": addresses,
+            "resolver_hints": resolver_hints,
+            "command": command,
+            "command_output": command_output,
+            "recommendations": [
+                "Use get_public_ip_info for NAT/public egress context.",
+                "Use resolve_dns_records and scan_tcp_ports for specific authorized services rather than broad network sweeps.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+
+    def start_control_server(self, host: str = "", port: int = 0, authorized: bool = False) -> ToolResult:
+        status = listen_for_connections(host=host, port=port, authorized=authorized)
+        redacted = dict(status)
+        redacted.pop("token", None)
+        return ToolResult(bool(status.get("ok")), json.dumps(redacted, indent=2, sort_keys=True), meta=redacted)
+
+    def show_control_server(self) -> ToolResult:
+        status = control_server_status()
+        return ToolResult(True, json.dumps(status, indent=2, sort_keys=True), meta=status)
+
+    def route_control_command(
+        self,
+        command_type: str,
+        payload: dict[str, Any] | None = None,
+        target_ids: list[str] | None = None,
+    ) -> ToolResult:
+        result = route_command_to_clients(command_type, payload or {}, target_ids or [])
+        return ToolResult(bool(result.get("ok")), json.dumps(result, indent=2, sort_keys=True), meta=result)
+
+    def stop_control_server(self) -> ToolResult:
+        status = stop_control_server()
+        return ToolResult(True, json.dumps(status, indent=2, sort_keys=True), meta=status)
+
+
+    def build_network_intel_brief(self, target: str, include_scan_plan: bool = True, allow_public_scan: bool = False) -> ToolResult:
+        target_text = str(target or "").strip()
+        if not target_text:
+            return ToolResult(False, "Target cannot be empty.")
+        normalized = self.normalize_network_target(target_text, resolve=True, allow_private=True)
+        dns = self.resolve_dns_records(target_text, record_type="ANY", allow_private=True) if normalized.ok and not normalized.meta.get("is_ip") else ToolResult(True, "{}", meta={"records": []})
+        public_candidates: list[str] = []
+        for row in normalized.meta.get("addresses", []):
+            if row.get("is_publicly_routable"):
+                public_candidates.append(str(row.get("address") or row.get("ip")))
+        public_ip = public_candidates[0] if public_candidates else ""
+        rdap_hint: dict[str, Any] = {}
+        geo_hint: dict[str, Any] = {}
+        if public_ip:
+            # Avoid slow external calls in the brief unless the caller later asks for the dedicated enrichment tools.
+            rdap_hint = {"recommended_tool": "lookup_ip_rdap", "target": public_ip}
+            geo_hint = {"recommended_tool": "lookup_ip_geolocation", "target": public_ip}
+        scan_plan = []
+        if include_scan_plan:
+            scan_plan = [
+                {"tool": "scan_tcp_ports", "args": {"target": target_text, "ports": "22,80,443,445,3389,8000,8080,8443", "allow_public": bool(allow_public_scan), "max_ports": 16}, "gate": "Only run if the asset is owned or explicitly authorized; public targets require allow_public=true."},
+                {"tool": "inspect_tls_certificate", "args": {"target": target_text, "port": 443}, "gate": "Use when HTTPS/TLS posture is relevant."},
+            ]
+        payload = {
+            "generated_at": utc_now(),
+            "target": target_text,
+            "normalized": normalized.meta,
+            "dns_summary": dns.meta if dns.ok else {"ok": False, "error": dns.content},
+            "public_ip_candidates": public_candidates,
+            "recommended_sequence": [
+                {"step": 1, "tool": "normalize_network_target", "purpose": "Classify the input and safety posture."},
+                {"step": 2, "tool": "resolve_dns_records", "purpose": "Resolve hostnames to A/AAAA addresses."},
+                {"step": 3, "tool": "reverse_dns_lookup", "purpose": "Add PTR context for resolved public IPs."},
+                {"step": 4, "tool": "lookup_ip_rdap", "purpose": "Get registration, range, and ASN-like ownership context for public IPs."},
+                {"step": 5, "tool": "lookup_ip_geolocation", "purpose": "Get approximate geolocation/ISP/org context for public IPs."},
+                {"step": 6, "tool": "scan_tcp_ports", "purpose": "Bounded active check only after authorization is clear."},
+            ],
+            "rdap_hint": rdap_hint,
+            "geo_hint": geo_hint,
+            "scan_plan": scan_plan,
+            "safety_rules": [
+                "Do not scan CIDR ranges; tools only support a single host.",
+                "Default port scans are blocked for public targets unless allow_public=true.",
+                "GeoIP and RDAP are passive enrichment and can be stale or approximate.",
+                "Use these tools for owned assets, troubleshooting, defensive inventory, and authorized OSINT.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_toolbox_brief(self, objective: str, path: str = ".") -> ToolResult:
+        objective_text = str(objective or "").strip()
+        if not objective_text:
+            return ToolResult(False, "Objective cannot be empty.")
+        scope = workspace_relative(resolve_workspace_path(path))
+        profile = infer_task_profile(objective_text)
+        registry = self.map_tool_capability_graph(objective=objective_text, include_edges=False)
+        repo = self.map_repository_structure(path=scope, max_depth=2, include_hidden=False)
+        entrypoints = self.inspect_project_entrypoints(path=scope, recursive=Path(scope).suffix == "", limit=40)
+        config_surface = self.inspect_config_surface(path=scope, include_preview=False)
+        chain = self.recommend_tool_chain(objective=objective_text, path=scope)
+        tool_groups = {
+            "repository_intelligence": ["map_repository_structure", "inspect_project_entrypoints", "extract_api_surface", "inspect_config_surface"],
+            "debugging_intelligence": ["inspect_error_log", "trace_data_flow", "propose_test_plan_for_symbol", "run_python_smoke_test"],
+            "planning_and_risk": ["build_execution_dossier", "build_toolbox_brief", "build_risk_register", "score_execution_readiness"],
+            "model_and_context": ["route_multi_model_task", "build_context_budget_plan", "recommend_model_selection", "list_available_models"],
+            "external_docs": ["inspect_http_endpoint", "fetch_url_text"],
+            "network_intelligence": ["normalize_network_target", "resolve_dns_records", "lookup_ip_rdap", "lookup_ip_geolocation", "scan_tcp_ports", "inspect_local_listening_ports"],
+            "ids_traffic_analysis": ["build_ids_mode_plan", "ingest_network_traffic_file", "analyze_network_traffic_file", "build_ids_baseline", "compare_network_baseline", "capture_network_metadata_sample", "show_ids_alerts"],
+            "threat_intelligence": ["build_threat_intel_brief", "lookup_cve", "search_cves", "check_cisa_kev", "lookup_malware_hash", "hash_workspace_file", "add_malware_signature", "scan_workspace_file_signatures"],
+            "cryptography": ["list_crypto_algorithms", "encrypt_text", "decrypt_text", "encrypt_file", "decrypt_file"],
+            "validation": ["build_validation_matrix", "run_self_improvement_validation", "quality_gate"],
+        }
+        ordered_probe_plan: list[dict[str, Any]] = []
+        if profile.get("tool_intent"):
+            ordered_probe_plan.append({"step": 1, "tool": "build_toolbox_brief", "purpose": "Select the best evidence probes and tool groups."})
+            ordered_probe_plan.append({"step": 2, "tool": "map_repository_structure", "purpose": "Confirm repository shape and likely boundaries."})
+            ordered_probe_plan.append({"step": 3, "tool": "inspect_project_entrypoints", "purpose": "Find runnable paths before changing behavior."})
+            ordered_probe_plan.append({"step": 4, "tool": "extract_api_surface", "purpose": "Identify public functions/classes likely affected."})
+        if "network_intelligence" in profile.get("intents", []) and any(term in objective_text.lower() for term in ["ids", "traffic", "pcap", "suricata", "zeek", "intrusion", "packet", "flows"]):
+            ordered_probe_plan.append({"step": len(ordered_probe_plan) + 1, "tool": "build_ids_mode_plan", "purpose": "Choose offline ingestion or explicitly authorized live metadata capture."})
+            ordered_probe_plan.append({"step": len(ordered_probe_plan) + 1, "tool": "ingest_network_traffic_file", "purpose": "Normalize PCAP/Zeek/Suricata/CSV/JSONL traffic into metadata-only flows."})
+            ordered_probe_plan.append({"step": len(ordered_probe_plan) + 1, "tool": "analyze_network_traffic_file", "purpose": "Generate IDS-style alerts and analyst recommendations."})
+        if profile.get("write_intent"):
+            ordered_probe_plan.extend([
+                {"step": len(ordered_probe_plan) + 1, "tool": "plan_patch_strategy", "purpose": "Choose the smallest reversible edit path."},
+                {"step": len(ordered_probe_plan) + 2, "tool": "build_validation_matrix", "purpose": "Define pass/fail checks before editing."},
+                {"step": len(ordered_probe_plan) + 3, "tool": "score_execution_readiness", "purpose": "Gate write action until evidence is sufficient."},
+            ])
+        if not ordered_probe_plan:
+            ordered_probe_plan.append({"step": 1, "tool": "decompose_goal", "purpose": "Decide whether direct answer is enough."})
+        payload = {
+            "generated_at": utc_now(),
+            "objective": objective_text,
+            "scope": scope,
+            "task_profile": profile,
+            "tool_groups": tool_groups,
+            "ordered_probe_plan": ordered_probe_plan,
+            "capability_graph_summary": {"ok": registry.ok, "node_count": registry.meta.get("node_count") if registry.ok else None},
+            "repository_summary": {"ok": repo.ok, "extension_counts": repo.meta.get("extension_counts", {}) if repo.ok else {}},
+            "entrypoint_summary": {"ok": entrypoints.ok, "entrypoint_count": len(entrypoints.meta.get("entrypoints", [])) if entrypoints.ok else 0},
+            "config_summary": {"ok": config_surface.ok, "config_file_count": config_surface.meta.get("config_file_count") if config_surface.ok else 0},
+            "recommended_tool_chain": chain.meta if chain.ok else {"error": chain.content},
+            "subagent_guidance": [
+                "Researcher: run repository/config/entrypoint probes and return exact paths.",
+                "Architect: use API/data-flow surfaces to choose boundaries before refactoring.",
+                "Coder: do not patch until patch_strategy and validation_matrix are clear.",
+                "Tester: turn trace_data_flow and inspect_error_log into targeted checks.",
+                "Safety: require checkpoint and readiness gate for write/control tools.",
+            ],
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
     def decompose_goal(self, goal: str, context: str = "") -> ToolResult:
         objective = str(goal).strip()
         if not objective:
@@ -3959,6 +12954,7 @@ class AgentTools:
 
         recommendations = [
             "Use this pack to avoid starting from a blank prompt.",
+            "Run recommend_tool_chain or build_execution_dossier when the next tool sequence is unclear.",
             "Prefer the suggested first tools and roles unless direct evidence points elsewhere.",
         ]
         if profile.get("write_intent"):
@@ -5609,11 +14605,13 @@ class AgentTools:
             "monitor": config.get("monitor"),
             "show_thinking_indicator": config.get("show_thinking_indicator"),
             "fallback_provider": config.get("fallback_provider"),
+            "model_router": config.get("model_router", {}),
             "autonomy_policy": config.get("autonomy_policy", {}),
             "llm_providers": redacted_llm_providers(config.get("llm_providers", {})),
             "role_providers": config.get("role_providers", {}),
             "role_models": config.get("role_models", {}),
             "config_file": workspace_relative(CONFIG_FILE),
+            "model_catalog_file": workspace_relative(MODEL_CATALOG_FILE),
         }
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
@@ -5634,6 +14632,8 @@ class AgentTools:
                 "base_url": settings.get("base_url", ""),
                 "model": settings.get("model", ""),
                 "api_key_source": settings.get("api_key_env", "inline" if settings.get("api_key") else ""),
+                "auto_discover_model": settings.get("auto_discover_model", False),
+                "known_model_hints": len(settings.get("known_models", [])) if isinstance(settings.get("known_models"), list) else 0,
             }
             for name, settings in providers.items()
             if isinstance(settings, dict)
@@ -5643,8 +14643,576 @@ class AgentTools:
             "fallback_provider": config.get("fallback_provider"),
             "providers": provider_summary,
             "routes": routes,
+            "model_router": config.get("model_router", {}),
             "config_file": workspace_relative(CONFIG_FILE),
         }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def show_model_router(self) -> ToolResult:
+        config = load_config()
+        router = dict(config.get("model_router", default_model_router_config()))
+        providers = config.get("llm_providers", {})
+        route_summaries: list[dict[str, Any]] = []
+        for route in router.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            provider = str(route.get("provider", "") or "<preserve selected>")
+            model = str(route.get("model", "") or "<preserve selected>")
+            route_summaries.append(
+                {
+                    "name": route.get("name"),
+                    "max_input_tokens": route.get("max_input_tokens"),
+                    "input_token_budget": route.get("input_token_budget"),
+                    "provider": provider,
+                    "provider_known": provider == "<preserve selected>" or provider in providers,
+                    "model": model,
+                    "temperature": route.get("temperature"),
+                    "reason": route.get("reason", ""),
+                }
+            )
+        payload = {
+            "enabled": router.get("enabled", True),
+            "estimate_chars_per_token": router.get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN),
+            "respect_explicit_model": router.get("respect_explicit_model", False),
+            "log_decisions": router.get("log_decisions", True),
+            "enable_prompt_compaction": router.get("enable_prompt_compaction", True),
+            "reserve_output_tokens": router.get("reserve_output_tokens", 1024),
+            "min_compaction_tokens": router.get("min_compaction_tokens", 256),
+            "compaction_margin_tokens": router.get("compaction_margin_tokens", 128),
+            "routes": route_summaries,
+            "how_to_configure": {
+                "lmstudio_example": "Set a route provider to lmstudio and model to the exact model id loaded in LM Studio, or leave model blank to preserve the selected provider model.",
+                "long_context_example": "Give the final route max_input_tokens=null and point it at your largest-context model.",
+                "budget_example": "Set input_token_budget on a route, or context_window on a provider, to let Cerebro compact oversized prompts before calling the model.",
+            },
+            "config_file": workspace_relative(CONFIG_FILE),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+
+    def validate_model_router_config(self) -> ToolResult:
+        config = load_config()
+        router = config.get("model_router", default_model_router_config())
+        providers = config.get("llm_providers", {})
+        routes = router.get("routes", []) if isinstance(router.get("routes"), list) else []
+        issues: list[str] = []
+        warnings: list[str] = []
+        checks: list[dict[str, Any]] = []
+
+        def record(name: str, ok: bool, detail: str = "") -> None:
+            checks.append({"name": name, "ok": bool(ok), "detail": detail})
+            if not ok:
+                issues.append(f"{name}: {detail}".strip())
+
+        record("router_is_dict", isinstance(router, dict), type(router).__name__)
+        record("routes_present", bool(routes), f"count={len(routes)}")
+        names = [str(route.get("name", "")) for route in routes if isinstance(route, dict)]
+        record("route_names_unique", len(names) == len(set(names)), ", ".join(names))
+        record("final_route_accepts_overflow", bool(routes) and routes[-1].get("max_input_tokens") is None, json.dumps(routes[-1] if routes else {}, indent=2))
+
+        finite_thresholds: list[int] = []
+        for index, route in enumerate(routes):
+            if not isinstance(route, dict):
+                record(f"route_{index + 1}_is_dict", False, repr(route))
+                continue
+            name = str(route.get("name") or f"route_{index + 1}")
+            provider = str(route.get("provider", "") or "")
+            budget = route.get("input_token_budget")
+            max_input = route.get("max_input_tokens")
+            if provider:
+                record(f"{name}_provider_known", provider in providers, provider)
+            if max_input is not None:
+                max_value = safe_int(max_input, 0)
+                record(f"{name}_max_input_positive", max_value > 0, str(max_input))
+                finite_thresholds.append(max_value)
+            if budget is not None:
+                budget_value = safe_int(budget, 0)
+                record(f"{name}_input_budget_positive", budget_value > 0, str(budget))
+                if max_input is not None and budget_value > safe_int(max_input, 0):
+                    warnings.append(f"{name}: input_token_budget exceeds max_input_tokens; compaction may not trigger until after route selection.")
+            temperature = route.get("temperature")
+            if temperature is not None:
+                try:
+                    temperature_value = float(temperature)
+                    record(f"{name}_temperature_range", 0 <= temperature_value <= 2, str(temperature))
+                except (TypeError, ValueError):
+                    record(f"{name}_temperature_range", False, str(temperature))
+
+        record("finite_thresholds_sorted", finite_thresholds == sorted(finite_thresholds), str(finite_thresholds))
+        chars_per_token = float(router.get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN))
+        record("chars_per_token_reasonable", 1.0 <= chars_per_token <= 8.0, str(chars_per_token))
+        if not bool(router.get("enable_prompt_compaction", True)):
+            warnings.append("Prompt compaction is disabled; oversized prompts may still overflow smaller local models.")
+        if safe_int(router.get("reserve_output_tokens"), 0) < 256:
+            warnings.append("reserve_output_tokens is low; model replies may be clipped on small context windows.")
+
+        payload = {
+            "ok": not issues,
+            "issue_count": len(issues),
+            "warning_count": len(warnings),
+            "issues": issues,
+            "warnings": warnings,
+            "checks": checks,
+            "routes": routes,
+            "config_file": workspace_relative(CONFIG_FILE),
+        }
+        return ToolResult(not issues, json.dumps(payload, indent=2), meta=payload)
+
+    def recommend_model_route(
+        self,
+        prompt: str = "",
+        path: str = "",
+        role: str = "",
+        provider: str = "",
+        model: str = "",
+    ) -> ToolResult:
+        config = load_config()
+        source = "prompt"
+        content = prompt or ""
+        if path:
+            target = resolve_workspace_path(path)
+            if not target.exists() or not target.is_file():
+                return ToolResult(False, f"Path does not exist or is not a file: {path}")
+            content = read_text_sample(target, max_chars=MAX_FILE_CHARS * 4)
+            source = workspace_relative(target)
+        if not content:
+            content = " "
+
+        if role and role in ROLE_CATALOG:
+            base_provider = get_role_provider(role, config)
+            _, base_provider_config = get_provider_config(base_provider)
+            base_model = get_role_model(role)
+        else:
+            base_provider, base_provider_config = get_provider_config(provider or None)
+            base_model = model or str(base_provider_config.get("model", config.get("default_model", MODEL)))
+        base_temperature = float(config.get("temperature", 0.25))
+        messages = [{"role": "user", "content": content}]
+        routed_provider, routed_config, routed_model, routed_temperature, decision = resolve_model_route(
+            messages,
+            provider_name=base_provider,
+            provider_config=base_provider_config,
+            selected_model=base_model,
+            selected_temperature=base_temperature,
+            config=config,
+            explicit_model=bool(model),
+            log_decision=False,
+        )
+        prompt_budget = model_input_token_budget(decision, routed_config, config)
+        compaction_preview = None
+        if prompt_budget:
+            _preview_messages, compaction_preview = compact_messages_for_input_budget(
+                messages,
+                max_input_tokens=prompt_budget,
+                chars_per_token=float(config.get("model_router", {}).get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN)),
+                min_message_tokens=safe_int(config.get("model_router", {}).get("min_compaction_tokens"), 256),
+            )
+        payload = {
+            "source": source,
+            "role": role if role in ROLE_CATALOG else "",
+            "input_characters": len(content),
+            "estimated_input_tokens": decision.get("estimated_input_tokens"),
+            "input_token_budget": prompt_budget,
+            "would_compact_prompt": bool(compaction_preview and compaction_preview.get("compacted")),
+            "compaction_preview": compaction_preview,
+            "route_name": decision.get("route_name"),
+            "route_reason": decision.get("route_reason"),
+            "original": {
+                "provider": decision.get("original_provider"),
+                "model": decision.get("original_model"),
+                "temperature": decision.get("original_temperature"),
+            },
+            "recommended": {
+                "provider": routed_provider,
+                "model": routed_model,
+                "temperature": routed_temperature,
+            },
+            "changed": decision.get("changed", False),
+            "router_enabled": decision.get("enabled", False),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def list_available_models(
+        self,
+        provider: str = "",
+        refresh: bool = False,
+        include_static: bool = True,
+        limit: int = 200,
+    ) -> ToolResult:
+        config = load_config()
+        provider = str(provider or "").strip()
+        providers = config.get("llm_providers", {})
+        if provider and provider not in providers:
+            return ToolResult(False, f"Unknown provider: {provider}")
+
+        discovery_meta: dict[str, Any] | None = None
+        if refresh:
+            discovery = self.discover_available_models(provider=provider, save=True)
+            discovery_meta = discovery.meta
+
+        models = combined_model_catalog(
+            config,
+            provider_filter=provider,
+            include_cache=True,
+            include_static=include_static,
+        )
+        limit = max(1, min(int(limit), 1000))
+        provider_counts: dict[str, int] = {}
+        capability_counts: dict[str, int] = {}
+        for model_record in models:
+            provider_name = str(model_record.get("provider", ""))
+            provider_counts[provider_name] = provider_counts.get(provider_name, 0) + 1
+            for capability in model_record.get("capabilities", []):
+                capability = str(capability)
+                capability_counts[capability] = capability_counts.get(capability, 0) + 1
+
+        payload = {
+            "provider_filter": provider,
+            "model_count": len(models),
+            "shown_count": min(len(models), limit),
+            "provider_counts": dict(sorted(provider_counts.items())),
+            "capability_counts": dict(sorted(capability_counts.items())),
+            "models": models[:limit],
+            "cache_file": workspace_relative(MODEL_CATALOG_FILE),
+            "config_file": workspace_relative(CONFIG_FILE),
+            "refreshed": bool(refresh),
+            "discovery": discovery_meta,
+            "usage": {
+                "list_without_network": "refresh=false uses configured defaults plus cached live discoveries.",
+                "live_refresh": "Set refresh=true, or call discover_available_models, after configuring API keys.",
+                "set_route": "Use set_model_selection after choosing an exact provider/model id.",
+            },
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def discover_available_models(
+        self,
+        provider: str = "",
+        save: bool = True,
+        timeout: int = 12,
+    ) -> ToolResult:
+        config = load_config()
+        providers = config.get("llm_providers", {})
+        provider = str(provider or "").strip()
+        if provider and provider not in providers:
+            return ToolResult(False, f"Unknown provider: {provider}")
+
+        selected_provider_names = [provider] if provider else sorted(providers)
+        all_records: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        provider_results: dict[str, Any] = {}
+
+        for provider_name in selected_provider_names:
+            settings = providers.get(provider_name, {})
+            if not isinstance(settings, dict):
+                continue
+            records, provider_warnings = discover_provider_models_live(provider_name, settings, timeout=timeout)
+            all_records.extend(records)
+            warnings.extend(provider_warnings)
+            provider_results[provider_name] = {
+                "ok": bool(records),
+                "model_count": len(records),
+                "warnings": provider_warnings,
+                "base_url": settings.get("base_url", ""),
+                "provider_type": settings.get("type", "openai_compatible"),
+                "api_key_source": settings.get("api_key_env", "inline" if settings.get("api_key") else ""),
+            }
+
+        all_records = dedupe_model_records(all_records)
+        if save:
+            existing = load_model_catalog_cache()
+            existing_models = [
+                item for item in existing.get("models", [])
+                if not provider or str(item.get("provider", "")) != provider
+            ]
+            merged = dedupe_model_records(existing_models + all_records)
+            provider_cache = existing.get("providers", {}) if isinstance(existing.get("providers"), dict) else {}
+            for provider_name, result in provider_results.items():
+                provider_cache[provider_name] = {
+                    "last_checked_at": utc_now(),
+                    "model_count": result.get("model_count", 0),
+                    "warnings": result.get("warnings", []),
+                    "base_url": result.get("base_url", ""),
+                    "provider_type": result.get("provider_type", ""),
+                }
+            save_model_catalog_cache(
+                {
+                    "schema_version": 1,
+                    "providers": provider_cache,
+                    "models": merged,
+                    "notes": "Cached live model discovery. Safe to delete; Cerebro will regenerate it.",
+                }
+            )
+
+        payload = {
+            "provider_filter": provider,
+            "providers_checked": selected_provider_names,
+            "model_count": len(all_records),
+            "models": all_records,
+            "warnings": warnings,
+            "provider_results": provider_results,
+            "saved": bool(save),
+            "cache_file": workspace_relative(MODEL_CATALOG_FILE),
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def recommend_model_selection(
+        self,
+        objective: str = "",
+        role: str = "",
+        provider: str = "",
+        required_context_tokens: int = 0,
+        prefer: str = "",
+        limit: int = 8,
+        refresh: bool = False,
+    ) -> ToolResult:
+        config = load_config()
+        provider = str(provider or "").strip()
+        providers = config.get("llm_providers", {})
+        if provider and provider not in providers:
+            return ToolResult(False, f"Unknown provider: {provider}")
+        if role and role not in ROLE_CATALOG:
+            return ToolResult(False, f"Unknown role: {role}")
+
+        if refresh:
+            self.discover_available_models(provider=provider, save=True)
+
+        models = combined_model_catalog(config, provider_filter=provider, include_cache=True, include_static=True)
+        if not models:
+            return ToolResult(False, "No model records are available. Configure providers or call discover_available_models after setting API keys.")
+
+        scored: list[dict[str, Any]] = []
+        for record in models:
+            score, reasons = score_model_record(
+                record,
+                objective=objective,
+                role=role,
+                required_context_tokens=max(0, int(required_context_tokens)),
+                prefer=prefer,
+            )
+            enriched = dict(record)
+            enriched["score"] = score
+            enriched["score_reasons"] = reasons
+            scored.append(enriched)
+        scored.sort(key=lambda item: (-float(item.get("score", 0)), str(item.get("provider", "")), str(item.get("id", ""))))
+        limit = max(1, min(int(limit), 50))
+        best = scored[0]
+        payload = {
+            "objective": objective,
+            "role": role,
+            "provider_filter": provider,
+            "required_context_tokens": max(0, int(required_context_tokens)),
+            "prefer": prefer,
+            "recommendation": {
+                "provider": best.get("provider"),
+                "model": best.get("id"),
+                "score": best.get("score"),
+                "reasons": best.get("score_reasons", []),
+                "capabilities": best.get("capabilities", []),
+            },
+            "candidates": scored[:limit],
+            "candidate_count": len(scored),
+            "next_action": "Use set_model_selection with the recommended provider/model if you want to persist this route.",
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def build_model_portfolio(self, objective: str = "", refresh: bool = False) -> ToolResult:
+        categories = [
+            {"name": "default_general", "role": "planner", "prefer": "balanced general model"},
+            {"name": "coding_refactor", "role": "coder", "prefer": "coding refactor debug software engineering"},
+            {"name": "deep_reasoning", "role": "critic", "prefer": "reasoning hard problems architecture"},
+            {"name": "fast_cheap", "role": "researcher", "prefer": "fast cheap quick small"},
+            {"name": "long_context", "role": "planner", "prefer": "long context large files transcripts", "required_context_tokens": 30000},
+            {"name": "local_private", "role": "coder", "prefer": "local private offline LM Studio Ollama"},
+            {"name": "open_weight_meta", "role": "coder", "prefer": "open weights Meta Llama open source"},
+        ]
+        portfolio: dict[str, Any] = {}
+        for category in categories:
+            result = self.recommend_model_selection(
+                objective=objective,
+                role=category.get("role", ""),
+                required_context_tokens=int(category.get("required_context_tokens", 0)),
+                prefer=str(category.get("prefer", "")),
+                limit=5,
+                refresh=refresh,
+            )
+            portfolio[category["name"]] = result.meta.get("recommendation", {}) if result.ok else {"error": result.content}
+
+        payload = {
+            "objective": objective,
+            "portfolio": portfolio,
+            "role_mapping_suggestion": {
+                "planner": portfolio.get("deep_reasoning", portfolio.get("default_general", {})),
+                "architect": portfolio.get("deep_reasoning", portfolio.get("coding_refactor", {})),
+                "coder": portfolio.get("coding_refactor", {}),
+                "refactorer": portfolio.get("coding_refactor", {}),
+                "reviewer": portfolio.get("deep_reasoning", {}),
+                "tester": portfolio.get("coding_refactor", {}),
+                "researcher": portfolio.get("fast_cheap", {}),
+                "writer": portfolio.get("default_general", portfolio.get("fast_cheap", {})),
+                "safety": portfolio.get("deep_reasoning", {}),
+                "critic": portfolio.get("deep_reasoning", {}),
+                "maintainer": portfolio.get("fast_cheap", portfolio.get("default_general", {})),
+                "meta": portfolio.get("deep_reasoning", portfolio.get("default_general", {})),
+            },
+            "next_action": "Persist specific assignments with set_model_selection(scope='role', role='coder', provider='...', model='...').",
+        }
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def set_model_selection(
+        self,
+        provider: str,
+        model: str,
+        scope: str = "default",
+        role: str = "",
+        route_name: str = "",
+        allow_unknown: bool = False,
+    ) -> ToolResult:
+        provider = str(provider or "").strip()
+        model = str(model or "").strip()
+        scope = str(scope or "default").strip().lower()
+        role = str(role or "").strip()
+        route_name = str(route_name or "").strip()
+        if not provider or not model:
+            return ToolResult(False, "provider and model are required.")
+
+        config = load_config()
+        providers = config.get("llm_providers", {})
+        if provider not in providers:
+            return ToolResult(False, f"Unknown provider: {provider}. Use configure_llm_provider first.")
+
+        known_models = combined_model_catalog(config, provider_filter=provider, include_cache=True, include_static=True)
+        known_ids = {str(item.get("id", "")) for item in known_models}
+        if not allow_unknown and model not in known_ids:
+            return ToolResult(
+                False,
+                f"Model {model!r} is not in the known catalog for {provider}. "
+                "Call discover_available_models or set allow_unknown=true if you know the exact provider model id."
+            )
+
+        before = {
+            "provider": config.get("provider"),
+            "default_model": config.get("default_model"),
+            "role_provider": config.get("role_providers", {}).get(role) if role else None,
+            "role_model": config.get("role_models", {}).get(role) if role else None,
+            "route": None,
+        }
+
+        if scope == "default":
+            config["provider"] = provider
+            config["default_model"] = model
+            providers[provider]["model"] = model
+            config["base_url"] = providers[provider].get("base_url", config.get("base_url", ""))
+            config["api_key"] = providers[provider].get("api_key", config.get("api_key", ""))
+        elif scope == "role":
+            if role not in ROLE_CATALOG:
+                return ToolResult(False, f"Unknown role for role-scoped route: {role}")
+            config.setdefault("role_providers", {})[role] = provider
+            config.setdefault("role_models", {})[role] = model
+            providers[provider]["model"] = model
+        elif scope == "router":
+            routes = config.get("model_router", {}).get("routes", [])
+            if not route_name:
+                return ToolResult(False, "route_name is required when scope='router'.")
+            updated_route = None
+            for route in routes if isinstance(routes, list) else []:
+                if isinstance(route, dict) and str(route.get("name", "")) == route_name:
+                    before["route"] = dict(route)
+                    route["provider"] = provider
+                    route["model"] = model
+                    updated_route = route
+                    break
+            if updated_route is None:
+                return ToolResult(False, f"No model-router route named {route_name!r}.")
+        else:
+            return ToolResult(False, "scope must be one of: default, role, router.")
+
+        config["llm_providers"] = providers
+        save_config(config)
+        after = {
+            "provider": config.get("provider"),
+            "default_model": config.get("default_model"),
+            "role_provider": config.get("role_providers", {}).get(role) if role else None,
+            "role_model": config.get("role_models", {}).get(role) if role else None,
+            "route": next(
+                (dict(route) for route in config.get("model_router", {}).get("routes", []) if isinstance(route, dict) and str(route.get("name", "")) == route_name),
+                None,
+            ) if route_name else None,
+        }
+        payload = {
+            "updated": True,
+            "scope": scope,
+            "provider": provider,
+            "model": model,
+            "role": role,
+            "route_name": route_name,
+            "allow_unknown": bool(allow_unknown),
+            "before": before,
+            "after": after,
+            "config_file": workspace_relative(CONFIG_FILE),
+        }
+        log_run_event("model_selection_updated", payload)
+        return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
+
+    def configure_llm_provider(
+        self,
+        name: str,
+        provider_type: str = "openai_compatible",
+        base_url: str = "",
+        api_key_env: str = "",
+        model: str = "",
+        model_list_endpoint: str = "",
+        overwrite: bool = False,
+    ) -> ToolResult:
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "").strip().lower())
+        if not name:
+            return ToolResult(False, "Provider name is required.")
+        provider_type = str(provider_type or "openai_compatible").strip().lower()
+        if provider_type not in {"openai", "openai_compatible", "anthropic"}:
+            return ToolResult(False, "provider_type must be openai, openai_compatible, or anthropic.")
+
+        config = load_config()
+        providers = config.setdefault("llm_providers", {})
+        if name in providers and not overwrite:
+            return ToolResult(False, f"Provider {name!r} already exists. Set overwrite=true to update it.")
+
+        if not base_url and provider_type == "anthropic":
+            base_url = "https://api.anthropic.com"
+        if not base_url and provider_type in {"openai", "openai_compatible"}:
+            return ToolResult(False, "base_url is required for OpenAI-compatible providers.")
+
+        settings = dict(providers.get(name, {})) if isinstance(providers.get(name), dict) else {}
+        settings.update(
+            {
+                "type": provider_type,
+                "base_url": base_url.rstrip("/") if base_url else settings.get("base_url", ""),
+                "model": model or settings.get("model", MODEL),
+                "auto_discover_model": True,
+                "family": settings.get("family", name),
+                "notes": settings.get("notes", "User-configured LLM provider."),
+            }
+        )
+        if api_key_env:
+            settings["api_key_env"] = api_key_env
+            settings.pop("api_key", None)
+        if model_list_endpoint:
+            settings["model_list_endpoint"] = model_list_endpoint
+        settings.setdefault("known_models", [{"id": settings.get("model", MODEL), "capabilities": ["configured"]}])
+        providers[name] = settings
+        config["llm_providers"] = providers
+        save_config(config)
+
+        payload = {
+            "configured": True,
+            "provider": name,
+            "settings": redacted_llm_providers({name: settings}).get(name, {}),
+            "config_file": workspace_relative(CONFIG_FILE),
+            "next_actions": [
+                f"Set {settings.get('api_key_env')} in your environment." if settings.get("api_key_env") else "Provider uses inline/local API key settings.",
+                f"Run discover_available_models(provider='{name}') to populate exact model ids.",
+                f"Run recommend_model_selection(provider='{name}', objective='...') to choose a model.",
+            ],
+        }
+        log_run_event("llm_provider_configured", payload)
         return ToolResult(True, json.dumps(payload, indent=2), meta=payload)
 
     def show_workspace_stats(self, path: str = ".", recursive: bool = True) -> ToolResult:
@@ -6893,6 +16461,11 @@ class AgentTools:
             task=goal,
             context=json.dumps({"selected_opportunity": selected, "governor_decision": decision}),
         )
+        tool_chain = self.recommend_tool_chain(
+            objective=goal,
+            context=json.dumps({"selected_opportunity": selected, "governor_decision": decision}),
+            path=scope,
+        )
         roles = recommendation.meta.get("roles", ["planner", "coder", "reviewer"])
         if selected.get("target") == "validation":
             roles = ["tester", "reviewer", "safety"]
@@ -6916,6 +16489,7 @@ class AgentTools:
             "governor_decision": decision,
             "recommended_roles": roles,
             "team_recommendation": recommendation.meta,
+            "recommended_tool_chain": tool_chain.meta if tool_chain.ok else {"error": tool_chain.content},
             "autonomy_policy": health.meta.get("autonomy_policy", {}),
             "health_recommendations": health.meta.get("recommendations", []),
             "execution_constraints": [
@@ -6924,6 +16498,7 @@ class AgentTools:
                 "Use build_code_graph and analyze_symbol_impact before refactoring shared helpers.",
                 "Use rank_code_hotspots to identify high-blast-radius symbols before broad edits.",
                 "Review the recent cycle ledger before widening scope or starting a new refactor path.",
+                "Use the recommended_tool_chain phases as the default order unless fresh evidence contradicts them.",
                 "Do not broaden scope beyond the selected opportunity unless validation is failing.",
                 "Preserve .agent_* state files during rollback.",
             ],
@@ -6939,6 +16514,589 @@ class AgentTools:
             },
         }
         return ToolResult(True, json.dumps(brief, indent=2), meta=brief)
+
+    def scan_workspace_secrets(
+        self,
+        path: str = ".",
+        recursive: bool = True,
+        max_files: int = 200,
+        max_bytes_per_file: int = 1048576,
+        include_low_confidence: bool = False,
+    ) -> ToolResult:
+        """Scan workspace text files for likely exposed secrets without revealing raw values."""
+        target = resolve_workspace_path(path)
+        max_files = max(1, min(int(max_files), 1000))
+        max_bytes_per_file = max(1024, min(int(max_bytes_per_file), 20 * 1024 * 1024))
+        if target.is_file():
+            candidates = [target]
+        elif recursive:
+            candidates = iter_workspace_files(target)
+        else:
+            candidates = [item for item in target.iterdir() if item.is_file() and not should_skip_checkpoint_path(item)]
+        candidates = sorted(candidates, key=lambda item: workspace_relative(item))[:max_files]
+
+        secret_patterns: list[dict[str, Any]] = [
+            {
+                "name": "private_key_block",
+                "severity": "critical",
+                "regex": re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----", re.I),
+                "description": "Private key material appears to be present.",
+            },
+            {
+                "name": "openai_api_key",
+                "severity": "high",
+                "regex": re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b"),
+                "description": "OpenAI-style API key pattern.",
+            },
+            {
+                "name": "anthropic_api_key",
+                "severity": "high",
+                "regex": re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
+                "description": "Anthropic-style API key pattern.",
+            },
+            {
+                "name": "github_token",
+                "severity": "high",
+                "regex": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b"),
+                "description": "GitHub token pattern.",
+            },
+            {
+                "name": "aws_access_key_id",
+                "severity": "high",
+                "regex": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+                "description": "AWS access key id pattern.",
+            },
+            {
+                "name": "slack_token",
+                "severity": "high",
+                "regex": re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{20,}\b"),
+                "description": "Slack token pattern.",
+            },
+            {
+                "name": "jwt_token",
+                "severity": "medium",
+                "regex": re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+                "description": "JWT-like token.",
+            },
+            {
+                "name": "credential_assignment",
+                "severity": "medium",
+                "regex": re.compile(
+                    r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?token)\b\s*[:=]\s*[\"']?([^\"'\s#]{12,})"
+                ),
+                "description": "Credential-looking assignment.",
+            },
+        ]
+
+        def shannon_entropy(value: str) -> float:
+            if not value:
+                return 0.0
+            counts = collections.Counter(value)
+            length = float(len(value))
+            return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+        def redact_value(value: str) -> str:
+            value = str(value)
+            if len(value) <= 8:
+                return "<redacted>"
+            return f"{value[:4]}…{value[-4:]}"
+
+        def redacted_context(line: str, raw_value: str) -> str:
+            safe_line = line.replace(raw_value, redact_value(raw_value)) if raw_value else line
+            return trim_text(safe_line.strip(), 220)
+
+        findings: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        scanned_files = 0
+        scanned_bytes = 0
+        severity_rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+        for file_path in candidates:
+            try:
+                size = file_path.stat().st_size
+            except OSError as exc:
+                skipped.append({"path": workspace_relative(file_path), "reason": f"stat_failed: {exc}"})
+                continue
+            if size > max_bytes_per_file:
+                skipped.append({"path": workspace_relative(file_path), "reason": f"larger_than_max_bytes_per_file:{size}"})
+                continue
+            try:
+                raw = file_path.read_bytes()
+            except OSError as exc:
+                skipped.append({"path": workspace_relative(file_path), "reason": f"read_failed: {exc}"})
+                continue
+            if b"\x00" in raw[:4096]:
+                skipped.append({"path": workspace_relative(file_path), "reason": "binary_or_null_bytes"})
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            scanned_files += 1
+            scanned_bytes += len(raw)
+            rel = workspace_relative(file_path)
+            lines = text.splitlines()
+            for line_no, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                for pattern in secret_patterns:
+                    for match in pattern["regex"].finditer(line):
+                        raw_value = match.group(1) if match.groups() else match.group(0)
+                        if not raw_value:
+                            continue
+                        if pattern["name"] == "credential_assignment":
+                            assignment_value = raw_value.strip()
+                            if (
+                                "(" in assignment_value
+                                or ")" in assignment_value
+                                or assignment_value.startswith(("read_", "os.", "str(", "dict(", "json.", "config.", "value."))
+                            ):
+                                continue
+                        entropy = round(shannon_entropy(raw_value), 3)
+                        finding = {
+                            "path": rel,
+                            "line": line_no,
+                            "type": pattern["name"],
+                            "severity": pattern["severity"],
+                            "description": pattern["description"],
+                            "redacted_value": redact_value(raw_value),
+                            "entropy": entropy,
+                            "context": redacted_context(line, raw_value),
+                        }
+                        findings.append(finding)
+
+                # Generic high-entropy fallback catches provider keys Cerebro does not know yet.
+                for match in re.finditer(r"\b[A-Za-z0-9_./+=\-]{24,}\b", line):
+                    candidate = match.group(0)
+                    if candidate.startswith(("http://", "https://")):
+                        continue
+                    if candidate.lower().endswith((".json", ".py", ".txt", ".md", ".sqlite")):
+                        continue
+                    if not (re.search(r"[A-Za-z]", candidate) and re.search(r"\d", candidate)):
+                        continue
+                    entropy = shannon_entropy(candidate)
+                    if entropy < 4.1:
+                        continue
+                    near = line[max(0, match.start() - 48) : min(len(line), match.end() + 48)]
+                    lower_near = near.lower()
+                    confidence = "medium" if any(token in lower_near for token in ["key", "secret", "token", "password", "auth", "bearer"]) else "low"
+                    if confidence == "low" and not include_low_confidence:
+                        continue
+                    findings.append(
+                        {
+                            "path": rel,
+                            "line": line_no,
+                            "type": "high_entropy_candidate",
+                            "severity": "medium" if confidence == "medium" else "low",
+                            "description": "High-entropy string that may be a token or generated secret.",
+                            "redacted_value": redact_value(candidate),
+                            "entropy": round(entropy, 3),
+                            "confidence": confidence,
+                            "context": redacted_context(line, candidate),
+                        }
+                    )
+
+        unique: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+        for finding in findings:
+            key = (
+                str(finding.get("path")),
+                int(finding.get("line", 0)),
+                str(finding.get("type")),
+                str(finding.get("redacted_value")),
+            )
+            existing = unique.get(key)
+            if existing is None or severity_rank.get(str(finding.get("severity")), 0) > severity_rank.get(str(existing.get("severity")), 0):
+                unique[key] = finding
+        findings = sorted(
+            unique.values(),
+            key=lambda item: (-severity_rank.get(str(item.get("severity")), 0), str(item.get("path")), int(item.get("line", 0))),
+        )
+        counts_by_severity: dict[str, int] = {}
+        counts_by_type: dict[str, int] = {}
+        for finding in findings:
+            counts_by_severity[str(finding.get("severity", "unknown"))] = counts_by_severity.get(str(finding.get("severity", "unknown")), 0) + 1
+            counts_by_type[str(finding.get("type", "unknown"))] = counts_by_type.get(str(finding.get("type", "unknown")), 0) + 1
+
+        recommendations = [
+            "Rotate any confirmed exposed credentials before committing or sharing this workspace.",
+            "Move secrets into environment variables or a dedicated local secret store.",
+            "Review low-confidence high-entropy candidates manually before treating them as incidents.",
+        ]
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "recursive": bool(recursive),
+            "scanned_files": scanned_files,
+            "scanned_bytes": scanned_bytes,
+            "skipped_count": len(skipped),
+            "finding_count": len(findings),
+            "counts_by_severity": counts_by_severity,
+            "counts_by_type": counts_by_type,
+            "findings": findings[:200],
+            "truncated": len(findings) > 200,
+            "skipped": skipped[:50],
+            "recommendations": recommendations,
+            "note": "Values are redacted by design; this tool does not print raw secrets.",
+        }
+        summary = [
+            "Workspace secret scan complete.",
+            f"Scanned files: {scanned_files}",
+            f"Findings: {len(findings)}",
+            f"Severity counts: {json.dumps(counts_by_severity, sort_keys=True)}",
+        ]
+        if findings:
+            summary.append("Top findings:")
+            for finding in findings[:10]:
+                summary.append(
+                    f"- {finding['severity']} {finding['type']} at {finding['path']}:{finding['line']} "
+                    f"value={finding['redacted_value']}"
+                )
+        return ToolResult(True, "\n".join(summary), meta=payload)
+
+    def build_workspace_snapshot(
+        self,
+        path: str = ".",
+        recursive: bool = True,
+        max_files: int = 250,
+        include_hashes: bool = False,
+    ) -> ToolResult:
+        """Build a compact, read-only operational snapshot of the current workspace."""
+        target = resolve_workspace_path(path)
+        max_files = max(1, min(int(max_files), 2000))
+        if target.is_file():
+            files = [target]
+        elif recursive:
+            files = iter_workspace_files(target)
+        else:
+            files = [item for item in target.iterdir() if item.is_file() and not should_skip_checkpoint_path(item)]
+        files = sorted(files, key=lambda item: workspace_relative(item))[:max_files]
+
+        extension_counts: dict[str, int] = {}
+        total_bytes = 0
+        largest: list[dict[str, Any]] = []
+        newest: list[dict[str, Any]] = []
+        python_files: list[Path] = []
+        file_records: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        for file_path in files:
+            try:
+                stat = file_path.stat()
+            except OSError as exc:
+                errors.append({"path": workspace_relative(file_path), "error": str(exc)})
+                continue
+            rel = workspace_relative(file_path)
+            suffix = file_path.suffix.lower() or "<none>"
+            extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
+            total_bytes += stat.st_size
+            if file_path.suffix.lower() == ".py":
+                python_files.append(file_path)
+            record = {
+                "path": rel,
+                "bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "extension": suffix,
+            }
+            if include_hashes and stat.st_size <= 5 * 1024 * 1024:
+                try:
+                    record["sha256"] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                except OSError as exc:
+                    record["hash_error"] = str(exc)
+            file_records.append(record)
+            largest.append(record)
+            newest.append(record)
+
+        largest = sorted(largest, key=lambda item: int(item.get("bytes", 0)), reverse=True)[:12]
+        newest = sorted(newest, key=lambda item: str(item.get("modified_at", "")), reverse=True)[:12]
+
+        symbol_counts = {"functions": 0, "classes": 0, "methods": 0, "syntax_errors": 0}
+        python_surface: list[dict[str, Any]] = []
+        for py_file in python_files[:100]:
+            rel = workspace_relative(py_file)
+            try:
+                source = py_file.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source)
+            except SyntaxError as exc:
+                symbol_counts["syntax_errors"] += 1
+                python_surface.append({"path": rel, "syntax_error": str(exc)})
+                continue
+            except OSError as exc:
+                errors.append({"path": rel, "error": str(exc)})
+                continue
+            functions = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+            classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+            method_count = sum(1 for cls in classes for node in cls.body if isinstance(node, ast.FunctionDef))
+            symbol_counts["functions"] += len(functions)
+            symbol_counts["classes"] += len(classes)
+            symbol_counts["methods"] += method_count
+            python_surface.append(
+                {
+                    "path": rel,
+                    "top_level_functions": len(functions),
+                    "classes": [cls.name for cls in classes[:20]],
+                    "method_count": method_count,
+                    "lines": source.count("\n") + 1,
+                }
+            )
+
+        risk_counts: dict[str, int] = {}
+        for spec in self.tool_specs.values():
+            risk_counts[spec.risk] = risk_counts.get(spec.risk, 0) + 1
+
+        config = load_config()
+        provider_count = len(config.get("llm_providers", {})) if isinstance(config.get("llm_providers"), dict) else 0
+        route_count = len(config.get("model_router", {}).get("routes", [])) if isinstance(config.get("model_router"), dict) else 0
+        state_files = {
+            "config": CONFIG_FILE.exists(),
+            "memory": MEMORY_FILE.exists(),
+            "tasks": TASKS_FILE.exists(),
+            "blackboard": BLACKBOARD_FILE.exists(),
+            "code_index": CODE_INDEX_FILE.exists(),
+            "code_graph": CODE_GRAPH_FILE.exists(),
+            "hotspots": CODE_HOTSPOTS_FILE.exists(),
+            "cycle_ledger": CYCLE_LEDGER_FILE.exists(),
+        }
+        payload = {
+            "generated_at": utc_now(),
+            "scope": workspace_relative(target),
+            "recursive": bool(recursive),
+            "file_count_sampled": len(file_records),
+            "total_bytes_sampled": total_bytes,
+            "extension_counts": dict(sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "largest_files": largest,
+            "newest_files": newest,
+            "python": {
+                "file_count_sampled": len(python_files),
+                "symbol_counts": symbol_counts,
+                "surface": python_surface[:50],
+            },
+            "tool_registry": {
+                "tool_count": len(self.tool_specs),
+                "risk_counts": risk_counts,
+                "recent_tool_history_count": len(self.state.tool_history),
+            },
+            "config_posture": {
+                "provider": config.get("provider"),
+                "fallback_provider": config.get("fallback_provider"),
+                "provider_count": provider_count,
+                "model_router_enabled": bool(config.get("model_router", {}).get("enabled", False)) if isinstance(config.get("model_router"), dict) else False,
+                "model_route_count": route_count,
+                "monitor": config.get("monitor"),
+                "show_thinking_indicator": config.get("show_thinking_indicator"),
+            },
+            "state_files": state_files,
+            "errors": errors[:50],
+            "file_records": file_records[:100],
+            "truncated": len(files) >= max_files,
+        }
+        summary = [
+            "Workspace snapshot complete.",
+            f"Scope: {payload['scope']}",
+            f"Files sampled: {len(file_records)}",
+            f"Python files sampled: {len(python_files)}",
+            f"Registered tools: {len(self.tool_specs)}",
+            f"Extensions: {json.dumps(payload['extension_counts'], sort_keys=True)[:600]}",
+        ]
+        return ToolResult(True, "\n".join(summary), meta=payload)
+
+    def analyze_unified_diff_impact(
+        self,
+        diff: str = "",
+        path: str = ".",
+        max_diff_chars: int = 40000,
+    ) -> ToolResult:
+        """Analyze a patch diff for impact and validation hints without applying it."""
+        max_diff_chars = max(1000, min(int(max_diff_chars), 200000))
+        if not diff.strip():
+            git_result = self.git_diff(path=path)
+            if not git_result.ok:
+                return ToolResult(False, f"Unable to obtain git diff: {git_result.content}", meta={"source": "git_diff", "ok": False})
+            diff = git_result.content
+        original_chars = len(diff)
+        diff = diff[:max_diff_chars]
+        changed_files: dict[str, dict[str, Any]] = {}
+        current_file = ""
+        hunk_header_re = re.compile(r"^@@ .* @@\s*(.*)$")
+        current_hunk_context = ""
+        for line in diff.splitlines():
+            if line.startswith("diff --git "):
+                parts = line.split()
+                b_path = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else ""
+                current_file = b_path
+                if current_file:
+                    changed_files.setdefault(
+                        current_file,
+                        {"path": current_file, "added": 0, "removed": 0, "hunks": 0, "symbols": [], "status": "modified", "risk_signals": []},
+                    )
+                continue
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+                changed_files.setdefault(
+                    current_file,
+                    {"path": current_file, "added": 0, "removed": 0, "hunks": 0, "symbols": [], "status": "modified", "risk_signals": []},
+                )
+                continue
+            if line.startswith("new file mode") and current_file:
+                changed_files[current_file]["status"] = "added"
+                continue
+            if line.startswith("deleted file mode") and current_file:
+                changed_files[current_file]["status"] = "deleted"
+                continue
+            hunk_match = hunk_header_re.match(line)
+            if hunk_match and current_file:
+                changed_files[current_file]["hunks"] += 1
+                current_hunk_context = hunk_match.group(1).strip()
+                if current_hunk_context:
+                    changed_files[current_file]["symbols"].append(current_hunk_context)
+                continue
+            if not current_file or current_file not in changed_files:
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                changed_files[current_file]["added"] += 1
+                symbol_match = re.match(r"\+\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+                if symbol_match:
+                    changed_files[current_file]["symbols"].append(symbol_match.group(1))
+            elif line.startswith("-") and not line.startswith("---"):
+                changed_files[current_file]["removed"] += 1
+                symbol_match = re.match(r"-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+                if symbol_match:
+                    changed_files[current_file]["symbols"].append(symbol_match.group(1))
+
+        risk_patterns = [
+            (re.compile(r"(^|/)(agent|main|app|server|router)\.py$", re.I), "entrypoint_or_core_python_file"),
+            (re.compile(r"(^|/)\.agent_config\.json$", re.I), "agent_configuration_changed"),
+            (re.compile(r"(^|/)(requirements|pyproject|setup|poetry\.lock|package-lock|package)\.(txt|toml|cfg|json|lock)$", re.I), "dependency_surface_changed"),
+            (re.compile(r"(^|/)(auth|security|crypto|network|ids|threat|malware|tool|agent)", re.I), "security_or_agentic_surface_changed"),
+            (re.compile(r"(^|/)\.github/", re.I), "ci_cd_surface_changed"),
+        ]
+        for record in changed_files.values():
+            record["symbols"] = sorted(set(str(item) for item in record.get("symbols", []) if str(item).strip()))[:20]
+            for regex, signal in risk_patterns:
+                if regex.search(str(record.get("path", ""))):
+                    record["risk_signals"].append(signal)
+            if int(record.get("added", 0)) + int(record.get("removed", 0)) > 400:
+                record["risk_signals"].append("large_patch")
+            if int(record.get("hunks", 0)) > 20:
+                record["risk_signals"].append("many_hunks")
+            record["risk_signals"] = sorted(set(record.get("risk_signals", [])))
+
+        total_added = sum(int(item.get("added", 0)) for item in changed_files.values())
+        total_removed = sum(int(item.get("removed", 0)) for item in changed_files.values())
+        total_hunks = sum(int(item.get("hunks", 0)) for item in changed_files.values())
+        all_signals = sorted({signal for item in changed_files.values() for signal in item.get("risk_signals", [])})
+        risk_score = 0
+        risk_score += min(25, len(changed_files) * 3)
+        risk_score += min(25, (total_added + total_removed) // 80)
+        risk_score += min(20, total_hunks)
+        risk_score += len(all_signals) * 8
+        if any(item.get("status") == "deleted" for item in changed_files.values()):
+            risk_score += 12
+        if risk_score >= 55:
+            risk_level = "high"
+        elif risk_score >= 25:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+
+        validation_steps = [
+            "python -m py_compile <changed .py files>",
+            "python agent.py --self-test or use run_internal_self_tests when runtime dependencies are available",
+        ]
+        if any("dependency_surface_changed" in item.get("risk_signals", []) for item in changed_files.values()):
+            validation_steps.append("Recreate or verify the environment and run dependency-health checks.")
+        if any("security_or_agentic_surface_changed" in item.get("risk_signals", []) for item in changed_files.values()):
+            validation_steps.append("Run tool schema health, policy evaluation, and focused safety regression checks.")
+        if any(str(item.get("path", "")).endswith(".py") for item in changed_files.values()):
+            validation_steps.append("Run targeted smoke tests against changed Python entrypoints.")
+
+        payload = {
+            "generated_at": utc_now(),
+            "source": "argument" if diff.strip() else "git_diff",
+            "original_diff_chars": original_chars,
+            "analyzed_diff_chars": len(diff),
+            "truncated": original_chars > len(diff),
+            "file_count": len(changed_files),
+            "total_added": total_added,
+            "total_removed": total_removed,
+            "total_hunks": total_hunks,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "risk_signals": all_signals,
+            "files": sorted(changed_files.values(), key=lambda item: str(item.get("path", ""))),
+            "recommended_validation": validation_steps,
+        }
+        summary = [
+            "Diff impact analysis complete.",
+            f"Changed files: {len(changed_files)}",
+            f"Lines added: {total_added}",
+            f"Lines removed: {total_removed}",
+            f"Risk level: {risk_level} ({risk_score})",
+        ]
+        if all_signals:
+            summary.append(f"Risk signals: {', '.join(all_signals)}")
+        return ToolResult(True, "\n".join(summary), meta=payload)
+
+    def create_diagnostic_bundle(
+        self,
+        path: str = ".",
+        output_path: str = ".agent_diagnostics/latest_diagnostic_bundle.json",
+        max_files: int = 200,
+    ) -> ToolResult:
+        """Write a redacted operational diagnostic bundle inside the workspace."""
+        output = resolve_workspace_path(output_path)
+        if output.exists() and output.is_dir():
+            return ToolResult(False, "output_path points to a directory; provide a JSON file path.")
+        target = resolve_workspace_path(path)
+        if output != WORKSPACE_ROOT and WORKSPACE_ROOT not in output.parents:
+            return ToolResult(False, "output_path escapes the workspace.")
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        snapshot = self.build_workspace_snapshot(path=workspace_relative(target), recursive=target.is_dir(), max_files=max_files)
+        schema_health = self.inspect_tool_schema_health()
+        secret_scan = self.scan_workspace_secrets(path=workspace_relative(target), recursive=target.is_dir(), max_files=max_files, include_low_confidence=False)
+        route_config = load_config()
+        config_posture = dict(route_config)
+        config_posture["llm_providers"] = redacted_llm_providers(config_posture.get("llm_providers", {}))
+        if config_posture.get("api_key"):
+            config_posture["api_key"] = "<redacted>"
+
+        validation_hints = [
+            "Run run_internal_self_tests for deterministic parser, registry, terminal-rendering, and policy checks.",
+            "Run run_self_improvement_validation before and after any autonomous improvement cycle.",
+            "Review scan_workspace_secrets findings before publishing diagnostics or committing files.",
+        ]
+        payload = {
+            "generated_at": utc_now(),
+            "workspace_root": str(WORKSPACE_ROOT),
+            "scope": workspace_relative(target),
+            "active_agent_file": active_agent_file(),
+            "snapshot": snapshot.meta if snapshot.ok else {"error": snapshot.content},
+            "tool_schema_health": {
+                "ok": schema_health.ok,
+                "schema_health_ok": schema_health.meta.get("schema_health_ok") if schema_health.ok else False,
+                "issue_count": schema_health.meta.get("issue_count") if schema_health.ok else None,
+                "severe_issue_count": schema_health.meta.get("severe_issue_count") if schema_health.ok else None,
+                "issues": schema_health.meta.get("issues", [])[:100] if schema_health.ok else [],
+            },
+            "secret_scan": {
+                "ok": secret_scan.ok,
+                "finding_count": secret_scan.meta.get("finding_count") if secret_scan.ok else None,
+                "counts_by_severity": secret_scan.meta.get("counts_by_severity", {}) if secret_scan.ok else {},
+                "findings": secret_scan.meta.get("findings", [])[:50] if secret_scan.ok else [],
+                "note": "secret values are redacted",
+            },
+            "config_posture": config_posture,
+            "run_history": load_run_events(limit=50),
+            "tool_history_tail": self.state.tool_history[-25:],
+            "tasks": load_tasks(),
+            "cycle_ledger_tail": load_cycle_ledger().get("cycles", [])[-10:],
+            "validation_hints": validation_hints,
+        }
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        content = (
+            f"Diagnostic bundle written to {workspace_relative(output)}\n"
+            f"Snapshot files sampled: {payload.get('snapshot', {}).get('file_count_sampled')}\n"
+            f"Tool schema severe issues: {payload.get('tool_schema_health', {}).get('severe_issue_count')}\n"
+            f"Redacted secret findings included: {payload.get('secret_scan', {}).get('finding_count')}"
+        )
+        return ToolResult(True, content, meta={"path": workspace_relative(output), "bundle": payload})
 
     def run_internal_self_tests(self) -> ToolResult:
         checks: list[dict[str, Any]] = []
@@ -6960,6 +17118,30 @@ class AgentTools:
         check("config_has_known_fallback_provider", config.get("fallback_provider") in config.get("llm_providers", {}))
         check("config_has_llm_providers", isinstance(config.get("llm_providers"), dict) and bool(config.get("llm_providers")))
         check("lmstudio_auto_discovers_model", config.get("llm_providers", {}).get("lmstudio", {}).get("auto_discover_model") is True)
+        check("config_has_model_router", isinstance(config.get("model_router"), dict) and isinstance(config.get("model_router", {}).get("routes"), list))
+        check("token_estimation_is_monotonic", estimate_token_count("hello world") < estimate_token_count("hello world " * 200))
+        route_probe = model_route_decision_payload(
+            messages=[{"role": "user", "content": "hello"}],
+            provider_name=str(config.get("provider", "lmstudio")),
+            selected_model=str(config.get("default_model", MODEL)),
+            selected_temperature=float(config.get("temperature", 0.25)),
+            config=config,
+        )
+        check("model_router_returns_route_decision", "estimated_input_tokens" in route_probe and "route_name" in route_probe, json.dumps(route_probe, indent=2))
+        prompt_budget = model_input_token_budget(route_probe, get_provider_config(str(config.get("provider", "lmstudio")))[1], config)
+        check("model_router_resolves_prompt_budget", prompt_budget is not None and prompt_budget > 0, str(prompt_budget))
+        compacted_probe, compaction_probe = compact_messages_for_input_budget(
+            [{"role": "user", "content": "alpha beta gamma " * 4000}],
+            max_input_tokens=512,
+            chars_per_token=float(config.get("model_router", {}).get("estimate_chars_per_token", APPROX_CHARS_PER_TOKEN)),
+        )
+        check(
+            "prompt_compaction_reduces_oversized_message",
+            compaction_probe.get("compacted") is True
+            and compaction_probe.get("new_estimated_tokens", 10**9) < compaction_probe.get("original_estimated_tokens", 0)
+            and "Cerebro compacted" in compacted_probe[0].get("content", ""),
+            json.dumps(compaction_probe, indent=2),
+        )
         activity_thinking_calls = []
         try:
             source_tree = ast.parse(Path(__file__).read_text(encoding="utf-8", errors="replace"))
@@ -7103,6 +17285,23 @@ class AgentTools:
             "ordinary conversation or an informational question" in build_turn_guidance("What is Cerebro?", AgentState()),
             build_turn_guidance("What is Cerebro?", AgentState()),
         )
+        inventory_request_text = "give me a table of the tools and what they do"
+        rendered_inventory = build_direct_tool_inventory_response(inventory_request_text, self)
+        check(
+            "direct_tool_inventory_detects_table_request",
+            _looks_like_tool_inventory_request(inventory_request_text),
+            inventory_request_text,
+        )
+        check(
+            "direct_tool_inventory_renders_live_registry",
+            rendered_inventory is not None
+            and "CEREBRO TOOL INVENTORY" in rendered_inventory
+            and "lookup_cve" in rendered_inventory
+            and "scan_workspace_file_signatures" in rendered_inventory
+            and "| # | Tool | Risk | What it does |" in rendered_inventory
+            and "### Threat Intelligence" in rendered_inventory,
+            trim_text(rendered_inventory or "", 1000),
+        )
         try:
             parse_cli_roles("planner,definitely_missing")
             unknown_role_rejected = False
@@ -7114,7 +17313,21 @@ class AgentTools:
             "self_improve_codebase",
             "generate_health_report",
             "generate_planning_brief",
+            "scan_workspace_secrets",
+            "build_workspace_snapshot",
+            "analyze_unified_diff_impact",
+            "create_diagnostic_bundle",
             "recommend_team",
+            "audit_tool_coverage",
+            "recommend_tool_chain",
+            "build_execution_dossier",
+            "inspect_tool_schema_health",
+            "map_tool_capability_graph",
+            "mine_tool_usage_patterns",
+            "trace_goal_to_symbols",
+            "build_validation_matrix",
+            "plan_patch_strategy",
+            "score_execution_readiness",
             "read_json_file",
             "validate_json_file",
             "show_last_self_improvement_changes",
@@ -7136,6 +17349,59 @@ class AgentTools:
             "show_cycle_ledger",
             "show_config",
             "list_llm_routes",
+            "route_multi_model_task",
+            "inspect_runtime_environment",
+            "audit_dependency_health",
+            "inspect_prompt_surface",
+            "build_context_budget_plan",
+            "propose_test_plan_for_symbol",
+            "simulate_tool_execution_plan",
+            "build_risk_register",
+            "map_repository_structure",
+            "inspect_project_entrypoints",
+            "extract_api_surface",
+            "trace_data_flow",
+            "inspect_error_log",
+            "inspect_config_surface",
+            "fetch_url_text",
+            "inspect_http_endpoint",
+            "fetch_json_api",
+            "extract_html_metadata",
+            "check_http_security_headers",
+            "crawl_url_map",
+            "infer_json_schema",
+            "extract_text_entities",
+            "generate_file_manifest",
+            "compare_workspace_files",
+            "inspect_python_environment",
+            "inspect_process_table",
+            "normalize_network_target",
+            "resolve_dns_records",
+            "reverse_dns_lookup",
+            "lookup_ip_rdap",
+            "lookup_ip_geolocation",
+            "get_public_ip_info",
+            "scan_tcp_ports",
+            "inspect_local_listening_ports",
+            "inspect_tls_certificate",
+            "inspect_local_network",
+            "build_network_intel_brief",
+            "ingest_network_traffic_file",
+            "analyze_network_traffic_file",
+            "build_ids_baseline",
+            "compare_network_baseline",
+            "capture_network_metadata_sample",
+            "build_ids_mode_plan",
+            "show_ids_alerts",
+            "lookup_cve",
+            "search_cves",
+            "check_cisa_kev",
+            "lookup_malware_hash",
+            "hash_workspace_file",
+            "add_malware_signature",
+            "scan_workspace_file_signatures",
+            "build_threat_intel_brief",
+            "build_toolbox_brief",
             "summarize_blackboard",
             "show_workspace_stats",
             "show_run_history",
@@ -7178,6 +17444,78 @@ class AgentTools:
         hotspots = self.rank_code_hotspots(active_file, recursive=False)
         cycle_ledger = self.show_cycle_ledger(limit=3)
         config_view = self.show_config()
+        model_router_view = self.show_model_router()
+        model_router_validation = self.validate_model_router_config()
+        model_route_recommendation = self.recommend_model_route(prompt="hello world", role="planner")
+        available_models = self.list_available_models(limit=20)
+        model_selection = self.recommend_model_selection(objective="debug and refactor python code", role="coder", prefer="coding", limit=5)
+        model_portfolio = self.build_model_portfolio(objective="autonomous coding and reasoning")
+        tool_coverage = self.audit_tool_coverage("implement a safe feature", include_specs=False)
+        tool_chain = self.recommend_tool_chain("implement a safe feature", path=active_file)
+        execution_dossier = self.build_execution_dossier("implement a safe feature", path=active_file, limit=2)
+        tool_schema_health = self.inspect_tool_schema_health()
+        capability_graph = self.map_tool_capability_graph("implement a safe feature", include_edges=True)
+        usage_patterns = self.mine_tool_usage_patterns(limit=20)
+        goal_trace = self.trace_goal_to_symbols("render markdown tables", active_file, limit=2)
+        validation_matrix = self.build_validation_matrix("implement a safe feature", changed_files=[active_file], path=active_file)
+        patch_strategy = self.plan_patch_strategy("render markdown tables", target_path=active_file, max_files=2)
+        readiness_score = self.score_execution_readiness("implement a safe feature", context="checkpoint validation compile", changed_files=[active_file])
+        multi_model_route = self.route_multi_model_task("implement a safe feature", path=active_file, prefer="coding", refresh=False)
+        runtime_environment = self.inspect_runtime_environment(include_packages=True, include_env=True)
+        dependency_health = self.audit_dependency_health(active_file, recursive=False, limit=5)
+        prompt_surface = self.inspect_prompt_surface(include_snippets=False)
+        context_budget = self.build_context_budget_plan("implement a safe feature", path=active_file, role="coder")
+        symbol_test_plan = self.propose_test_plan_for_symbol("load_config", path=active_file, objective="configuration routing", limit=3)
+        simulated_plan = self.simulate_tool_execution_plan("implement a safe feature", path=active_file)
+        risk_register = self.build_risk_register("implement a safe feature", path=active_file, context="checkpoint validation compile", changed_files=[active_file])
+        repository_structure = self.map_repository_structure(path=active_file, max_depth=2, include_hidden=False)
+        project_entrypoints = self.inspect_project_entrypoints(path=active_file, recursive=False, limit=10)
+        api_surface = self.extract_api_surface(path=active_file, recursive=False, include_private=False, limit=10)
+        data_flow = self.trace_data_flow("configuration routing", symbol="load_config", path=active_file, limit=3)
+        error_log = self.inspect_error_log(text="Traceback (most recent call last):\n  File \"agent.py\", line 1, in <module>\nModuleNotFoundError: No module named 'openai'", limit=5)
+        config_surface = self.inspect_config_surface(path=active_file, include_preview=False)
+        toolbox_brief = self.build_toolbox_brief("implement a safe feature", path=active_file)
+        network_target = self.normalize_network_target("127.0.0.1", resolve=False, allow_private=True)
+        dns_records = self.resolve_dns_records("localhost", record_type="ANY", allow_private=True, timeout=2)
+        reverse_dns = self.reverse_dns_lookup("127.0.0.1", allow_private=True)
+        rdap_private = self.lookup_ip_rdap("127.0.0.1", timeout=2)
+        geo_private = self.lookup_ip_geolocation("127.0.0.1", timeout=2)
+        port_scan_private = self.scan_tcp_ports("127.0.0.1", ports="9", timeout=0.1, allow_public=False, max_ports=1)
+        local_ports = self.inspect_local_listening_ports(include_udp=True, include_process_names=False, limit=10)
+        direct_port_action = build_direct_network_tool_action("What ports are open on this network?")
+        direct_ids_action = build_direct_network_tool_action("Can you act as an IDS and ingest network traffic?")
+        direct_cve_action = build_direct_threat_intel_tool_action("Look up CVE-2024-3094")
+        direct_hash_action = build_direct_threat_intel_tool_action("Check hash d41d8cd98f00b204e9800998ecf8427e")
+        threat_brief = self.build_threat_intel_brief("CVE-2024-3094")
+        local_network = self.inspect_local_network(include_command_output=False)
+        network_brief = self.build_network_intel_brief("localhost", include_scan_plan=True, allow_public_scan=False)
+        ids_sample_path = ".agent_ids_selftest.jsonl"
+        try:
+            resolve_workspace_path(ids_sample_path).write_text(
+                "\n".join([
+                    json.dumps({"timestamp": 1, "event_type": "flow", "src_ip": "192.168.1.10", "dest_ip": "8.8.8.8", "src_port": 51500, "dest_port": 53, "proto": "UDP", "dns": {"rrname": "example.com"}}),
+                    json.dumps({"timestamp": 2, "event_type": "flow", "src_ip": "192.168.1.10", "dest_ip": "192.168.1.20", "src_port": 51501, "dest_port": 4444, "proto": "TCP"}),
+                    json.dumps({"timestamp": 3, "event_type": "alert", "src_ip": "10.0.0.5", "dest_ip": "192.168.1.20", "src_port": 4444, "dest_port": 3389, "proto": "TCP", "alert": {"signature": "self-test suspicious RDP", "category": "self-test", "severity": 2}}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        ids_ingest = self.ingest_network_traffic_file(ids_sample_path, input_format="jsonl", limit=10)
+        ids_analysis = self.analyze_network_traffic_file(ids_sample_path, input_format="jsonl", limit=10, sensitivity="medium", record_alerts=False)
+        ids_baseline = self.build_ids_baseline(ids_sample_path, input_format="jsonl", label="self-test", limit=10, baseline_path=".agent_ids_selftest_baseline.json")
+        ids_compare = self.compare_network_baseline(ids_sample_path, input_format="jsonl", baseline_path=".agent_ids_selftest_baseline.json", limit=10, record_alerts=False)
+        ids_plan = self.build_ids_mode_plan(mode="offline", source_path=ids_sample_path, authorized=False)
+        ids_alerts = self.show_ids_alerts(limit=5)
+        signature_sample_path = ".agent_signature_selftest.txt"
+        try:
+            resolve_workspace_path(signature_sample_path).write_text("hello X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H* world", encoding="utf-8")
+        except OSError:
+            pass
+        hash_selftest = self.hash_workspace_file(signature_sample_path, lookup_malware_bazaar=False)
+        signature_scan = self.scan_workspace_file_signatures(signature_sample_path, recursive=False, max_files=1, use_yara=False)
+        signature_add = self.add_malware_signature("self-test literal", "self-test-needle", signature_type="string", severity="low", tags=["self-test"], overwrite=True, signature_path=".agent_signature_selftest_signatures.json")
+        ids_capture_guard = self.capture_network_metadata_sample(duration_seconds=1, max_packets=1, authorized=False)
         user_profile = self.show_user_profile()
         blackboard_summary = self.summarize_blackboard(limit=2)
         workspace_stats = self.show_workspace_stats(path=active_file, recursive=False)
@@ -7204,6 +17542,62 @@ class AgentTools:
         check("rank_code_hotspots_persists_file", CODE_HOTSPOTS_FILE.exists(), workspace_relative(CODE_HOTSPOTS_FILE))
         check("show_cycle_ledger_returns_list", cycle_ledger.ok and isinstance(cycle_ledger.meta.get("cycles"), list), trim_text(cycle_ledger.content, 500))
         check("show_config_returns_payload", config_view.ok and "role_models" in config_view.meta, trim_text(config_view.content, 500))
+        check("show_model_router_returns_routes", model_router_view.ok and isinstance(model_router_view.meta.get("routes"), list), trim_text(model_router_view.content, 500))
+        check("validate_model_router_config_passes", model_router_validation.ok and model_router_validation.meta.get("ok") is True, trim_text(model_router_validation.content, 500))
+        check("recommend_model_route_estimates_prompt", model_route_recommendation.ok and "estimated_input_tokens" in model_route_recommendation.meta, trim_text(model_route_recommendation.content, 500))
+        check("recommend_model_route_reports_budget", model_route_recommendation.ok and "input_token_budget" in model_route_recommendation.meta, trim_text(model_route_recommendation.content, 500))
+        check("list_available_models_returns_catalog", available_models.ok and available_models.meta.get("model_count", 0) > 0 and isinstance(available_models.meta.get("models"), list), trim_text(available_models.content, 500))
+        check("recommend_model_selection_returns_provider_model", model_selection.ok and model_selection.meta.get("recommendation", {}).get("provider") and model_selection.meta.get("recommendation", {}).get("model"), trim_text(model_selection.content, 500))
+        check("build_model_portfolio_returns_categories", model_portfolio.ok and "coding_refactor" in model_portfolio.meta.get("portfolio", {}), trim_text(model_portfolio.content, 500))
+        check("audit_tool_coverage_returns_capabilities", tool_coverage.ok and "capabilities" in tool_coverage.meta and tool_coverage.meta.get("tool_count", 0) >= len(required_tools), trim_text(tool_coverage.content, 500))
+        check("recommend_tool_chain_returns_phases", tool_chain.ok and bool(tool_chain.meta.get("phases")) and bool(tool_chain.meta.get("tool_sequence")), trim_text(tool_chain.content, 500))
+        check("execution_dossier_contains_chain_and_route", execution_dossier.ok and "tool_chain" in execution_dossier.meta and "model_route" in execution_dossier.meta, trim_text(execution_dossier.content, 500))
+        check("tool_schema_health_returns_rows", tool_schema_health.ok and isinstance(tool_schema_health.meta.get("tools"), list), trim_text(tool_schema_health.content, 500))
+        check("capability_graph_returns_nodes_and_edges", capability_graph.ok and capability_graph.meta.get("node_count", 0) >= len(required_tools) and isinstance(capability_graph.meta.get("edges"), list), trim_text(capability_graph.content, 500))
+        check("usage_patterns_returns_stats", usage_patterns.ok and isinstance(usage_patterns.meta.get("tool_stats"), list), trim_text(usage_patterns.content, 500))
+        check("goal_trace_returns_targets", goal_trace.ok and (goal_trace.meta.get("candidate_files") or goal_trace.meta.get("candidate_symbols")), trim_text(goal_trace.content, 500))
+        check("validation_matrix_returns_minimum_pass_set", validation_matrix.ok and isinstance(validation_matrix.meta.get("minimum_pass_set"), list), trim_text(validation_matrix.content, 500))
+        check("patch_strategy_returns_patch_steps", patch_strategy.ok and bool(patch_strategy.meta.get("patch_steps")), trim_text(patch_strategy.content, 500))
+        check("readiness_score_returns_decision", readiness_score.ok and readiness_score.meta.get("decision") in {"ready", "proceed_with_caution", "not_ready"}, trim_text(readiness_score.content, 500))
+        check("route_multi_model_task_returns_phase_routes", multi_model_route.ok and isinstance(multi_model_route.meta.get("role_routes"), dict) and isinstance(multi_model_route.meta.get("phase_routes"), list), trim_text(multi_model_route.content, 500))
+        check("inspect_runtime_environment_returns_python_payload", runtime_environment.ok and "python" in runtime_environment.meta and "providers" in runtime_environment.meta, trim_text(runtime_environment.content, 500))
+        check("audit_dependency_health_returns_imports", dependency_health.ok and "imports" in dependency_health.meta and "health" in dependency_health.meta, trim_text(dependency_health.content, 500))
+        check("inspect_prompt_surface_returns_prompt_rows", prompt_surface.ok and isinstance(prompt_surface.meta.get("prompts"), list), trim_text(prompt_surface.content, 500))
+        check("build_context_budget_plan_returns_budget", context_budget.ok and "budget" in context_budget.meta and "sections" in context_budget.meta, trim_text(context_budget.content, 500))
+        check("propose_test_plan_for_symbol_returns_cases", symbol_test_plan.ok and isinstance(symbol_test_plan.meta.get("test_cases"), list), trim_text(symbol_test_plan.content, 500))
+        check("simulate_tool_execution_plan_returns_steps", simulated_plan.ok and isinstance(simulated_plan.meta.get("simulated_steps"), list), trim_text(simulated_plan.content, 500))
+        check("build_risk_register_returns_risks", risk_register.ok and isinstance(risk_register.meta.get("risks"), list), trim_text(risk_register.content, 500))
+        check("map_repository_structure_returns_tree", repository_structure.ok and isinstance(repository_structure.meta.get("tree"), list), trim_text(repository_structure.content, 500))
+        check("inspect_project_entrypoints_returns_entrypoints", project_entrypoints.ok and isinstance(project_entrypoints.meta.get("entrypoints"), list), trim_text(project_entrypoints.content, 500))
+        check("extract_api_surface_returns_modules", api_surface.ok and isinstance(api_surface.meta.get("modules"), list), trim_text(api_surface.content, 500))
+        check("trace_data_flow_returns_flows", data_flow.ok and isinstance(data_flow.meta.get("flows"), list), trim_text(data_flow.content, 500))
+        check("inspect_error_log_detects_missing_module", error_log.ok and "openai" in error_log.meta.get("missing_modules", []), trim_text(error_log.content, 500))
+        check("inspect_config_surface_returns_files", config_surface.ok and isinstance(config_surface.meta.get("files"), list), trim_text(config_surface.content, 500))
+        check("build_toolbox_brief_returns_groups", toolbox_brief.ok and "tool_groups" in toolbox_brief.meta and "repository_intelligence" in toolbox_brief.meta.get("tool_groups", {}), trim_text(toolbox_brief.content, 500))
+        check("network_target_normalizes_loopback", network_target.ok and network_target.meta.get("addresses") and network_target.meta["addresses"][0].get("is_loopback") is True, trim_text(network_target.content, 500))
+        check("resolve_dns_records_returns_payload", dns_records.ok and isinstance(dns_records.meta.get("records"), list), trim_text(dns_records.content, 500))
+        check("reverse_dns_lookup_returns_ptr_payload", reverse_dns.ok and "ptr_records" in reverse_dns.meta, trim_text(reverse_dns.content, 500))
+        check("lookup_ip_rdap_skips_private", rdap_private.ok and rdap_private.meta.get("skipped") is True, trim_text(rdap_private.content, 500))
+        check("lookup_ip_geolocation_skips_private", geo_private.ok and geo_private.meta.get("skipped") is True, trim_text(geo_private.content, 500))
+        check("scan_tcp_ports_returns_results", port_scan_private.ok and isinstance(port_scan_private.meta.get("results"), list) and port_scan_private.meta.get("ports_scanned") == 1, trim_text(port_scan_private.content, 500))
+        check("inspect_local_listening_ports_returns_entries_list", local_ports.ok and isinstance(local_ports.meta.get("entries"), list), trim_text(local_ports.content, 500))
+        check("direct_network_routes_open_ports_to_local_listener_tool", isinstance(direct_port_action, dict) and direct_port_action.get("tool") == "inspect_local_listening_ports", str(direct_port_action))
+        check("direct_ids_request_routes_to_ids_plan", isinstance(direct_ids_action, dict) and direct_ids_action.get("tool") == "build_ids_mode_plan", str(direct_ids_action))
+        check("direct_cve_request_routes_to_lookup_cve", isinstance(direct_cve_action, dict) and direct_cve_action.get("tool") == "lookup_cve", str(direct_cve_action))
+        check("direct_hash_request_routes_to_malware_lookup", isinstance(direct_hash_action, dict) and direct_hash_action.get("tool") == "lookup_malware_hash", str(direct_hash_action))
+        check("threat_brief_returns_sequence", threat_brief.ok and isinstance(threat_brief.meta.get("recommended_sequence"), list) and threat_brief.meta.get("recommended_sequence"), trim_text(threat_brief.content, 500))
+        check("inspect_local_network_returns_hostname", local_network.ok and "hostname" in local_network.meta and isinstance(local_network.meta.get("addresses"), list), trim_text(local_network.content, 500))
+        check("build_network_intel_brief_returns_sequence", network_brief.ok and isinstance(network_brief.meta.get("recommended_sequence"), list) and "safety_rules" in network_brief.meta, trim_text(network_brief.content, 500))
+        check("ids_ingest_returns_flow_count", ids_ingest.ok and ids_ingest.meta.get("flow_count", 0) >= 3 and isinstance(ids_ingest.meta.get("sample_flows"), list), trim_text(ids_ingest.content, 500))
+        check("ids_analysis_generates_alerts", ids_analysis.ok and ids_analysis.meta.get("alert_count", 0) >= 1 and isinstance(ids_analysis.meta.get("alerts"), list), trim_text(ids_analysis.content, 500))
+        check("ids_baseline_saves_known_good", ids_baseline.ok and ids_baseline.meta.get("baseline_path") == ".agent_ids_selftest_baseline.json" and "dst_ports" in ids_baseline.meta, trim_text(ids_baseline.content, 500))
+        check("ids_compare_returns_deviation_payload", ids_compare.ok and "baseline_label" in ids_compare.meta and isinstance(ids_compare.meta.get("alerts"), list), trim_text(ids_compare.content, 500))
+        check("ids_plan_returns_supported_inputs", ids_plan.ok and isinstance(ids_plan.meta.get("recommended_sequence"), list) and "supported_inputs" in ids_plan.meta, trim_text(ids_plan.content, 500))
+        check("ids_capture_requires_authorization", not ids_capture_guard.ok and ids_capture_guard.meta.get("authorization_required") is True, trim_text(ids_capture_guard.content, 500))
+        check("show_ids_alerts_returns_alert_list", ids_alerts.ok and isinstance(ids_alerts.meta.get("alerts"), list), trim_text(ids_alerts.content, 500))
+        check("hash_workspace_file_returns_hashes", hash_selftest.ok and "sha256" in hash_selftest.meta.get("hashes", {}), trim_text(hash_selftest.content, 500))
+        check("scan_workspace_file_signatures_detects_eicar", signature_scan.ok and signature_scan.meta.get("match_count", 0) >= 1, trim_text(signature_scan.content, 500))
+        check("add_malware_signature_saves_catalog", signature_add.ok and signature_add.meta.get("signature_count", 0) >= 1, trim_text(signature_add.content, 500))
         check("show_user_profile_returns_schema", user_profile.ok and "identity" in user_profile.meta and "contact" in user_profile.meta, trim_text(user_profile.content, 500))
         check("summarize_blackboard_returns_sections", blackboard_summary.ok and isinstance(blackboard_summary.meta.get("sections"), dict), trim_text(blackboard_summary.content, 500))
         check("show_workspace_stats_returns_counts", workspace_stats.ok and "file_count" in workspace_stats.meta, trim_text(workspace_stats.content, 500))
@@ -7243,6 +17637,15 @@ class AgentTools:
         profile_forget = self.forget_user_profile_field("custom.__self_test__")
         check("update_user_profile_writes_field", profile_update.ok, trim_text(profile_update.content, 500))
         check("forget_user_profile_field_removes_field", profile_forget.ok, trim_text(profile_forget.content, 500))
+
+        workspace_snapshot_probe = self.build_workspace_snapshot(path=active_file, recursive=False, max_files=1)
+        secret_scan_probe = self.scan_workspace_secrets(path=active_file, recursive=False, max_files=1, include_low_confidence=False)
+        diff_impact_probe = self.analyze_unified_diff_impact(
+            diff="diff --git a/sample.py b/sample.py\n--- a/sample.py\n+++ b/sample.py\n@@ -1 +1 @@ def demo():\n-old = 1\n+new = 2\n"
+        )
+        check("workspace_snapshot_probe_returns_sample", workspace_snapshot_probe.ok and workspace_snapshot_probe.meta.get("file_count_sampled", 0) >= 1, trim_text(workspace_snapshot_probe.content, 500))
+        check("secret_scan_probe_returns_findings_list", secret_scan_probe.ok and isinstance(secret_scan_probe.meta.get("findings"), list), trim_text(secret_scan_probe.content, 500))
+        check("diff_impact_probe_scores_patch", diff_impact_probe.ok and diff_impact_probe.meta.get("file_count") == 1, trim_text(diff_impact_probe.content, 500))
 
         terminal_was_tty = sys.stdout.isatty
         try:
@@ -7303,6 +17706,7 @@ class AgentTools:
 
         brief = self.generate_planning_brief("internal self-test planning brief", scope=active_file)
         check("planning_brief_generates", brief.ok and bool(brief.meta.get("acceptance_criteria")), trim_text(brief.content, 500))
+        check("planning_brief_includes_tool_chain", brief.ok and "recommended_tool_chain" in brief.meta, trim_text(brief.content, 500))
 
         validation = self.run_self_improvement_validation(path=active_file)
         check("self_improvement_validation_runs_on_active_file", validation.ok, trim_text(validation.content, 500))
@@ -7568,10 +17972,25 @@ def main() -> None:
             "repairs_oversized_batch": len(parse_model_reply(json.dumps({"type": "batch", "actions": [{"tool": "list_files", "args": {}}, {"tool": "read_control_state", "args": {}}, {"tool": "show_workspace_stats", "args": {}}, {"tool": "inspect_path", "args": {"path": "."}}]}), tool_names=set(AgentTools(AgentState()).tools)).get("actions", [])) == configured_max_batch_actions(),
             "suppresses_raw_action_json": "internal tool request suppressed" in render_terminal_markdown(json.dumps({"type": "tool", "tool": "missing_tool", "args": {}})),
             "uses_dynamic_tool_registry_prompt": "Registered tool specs are injected at runtime" in SYSTEM_PROMPT and "Available tools and JSON arg schemas:" not in SYSTEM_PROMPT,
+            "direct_tool_inventory_detects_table_request": _looks_like_tool_inventory_request("give me a table of the tools and what they do"),
+            "direct_tool_inventory_renders_live_registry": "lookup_cve" in (build_direct_tool_inventory_response("give me a list of the tools CEREBRO has access to", AgentTools(AgentState())) or ""),
             "direct_guidance_for_plain_question": "direct final answer" in build_turn_guidance("What is Cerebro?", AgentState()),
             "cli_roles_validate": parse_cli_roles("planner,coder") == ["planner", "coder"],
             "task_profile_detects_implementation": "implementation" in infer_task_profile("Improve the agent with more intelligence")["intents"],
+            "task_profile_estimates_tokens": infer_task_profile("Improve the agent with more intelligence").get("estimated_input_tokens", 0) > 0,
             "context_tools_registered": {"build_context_pack", "decompose_goal", "semantic_search_workspace", "find_relevant_code_context"}.issubset(set(AgentTools(AgentState()).tools)),
+            "control_server_tools_registered": {"start_control_server", "show_control_server", "route_control_command", "stop_control_server"}.issubset(set(AgentTools(AgentState()).tools)),
+            "control_server_safe_command_allows_ping": _control_server_command_is_allowed("ping"),
+            "control_server_blocks_exec_command": not _control_server_command_is_allowed("exec"),
+            "diagnostic_tools_registered": {"scan_workspace_secrets", "build_workspace_snapshot", "analyze_unified_diff_impact", "create_diagnostic_bundle"}.issubset(set(AgentTools(AgentState()).tools)),
+            "workspace_snapshot_smoke": AgentTools(AgentState()).build_workspace_snapshot(path=active_agent_file(), recursive=False, max_files=1).ok,
+            "secret_scan_smoke": AgentTools(AgentState()).scan_workspace_secrets(path=active_agent_file(), recursive=False, max_files=1).ok,
+            "diff_impact_smoke": AgentTools(AgentState()).analyze_unified_diff_impact(diff="diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a=1\n+b=2\n").ok,
+            "model_router_tools_registered": {"show_model_router", "validate_model_router_config", "recommend_model_route"}.issubset(set(AgentTools(AgentState()).tools)),
+            "model_router_smoke": AgentTools(AgentState()).recommend_model_route(prompt="hello", role="planner").ok,
+            "prompt_compaction_smoke": compact_messages_for_input_budget([{"role": "user", "content": "x " * 8000}], max_input_tokens=512)[1].get("compacted") is True,
+            "route_recommendation_reports_budget": "input_token_budget" in AgentTools(AgentState()).recommend_model_route(prompt="hello", role="planner").meta,
+            "model_router_config_validates": AgentTools(AgentState()).validate_model_router_config().ok,
             "inspect_path_smoke": AgentTools(AgentState()).inspect_path(active_agent_file()).ok,
             "semantic_search_smoke": AgentTools(AgentState()).semantic_search_workspace("render markdown", active_agent_file(), limit=2).ok,
             "code_context_smoke": AgentTools(AgentState()).find_relevant_code_context("render markdown", active_agent_file(), limit=2).ok,
@@ -7584,8 +18003,44 @@ def main() -> None:
     if "--tools" in sys.argv:
         state = AgentState()
         tools = AgentTools(state)
-        print(tools.render_tool_prompt())
+        print(render_registered_tool_inventory(tools, include_schemas="--tool-schemas" in sys.argv))
         raise SystemExit(0)
+
+    if "--model-router" in sys.argv:
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.show_model_router()
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--validate-router" in sys.argv:
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.validate_model_router_config()
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--route-prompt" in sys.argv:
+        prompt = cli_flag_value("--route-prompt", "")
+        role = cli_flag_value("--role", "")
+        provider = cli_flag_value("--provider", "")
+        model = cli_flag_value("--model", "")
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.recommend_model_route(prompt=prompt, role=role, provider=provider, model=model)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--route-file" in sys.argv:
+        target = cli_flag_value("--route-file", active_agent_file())
+        role = cli_flag_value("--role", "")
+        provider = cli_flag_value("--provider", "")
+        model = cli_flag_value("--model", "")
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.recommend_model_route(path=target, role=role, provider=provider, model=model)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
 
     if "--validate" in sys.argv:
         target = cli_flag_value("--validate", active_agent_file())
@@ -7613,6 +18068,53 @@ def main() -> None:
         print(result.content)
         raise SystemExit(0 if result.ok else 1)
 
+    if "--secret-scan" in sys.argv:
+        target = cli_flag_value("--secret-scan", active_agent_file())
+        max_files = cli_int_value("--max-files", 200)
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.scan_workspace_secrets(
+            path=target,
+            recursive="--no-recursive" not in sys.argv,
+            max_files=max_files,
+            include_low_confidence="--include-low-confidence" in sys.argv,
+        )
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--workspace-snapshot" in sys.argv:
+        target = cli_flag_value("--workspace-snapshot", active_agent_file())
+        max_files = cli_int_value("--max-files", 250)
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.build_workspace_snapshot(
+            path=target,
+            recursive="--no-recursive" not in sys.argv,
+            max_files=max_files,
+            include_hashes="--hashes" in sys.argv,
+        )
+        print(json.dumps(result.meta, indent=2, sort_keys=True) if "--json" in sys.argv else result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--diff-impact" in sys.argv:
+        target = cli_flag_value("--diff-impact", ".")
+        diff_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.analyze_unified_diff_impact(diff=diff_text, path=target)
+        print(json.dumps(result.meta, indent=2, sort_keys=True) if "--json" in sys.argv else result.content)
+        raise SystemExit(0 if result.ok else 1)
+
+    if "--diagnostic-bundle" in sys.argv:
+        target = cli_flag_value("--diagnostic-bundle", active_agent_file())
+        output_path = cli_flag_value("--output", ".agent_diagnostics/latest_diagnostic_bundle.json")
+        max_files = cli_int_value("--max-files", 200)
+        state = AgentState()
+        tools = AgentTools(state)
+        result = tools.create_diagnostic_bundle(path=target, output_path=output_path, max_files=max_files)
+        print(result.content)
+        raise SystemExit(0 if result.ok else 1)
+
     if "--self-improve" in sys.argv:
         goal = cli_flag_value("--self-improve", "improve this codebase")
         cycles = max(1, cli_int_value("--cycles", DEFAULT_SELF_IMPROVE_CYCLES))
@@ -7626,6 +18128,45 @@ def main() -> None:
         result = tools.self_improve_codebase(goal=goal, max_cycles=cycles, roles=roles)
         print(result.content)
         raise SystemExit(0 if result.ok else 1)
+
+
+    if "--control-server-status" in sys.argv:
+        status = control_server_status()
+        print(json.dumps(status, indent=2, sort_keys=True))
+        raise SystemExit(0 if status.get("ok") else 1)
+
+    if "--control-server" in sys.argv:
+        host = cli_flag_value("--host", CONTROL_SERVER_DEFAULT_HOST)
+        port = cli_int_value("--port", CONTROL_SERVER_DEFAULT_PORT)
+        status = listen_for_connections(
+            host=host,
+            port=port,
+            authorized="--authorized-network-bind" in sys.argv,
+        )
+        print(json.dumps(status, indent=2, sort_keys=True))
+        if not status.get("ok"):
+            raise SystemExit(1)
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print(json.dumps(stop_control_server(), indent=2, sort_keys=True))
+            raise SystemExit(0)
+
+    if "--route-control-command" in sys.argv:
+        command_type = cli_flag_value("--route-control-command", "ping")
+        payload_raw = cli_flag_value("--payload", "{}")
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid --payload JSON: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        target_ids_raw = cli_flag_value("--target-ids", "")
+        target_ids = [item.strip() for item in target_ids_raw.split(",") if item.strip()]
+        result = route_command_to_clients(command_type, payload, target_ids)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        raise SystemExit(0 if result.get("ok") else 1)
+
 
     if "--run-prompt" in sys.argv:
         index = sys.argv.index("--run-prompt")
