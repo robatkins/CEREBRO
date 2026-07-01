@@ -1,6 +1,6 @@
 # CEREBRO
 
-**Cognitive, Empathetic, Responsive, Efficient, Bounded, Optimized, Robust, Organized**
+**Cognitive Engine for Recursive Enhancement, Behavioral Reasoning, and Orchestration**
 
 A local multi-agent AI assistant running on your computer to help with codebase improvement, autonomous loops, and intelligent coordination.
 
